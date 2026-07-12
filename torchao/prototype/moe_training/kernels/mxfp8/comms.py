@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -17,6 +19,16 @@ from torchao.prototype.mx_formats.kernels import (
     triton_to_mxfp8_dim0,
 )
 from torchao.prototype.mx_formats.mx_tensor import to_dtype, to_mx
+
+
+@functools.cache
+def _get_compiled_to_mx():
+    return torch.compile(to_mx)
+
+
+@functools.cache
+def _get_compiled_to_dtype():
+    return torch.compile(to_dtype)
 
 
 # This performs dynamic mxfp8 quantization of the input tensor,
@@ -77,7 +89,7 @@ class MXFP8OnDeviceAllToAllV(torch.autograd.Function):
 
         # Quantize input
         block_size = 32
-        to_mx_c = torch.compile(to_mx)
+        to_mx_c = _get_compiled_to_mx()
         input_scales, input_data = to_mx_c(
             input,
             elem_dtype=torch.float8_e4m3fn,
@@ -150,7 +162,7 @@ class MXFP8OnDeviceAllToAllV(torch.autograd.Function):
         # Dequantize output
         lowp_dtype = output.dtype
         hp_dtype = input.dtype
-        to_dtype_c = torch.compile(to_dtype)
+        to_dtype_c = _get_compiled_to_dtype()
         hp_output = to_dtype_c(
             output,
             output_scales.view(torch.float8_e8m0fnu),
@@ -194,7 +206,7 @@ class MXFP8OnDeviceAllToAllV(torch.autograd.Function):
 
         # Quantize grad_output
         block_size = 32
-        to_mx_c = torch.compile(to_mx)
+        to_mx_c = _get_compiled_to_mx()
         grad_out_scales, grad_out_data = to_mx_c(
             grad_output,
             elem_dtype=torch.float8_e4m3fn,
@@ -250,7 +262,7 @@ class MXFP8OnDeviceAllToAllV(torch.autograd.Function):
 
         # Dequantize grad_input
         lowp_dtype = grad_out_data.dtype
-        to_dtype_c = torch.compile(to_dtype)
+        to_dtype_c = _get_compiled_to_dtype()
         grad_input_hp = to_dtype_c(
             MXFP8OnDeviceAllToAllV.grad_input_buf,
             MXFP8OnDeviceAllToAllV.grad_input_scales_buf.view(torch.float8_e8m0fnu),

@@ -16,6 +16,7 @@ from torch.testing._internal.common_distributed import (
 )
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
+    parametrize,
     run_tests,
 )
 
@@ -31,6 +32,7 @@ from torchao.prototype.mx_formats.kernels import (
     triton_mxfp8_dequant_dim0,
     triton_to_mxfp8_dim0,
 )
+from torchao.prototype.mx_formats.mx_tensor import to_dtype, to_mx
 
 from ..testing_utils import generate_split_sizes
 
@@ -149,7 +151,8 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
         finally:
             dist.destroy_process_group()
 
-    def test_scaling_mode_semantics(self):
+    @parametrize("dtype", (torch.bfloat16, torch.float32))
+    def test_scaling_mode_semantics(self, dtype):
         self._init_process()
         try:
             self._init_device()
@@ -165,17 +168,28 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
             x = torch.full(
                 (tokens, dim),
                 500.0,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 device=self.device,
             )
 
+            to_mx_c = torch.compile(to_mx)
+            to_dtype_c = torch.compile(to_dtype)
+
             def quantize_dequantize(mode):
-                qdata, scales = triton_to_mxfp8_dim0(
-                    x, inner_block_size=32, scaling_mode=mode.value
+                if dtype == torch.bfloat16:
+                    qdata, scales = triton_to_mxfp8_dim0(
+                        x, inner_block_size=32, scaling_mode=mode.value
+                    )
+                    return triton_mxfp8_dequant_dim0(
+                        qdata, scales.view(torch.uint8), x.dtype, 32
+                    )
+                scales, qdata = to_mx_c(
+                    x,
+                    elem_dtype=torch.float8_e4m3fn,
+                    block_size=32,
+                    scaling_mode=mode,
                 )
-                return triton_mxfp8_dequant_dim0(
-                    qdata, scales.view(torch.uint8), x.dtype, 32
-                )
+                return to_dtype_c(qdata, scales, qdata.dtype, 32, x.dtype)
 
             expected = {
                 mode: quantize_dequantize(mode)
@@ -195,6 +209,7 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
                 group_name,
             )
             assert torch.equal(output_splits, input_splits)
+            assert output_default.dtype == dtype
             assert torch.equal(
                 output_default, expected[ScaleCalculationMode.RCEIL]
             )
@@ -214,6 +229,7 @@ class MXFP8OnDeviceAllToAllVTest(MultiProcessTestCase):
             actual_grad = torch.autograd.grad(
                 output_default, x_default, grad_outputs=grad
             )[0]
+            assert actual_grad.dtype == dtype
             assert torch.equal(
                 actual_grad,
                 expected[ScaleCalculationMode.RCEIL],
