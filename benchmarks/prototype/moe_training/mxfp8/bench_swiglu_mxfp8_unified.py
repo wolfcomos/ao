@@ -46,7 +46,9 @@ def swiglu_grads(grad_h, gated_input):
     sigmoid_gate = torch.sigmoid(gate)
     d_silu = sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
     dgate = (grad_h_f * up * d_silu).bfloat16()
-    dup = (grad_h_f * gate * sigmoid_gate).bfloat16()
+    # grad_h * (gate * sigmoid): the kernel forms silu first, and
+    # grad_h * gate * sigmoid would associate the other way and round differently.
+    dup = (grad_h_f * (gate * sigmoid_gate)).bfloat16()
     return torch.cat([dgate, dup], dim=1)
 
 
@@ -77,17 +79,11 @@ def fused(gated_input, grad_h, rowwise, colwise):
 
 
 def check(actual, expected, msg):
-    """Scales must match bitwise; E4M3 codes may differ by at most one."""
+    """The fused kernel is bitwise exact against the eager path."""
     assert actual.shape == expected.shape, f"{msg}: {actual.shape} vs {expected.shape}"
     assert actual.stride() == expected.stride(), f"{msg}: stride mismatch"
-    if actual.numel() == 0:
-        return
     a, e = actual.view(torch.uint8), expected.view(torch.uint8)
-    if actual.dtype == torch.float8_e8m0fnu:
-        assert bool((a == e).all()), f"{msg}: scales are not bitwise identical"
-        return
-    gap = torch.maximum(a, e) - torch.minimum(a, e)
-    assert int(gap.max()) <= 1, f"{msg}: max E4M3 code gap > 1"
+    assert bool((a == e).all()), f"{msg}: not bitwise identical"
 
 
 def run(M, K, is_backward, rowwise, colwise, use_compile):

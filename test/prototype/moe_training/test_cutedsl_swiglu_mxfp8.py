@@ -12,10 +12,11 @@ Every case goes through the public API -- `swiglu_mxfp8_forward` or
   forward:  h = silu(gate) * up          -> mxfp8_quantize_2d_{1x32,32x1}_cutedsl(h)
   backward: dGate, dUp via SwiGLU grads  -> the same quantize functions
 
-E8M0 scales and forward E4M3 data must match bitwise. Backward E4M3 data may
-differ by at most one code in a small fraction of elements, because the kernel
-evaluates sigmoid with rcp.approx plus Markstein refinement and fuses the d_silu
-product differently than eager PyTorch.
+Every output must match BITWISE -- E4M3 data and E8M0 scales, both directions,
+all layouts. The reference below mirrors the kernel's multiply order exactly:
+dUp is `grad_h * (gate * sigmoid)`, forming silu first, because
+`grad_h * gate * sigmoid` associates as `(grad_h * gate) * sigmoid` and rounds
+differently in fp32.
 """
 
 import pytest
@@ -47,10 +48,6 @@ _LAYOUTS = [
     (True, True),
 ]
 
-# Only backward E4M3 data is allowed to differ at all; see the module docstring.
-_MAX_DIFFERING_FRACTION = 1e-5
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -67,7 +64,8 @@ def _eager_reference(gated_input, grad_h):
     sigmoid_gate = torch.sigmoid(gate)
     d_silu = sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
     dgate = (grad_h_f * up * d_silu).bfloat16()
-    dup = (grad_h_f * gate * sigmoid_gate).bfloat16()
+    # grad_h * (gate * sigmoid), matching the kernel; see the module docstring.
+    dup = (grad_h_f * (gate * sigmoid_gate)).bfloat16()
     return torch.cat([dgate, dup], dim=1)
 
 
@@ -79,27 +77,10 @@ def _assert_layout(actual, ref, msg):
     assert actual.dtype == ref.dtype, f"{msg}: dtype {actual.dtype} vs {ref.dtype}"
 
 
-def _assert_scales_identical(actual, ref, msg):
-    """Scale bytes must match exactly."""
+def _assert_identical(actual, ref, msg):
+    """Bitwise equality, including shape, stride and dtype."""
     _assert_layout(actual, ref, msg)
     torch.testing.assert_close(actual, ref, rtol=0, atol=0, msg=msg)
-
-
-def _assert_qdata_matches(actual, ref, msg, exact):
-    """Exact FP8-bit comparison, or a bounded 1-code tolerance for backward."""
-    _assert_layout(actual, ref, msg)
-    if exact:
-        torch.testing.assert_close(actual, ref, rtol=0, atol=0, msg=msg)
-        return
-    a = actual.contiguous().view(torch.uint8).int()
-    r = ref.contiguous().view(torch.uint8).int()
-    gap = (a - r).abs()
-    max_gap = int(gap.max())
-    assert max_gap <= 1, f"{msg}: max E4M3 code gap {max_gap} > 1"
-    fraction = int((gap != 0).sum()) / a.numel()
-    assert fraction <= _MAX_DIFFERING_FRACTION, (
-        f"{msg}: {fraction:.3e} of codes differ, limit {_MAX_DIFFERING_FRACTION:.3e}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +121,8 @@ def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
         assert output_rowwise.stride() == (expected_width, 1), (
             f"{tag}: rowwise qdata must be row-major, got {output_rowwise.stride()}"
         )
-        _assert_qdata_matches(
-            output_rowwise, ref_q, f"{tag}: rowwise qdata", exact=not is_backward
-        )
-        _assert_scales_identical(scales_rowwise, ref_s, f"{tag}: rowwise scales")
+        _assert_identical(output_rowwise, ref_q, f"{tag}: rowwise qdata")
+        _assert_identical(scales_rowwise, ref_s, f"{tag}: rowwise scales")
     else:
         assert output_rowwise.numel() == 0, f"{tag}: rowwise output should be empty"
         assert scales_rowwise.numel() == 0, f"{tag}: rowwise scales should be empty"
@@ -157,10 +136,8 @@ def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
         assert output_colwise.stride() == (1, M), (
             f"{tag}: colwise qdata must have stride (1, M), got {output_colwise.stride()}"
         )
-        _assert_qdata_matches(
-            output_colwise, ref_q, f"{tag}: colwise qdata", exact=not is_backward
-        )
-        _assert_scales_identical(scales_colwise, ref_s, f"{tag}: colwise scales")
+        _assert_identical(output_colwise, ref_q, f"{tag}: colwise qdata")
+        _assert_identical(scales_colwise, ref_s, f"{tag}: colwise scales")
         # The 32x1 quantizer returns flat scales; ours must match that layout.
         assert scales_colwise.ndim == 1, f"{tag}: colwise scales should be flat"
     else:
