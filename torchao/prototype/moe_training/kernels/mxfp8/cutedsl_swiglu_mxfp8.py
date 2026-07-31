@@ -4,12 +4,43 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torch
+"""Unified SwiGLU + MXFP8 CuTe DSL kernel for SM100.
+
+A single pass computes the SwiGLU activation and its MXFP8 cast, so the
+activation never round-trips through global memory as bfloat16:
+
+    forward:   h     = silu(gate) * up
+    backward:  dGate = grad_h * up * d_silu(gate),  dUp = grad_h * silu(gate)
+
+Both directions can emit rowwise (1x32) scales, colwise (32x1) scales, or both
+in one launch. ``IS_BWD`` / ``ROWWISE`` / ``COLWISE`` are ``Constexpr`` flags, so
+each combination specializes into its own kernel with no runtime branching.
+
+Against the equivalent eager sequence (SwiGLU in fp32, rounded to bfloat16, then
+``mxfp8_quantize_2d_{1x32,32x1}_cutedsl`` with ``scaling_mode="rceil"``), E8M0
+scales match bitwise everywhere and forward E4M3 data matches bitwise. Backward
+E4M3 data can differ by one code in roughly 4e-7 of elements, because sigmoid is
+evaluated with rcp.approx plus Markstein refinement and the d_silu product is
+fused differently than eager PyTorch.
+
+Shapes are limited to ``2*K*M <= INT32_MAX``: the gmem layouts are built from
+Python ints, so CuTe emits 32-bit index math.
+
+Call ``swiglu_mxfp8_quantize`` from ``quant.py`` rather than the two entry points
+here: it wraps them in torch custom ops, so it works under ``torch.compile``.
+"""
+
+import functools
+
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils
+import torch
 from cutlass._mlir.dialects import llvm
-from cutlass._mlir.dialects._cute_nvgpu_enum_gen import AddressSpace
+from cutlass.cute import AddressSpace
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from torchao.utils import ceil_div
 
 try:
     from cuda.bindings.driver import CUstream
@@ -23,11 +54,16 @@ U8 = cutlass.Uint8
 
 EVICT_FIRST = cute.nvgpu.common.CacheEvictionPriority.EVICT_FIRST
 
-THREADS = 128
-TR = 32       # rows per CTA tile
-TJ = 128      # j-columns per CTA tile
-SP = 36       # padded row-stride (words) of the transposed smem cache
-SH = 64 * SP  # words per half
+# CTA tile geometry. Each CTA owns a TR x TJ tile of the logical [M, K] output.
+TR = 32  # rows per CTA tile
+TJ = 128  # j-columns per CTA tile
+
+# Transposed smem cache used only by the colwise path. Rows are padded from 32
+# to SP words so that the colwise read pattern is bank-conflict free.
+SP = 36  # padded row-stride, in 32-bit words
+SH = 64 * SP  # words per output half ([dGate | dUp] is two halves)
+
+_INT32_MAX = 2**31 - 1
 
 
 @dsl_user_op
@@ -58,46 +94,57 @@ def _qpack(w0, w1, s, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _prmt_even(a, b, *, loc=None, ip=None):
-    """prmt.b32 with selector 0x6420: select bytes [0,2,4,6] from a pair."""
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                cutlass.Int32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Int32(b).ir_value(loc=loc, ip=ip),
-            ],
-            "prmt.b32 $0, $1, $2, 0x6420;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
+def _binary_b32_op(name, asm, doc):
+    """Wrap a two-operand, one-result b32 PTX instruction as a dsl_user_op."""
+
+    @dsl_user_op
+    def op(a, b, *, loc=None, ip=None):
+        return cutlass.Int32(
+            llvm.inline_asm(
+                T.i32(),
+                [
+                    cutlass.Int32(a).ir_value(loc=loc, ip=ip),
+                    cutlass.Int32(b).ir_value(loc=loc, ip=ip),
+                ],
+                asm,
+                "=r,r,r",
+                has_side_effects=False,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+                loc=loc,
+                ip=ip,
+            )
         )
-    )
+
+    op.__name__ = name
+    op.__qualname__ = name
+    op.__doc__ = doc
+    return op
 
 
-@dsl_user_op
-def _prmt_odd(a, b, *, loc=None, ip=None):
-    """prmt.b32 with selector 0x7531: select bytes [1,3,5,7] from a pair."""
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                cutlass.Int32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Int32(b).ir_value(loc=loc, ip=ip),
-            ],
-            "prmt.b32 $0, $1, $2, 0x7531;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
+_prmt_even = _binary_b32_op(
+    "_prmt_even",
+    "prmt.b32 $0, $1, $2, 0x6420;",
+    "Select bytes [0,2,4,6] from a pair of b32 words.",
+)
+
+_prmt_odd = _binary_b32_op(
+    "_prmt_odd",
+    "prmt.b32 $0, $1, $2, 0x7531;",
+    "Select bytes [1,3,5,7] from a pair of b32 words.",
+)
+
+_max_bf16x2 = _binary_b32_op(
+    "_max_bf16x2",
+    "max.bf16x2 $0, $1, $2;",
+    "Elementwise max of two packed bf16x2 words (operands must be non-negative).",
+)
+
+_amax_bf16x2 = _binary_b32_op(
+    "_amax_bf16x2",
+    "max.xorsign.abs.bf16x2 $0, $1, $2;",
+    "max(|a|,|b|) per bf16 lane; result sign bits are junk and must be masked.",
+)
 
 
 @dsl_user_op
@@ -109,48 +156,6 @@ def _bf16x2(hi, lo, *, loc=None, ip=None):
             [F32(hi).ir_value(loc=loc, ip=ip), F32(lo).ir_value(loc=loc, ip=ip)],
             "cvt.rn.bf16x2.f32 $0, $1, $2;",
             "=r,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _max_bf16x2(a, b, *, loc=None, ip=None):
-    """Elementwise max of two packed bf16x2 words (operands must be non-negative)."""
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                cutlass.Int32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Int32(b).ir_value(loc=loc, ip=ip),
-            ],
-            "max.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def _amax_bf16x2(a, b, *, loc=None, ip=None):
-    """max(|a|,|b|) per bf16 lane; result sign bits are junk and must be masked."""
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                cutlass.Int32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Int32(b).ir_value(loc=loc, ip=ip),
-            ],
-            "max.xorsign.abs.bf16x2 $0, $1, $2;",
-            "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -257,7 +262,9 @@ def swiglu_mxfp8_kernel(
     if cutlass.const_expr(ROWWISE):
         fq4r = cute.make_rmem_tensor(4, I32)
 
-    for p in cutlass.range_constexpr(NP):
+    # A runtime loop, not range_constexpr: fully unrolling this phase regressed
+    # large-shape performance in the backward-bidirectional tuning runs.
+    for p in cutlass.range(NP):
         rl = p * NR + rw
         row = rt * I32(TR) + rl
         cute.autovec_copy(
@@ -302,21 +309,15 @@ def swiglu_mxfp8_kernel(
                 silu_grad0, silu_grad1 = cute.arch.mul_packed_f32x2(
                     (s0, s1), (deriv0, deriv1)
                 )
-                grad_up0, grad_up1 = cute.arch.mul_packed_f32x2(
-                    (h0, h1), (u0, u1)
-                )
+                grad_up0, grad_up1 = cute.arch.mul_packed_f32x2((h0, h1), (u0, u1))
                 dg0, dg1 = cute.arch.mul_packed_f32x2(
                     (grad_up0, grad_up1), (silu_grad0, silu_grad1)
                 )
-                du0, du1 = cute.arch.mul_packed_f32x2(
-                    (h0, h1), (silu0, silu1)
-                )
+                du0, du1 = cute.arch.mul_packed_f32x2((h0, h1), (silu0, silu1))
                 w0[e >> 1] = _bf16x2(dg1, dg0)
                 w1[e >> 1] = _bf16x2(du1, du0)
             else:
-                y0, y1 = cute.arch.mul_packed_f32x2(
-                    (silu0, silu1), (u0, u1)
-                )
+                y0, y1 = cute.arch.mul_packed_f32x2((silu0, silu1), (u0, u1))
                 w0[e >> 1] = _bf16x2(y1, y0)
 
         if cutlass.const_expr(COLWISE):
@@ -497,15 +498,36 @@ def launcher(
     )
 
 
-_CACHE = {}
-_STREAMS = {}
+@functools.cache
+def _compile_kernel(M, K, is_bwd, rowwise, colwise, device_index):
+    """Compile and cache one kernel specialization.
+
+    Tensor addresses are runtime arguments, so a single compilation per
+    (shape, flags, device) serves every subsequent call. ``device_index`` is
+    part of the cache key only; compilation targets the active device.
+    """
+    del device_index
+    from cutlass.cute.runtime import make_fake_stream
+
+    null = cutlass.Int64(0)
+    return cute.compile(
+        launcher,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        make_fake_stream(),
+        M,
+        K,
+        is_bwd,
+        rowwise,
+        colwise,
+    )
 
 
-def _ceil_div(a, b):
-    return (a + b - 1) // b
-
-
-def _validate_inputs(gated_input, grad_h=None):
+def _validate_inputs(gated_input, grad_out=None):
     if not gated_input.is_cuda:
         raise ValueError("gated_input must be a CUDA tensor")
     if gated_input.dtype != torch.bfloat16:
@@ -516,54 +538,82 @@ def _validate_inputs(gated_input, grad_h=None):
     if two_k % 2:
         raise ValueError("gated_input.shape[1] must be even")
     K = two_k // 2
+    # M % 128 keeps every CTA row-tile whole; K % 128 keeps K // 32 a multiple
+    # of 4. Together they mean the blocked scale layout needs no padding, so
+    # every element of the scale tensors is written by the kernel.
     if M % 128 or K % 128:
         raise ValueError("M and K must be divisible by 128")
-    if grad_h is not None:
+    # Every gmem layout below is built from Python ints, so CuTe emits 32-bit
+    # coordinate-to-index math. The largest element offset the input layout can
+    # reach is 2*K*M - K - 1; beyond INT32_MAX it wraps to a negative offset and
+    # silently corrupts memory, so reject those shapes outright.
+    if 2 * K * M - K - 1 > _INT32_MAX:
+        raise ValueError(
+            f"M={M}, K={K} exceeds the kernel's 32-bit indexing limit "
+            f"(needs 2*K*M <= {_INT32_MAX})"
+        )
+    if grad_out is not None:
         if (
-            not grad_h.is_cuda
-            or grad_h.dtype != torch.bfloat16
-            or not grad_h.is_contiguous()
-            or tuple(grad_h.shape) != (M, K)
+            not grad_out.is_cuda
+            or grad_out.dtype != torch.bfloat16
+            or not grad_out.is_contiguous()
+            or tuple(grad_out.shape) != (M, K)
         ):
-            raise ValueError("grad_h must be contiguous BF16 CUDA [M, K]")
+            raise ValueError("grad_out must be contiguous BF16 CUDA [M, K]")
+        if grad_out.device != gated_input.device:
+            raise ValueError(
+                f"grad_out is on {grad_out.device} but gated_input is on "
+                f"{gated_input.device}; both must be on the same CUDA device"
+            )
     return M, K
 
 
+def rowwise_scale_shape(M, out_k):
+    """Blocked tcgen05 scale shape for the 1x32 layout, as a 2D tensor."""
+    return ceil_div(M, 128) * 128, ceil_div(out_k // 32, 4) * 4
+
+
+def colwise_scale_numel(M, out_k):
+    """Element count of the flat 32x1 scale tensor, matching the 32x1 quantizer."""
+    return (ceil_div(out_k, 128) * 128) * (ceil_div(M // 32, 4) * 4)
+
+
 def _allocate_outputs(M, K, out_halves, rowwise, colwise, device):
+    """Allocate the fixed four outputs; disabled directions get empty tensors."""
     out_k = out_halves * K
-    row_qdata = row_scales = None
-    col_qdata = col_scales = None
+    empty_qdata = torch.empty(0, device=device, dtype=torch.float8_e4m3fn)
+    empty_scales = torch.empty(0, device=device, dtype=torch.float8_e8m0fnu)
 
     if rowwise:
-        row_qdata = torch.empty(
+        output_rowwise = torch.empty(
             (M, out_k),
             device=device,
             dtype=torch.float8_e4m3fn,
         )
-        row_scale_rows = _ceil_div(M, 128) * 128
-        row_scale_cols = _ceil_div(out_k // 32, 4) * 4
-        row_scales = torch.empty(
-            (row_scale_rows, row_scale_cols),
+        scales_rowwise = torch.empty(
+            rowwise_scale_shape(M, out_k),
             device=device,
             dtype=torch.float8_e8m0fnu,
         )
+    else:
+        output_rowwise, scales_rowwise = empty_qdata, empty_scales
 
     if colwise:
-        col_qdata = torch.empty_strided(
+        output_colwise = torch.empty_strided(
             (M, out_k),
             (1, M),
             device=device,
             dtype=torch.float8_e4m3fn,
         )
-        col_scale_rows = _ceil_div(out_k, 128) * 128
-        col_scale_cols = _ceil_div(M // 32, 4) * 4
-        col_scales = torch.empty(
-            col_scale_rows * col_scale_cols,  # flat 1D, matching reference layout
+        scales_colwise = torch.empty(
+            colwise_scale_numel(M, out_k),  # flat 1D, matching reference layout
             device=device,
             dtype=torch.float8_e8m0fnu,
         )
+    else:
+        output_colwise, scales_colwise = empty_qdata, empty_scales
 
-    return row_qdata, row_scales, col_qdata, col_scales
+    return output_rowwise, output_colwise, scales_rowwise, scales_colwise
 
 
 def _ptr(tensor):
@@ -571,11 +621,11 @@ def _ptr(tensor):
 
 
 @torch.no_grad()
-def _run(gated_input, grad_h, rowwise, colwise):
+def _run(gated_input, grad_out, rowwise, colwise):
     if not rowwise and not colwise:
         raise ValueError("at least one of rowwise or colwise must be enabled")
-    M, K = _validate_inputs(gated_input, grad_h)
-    is_bwd = grad_h is not None
+    M, K = _validate_inputs(gated_input, grad_out)
+    is_bwd = grad_out is not None
     out_halves = 2 if is_bwd else 1
     outputs = _allocate_outputs(
         M,
@@ -585,72 +635,66 @@ def _run(gated_input, grad_h, rowwise, colwise):
         colwise,
         gated_input.device,
     )
-    row_qdata, row_scales, col_qdata, col_scales = outputs
+    output_rowwise, output_colwise, scales_rowwise, scales_colwise = outputs
 
-    key = (is_bwd, rowwise, colwise, M, K)
-    fn = _CACHE.get(key)
-    stream_handle = torch.cuda.current_stream().cuda_stream
-    stream = _STREAMS.get(stream_handle)
-    if stream is None:
-        stream = CUstream(stream_handle)
-        _STREAMS[stream_handle] = stream
-
-    args = (
-        _ptr(grad_h),
-        gated_input.data_ptr(),
-        _ptr(row_qdata),
-        _ptr(row_scales),
-        _ptr(col_qdata),
-        _ptr(col_scales),
-    )
-    if fn is None:
-        fn = cute.compile(
-            launcher,
-            *(cutlass.Int64(arg) for arg in args),
-            stream,
+    # Compile and launch under the input's device, not whatever device happens
+    # to be current -- otherwise a caller holding cuda:0 current while passing a
+    # cuda:1 tensor would launch with foreign pointers.
+    with torch.cuda.device(gated_input.device):
+        # Wrapping the handle is cheap; caching it would keep stale entries
+        # alive after a stream is destroyed and could alias a recycled handle.
+        stream = CUstream(torch.cuda.current_stream(gated_input.device).cuda_stream)
+        fn = _compile_kernel(
             M,
             K,
             is_bwd,
             rowwise,
             colwise,
+            gated_input.device.index,
         )
-        _CACHE[key] = fn
-    fn(*args, stream)
+        fn(
+            _ptr(grad_out),
+            gated_input.data_ptr(),
+            _ptr(output_rowwise) if rowwise else 0,
+            _ptr(scales_rowwise) if rowwise else 0,
+            _ptr(output_colwise) if colwise else 0,
+            _ptr(scales_colwise) if colwise else 0,
+            stream,
+        )
     return outputs
 
 
-def swiglu_mxfp8_forward_row(gated_input):
-    """Forward SwiGLU fused with MXFP8 rowwise (1x32) quantization."""
-    row_qdata, row_scales, _, _ = _run(gated_input, None, True, False)
-    return row_qdata, row_scales
+def swiglu_mxfp8_forward_cutedsl(gated_input, rowwise, colwise):
+    """SwiGLU forward fused with the MXFP8 cast.
 
+    Args:
+        gated_input: contiguous BF16 CUDA tensor of shape (M, 2K) holding
+            ``gate`` in the first K columns and ``up`` in the last K. M and K
+            must both be divisible by 128.
+        rowwise: emit 1x32-scaled, row-major output.
+        colwise: emit 32x1-scaled, column-major output.
 
-def swiglu_mxfp8_forward_col(gated_input):
-    """Forward SwiGLU fused with MXFP8 colwise (32x1) quantization."""
-    _, _, col_qdata, col_scales = _run(gated_input, None, False, True)
-    return col_qdata, col_scales
-
-
-def swiglu_mxfp8_forward_bidirectional(gated_input):
-    """Forward SwiGLU fused with both MXFP8 rowwise and colwise quantization."""
-    return _run(gated_input, None, True, True)
-
-
-def swiglu_mxfp8_backward_row(grad_h, gated_input):
-    """Backward SwiGLU fused with MXFP8 rowwise (1x32) quantization.
-
-    Returns [M, 2K] qdata with dGate in first K columns and dUp in last K columns.
+    Returns:
+        ``(output_rowwise, output_colwise, scales_rowwise, scales_colwise)``,
+        each of width K. Disabled directions come back as zero-sized tensors.
     """
-    row_qdata, row_scales, _, _ = _run(gated_input, grad_h, True, False)
-    return row_qdata, row_scales
+    return _run(gated_input, None, rowwise, colwise)
 
 
-def swiglu_mxfp8_backward_col(grad_h, gated_input):
-    """Backward SwiGLU fused with MXFP8 colwise (32x1) quantization."""
-    _, _, col_qdata, col_scales = _run(gated_input, grad_h, False, True)
-    return col_qdata, col_scales
+def swiglu_mxfp8_backward_cutedsl(grad_h, gated_input, rowwise, colwise):
+    """SwiGLU backward fused with the MXFP8 cast.
 
+    Args:
+        grad_h: contiguous BF16 CUDA tensor of shape (M, K), on the same device
+            as ``gated_input``.
+        gated_input: the forward input, shape (M, 2K).
+        rowwise: emit 1x32-scaled, row-major output.
+        colwise: emit 32x1-scaled, column-major output.
 
-def swiglu_mxfp8_backward_bidirectional(grad_h, gated_input):
-    """Backward SwiGLU fused with both MXFP8 rowwise and colwise quantization."""
-    return _run(gated_input, grad_h, True, True)
+    Returns:
+        ``(output_rowwise, output_colwise, scales_rowwise, scales_colwise)`` for
+        the concatenated ``[dGate | dUp]`` gradient, so each output is 2K wide --
+        the layout a fused w13 weight expects for the wgrad GEMM. Disabled
+        directions come back as zero-sized tensors.
+    """
+    return _run(gated_input, grad_h, rowwise, colwise)

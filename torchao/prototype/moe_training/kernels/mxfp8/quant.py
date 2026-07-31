@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -1135,10 +1135,11 @@ def _fake_mxfp8_quantize_2d_32x1_cutedsl_custom_op(
     assert block_size == 32, "Only block_size=32 is supported"
     m, k = x.shape
 
-    # For 32x1 scaling, output data has same dimensions as input (no padding)
+    # For 32x1 scaling, output data has same dimensions as input (no padding).
+    # The kernel writes it column-major, so the fake must say so too.
     q_data = torch.empty_strided(
         (m, k),
-        (k, 1),
+        (1, m),
         device=x.device,
         dtype=torch.float8_e4m3fn,
     )
@@ -1152,6 +1153,121 @@ def _fake_mxfp8_quantize_2d_32x1_cutedsl_custom_op(
         dtype=torch.float8_e8m0fnu,
     )
     return q_data, scales
+
+
+# ---------------------------------------------------------------------------
+# Fused SwiGLU + MXFP8 quantization
+#
+# Two operators, both returning the same fixed four-tensor tuple in the order
+# used by torchao's generic CUDA MXFP8 API
+# (torchao/prototype/mx_formats/kernels.py::mxfp8_quantize_cuda):
+#
+#     (output_rowwise, output_colwise, scales_rowwise, scales_colwise)
+#
+# `rowwise` and `colwise` are static booleans that select a compile-time kernel
+# specialization. Disabled directions come back zero-sized so the arity never
+# varies. Input is a packed `gated_input` of shape (M, 2K) -- `gate` in the first
+# K columns, `up` in the last K -- which is what a fused w13 projection produces.
+# ---------------------------------------------------------------------------
+
+
+@torch.library.custom_op("torchao::swiglu_mxfp8_forward", mutates_args=())
+def _swiglu_mxfp8_forward(
+    gated_input: torch.Tensor,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_swiglu_mxfp8 import (
+        swiglu_mxfp8_forward_cutedsl,
+    )
+
+    return swiglu_mxfp8_forward_cutedsl(gated_input, rowwise, colwise)
+
+
+@torch.library.custom_op("torchao::swiglu_mxfp8_backward", mutates_args=())
+def _swiglu_mxfp8_backward(
+    grad_h: torch.Tensor,
+    gated_input: torch.Tensor,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_swiglu_mxfp8 import (
+        swiglu_mxfp8_backward_cutedsl,
+    )
+
+    return swiglu_mxfp8_backward_cutedsl(grad_h, gated_input, rowwise, colwise)
+
+
+def _fake_swiglu_mxfp8_outputs(
+    gated_input: torch.Tensor,
+    out_k: int,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta outputs for both SwiGLU ops; must mirror _allocate_outputs exactly.
+
+    Shapes are recomputed here rather than imported from the CuTe module so the
+    meta path stays free of the cutlass dependency.
+    """
+    m = gated_input.shape[0]
+    empty_qdata = gated_input.new_empty(0, dtype=torch.float8_e4m3fn)
+    empty_scales = gated_input.new_empty(0, dtype=torch.float8_e8m0fnu)
+
+    if rowwise:
+        output_rowwise = torch.empty_strided(
+            (m, out_k),
+            (out_k, 1),
+            device=gated_input.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scales_rowwise = gated_input.new_empty(
+            (ceil_div(m, 128) * 128, ceil_div(out_k // 32, 4) * 4),
+            dtype=torch.float8_e8m0fnu,
+        )
+    else:
+        output_rowwise, scales_rowwise = empty_qdata, empty_scales
+
+    if colwise:
+        output_colwise = torch.empty_strided(
+            (m, out_k),
+            (1, m),
+            device=gated_input.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scales_colwise = gated_input.new_empty(
+            ((ceil_div(out_k, 128) * 128) * (ceil_div(m // 32, 4) * 4),),
+            dtype=torch.float8_e8m0fnu,
+        )
+    else:
+        output_colwise, scales_colwise = empty_qdata, empty_scales
+
+    return output_rowwise, output_colwise, scales_rowwise, scales_colwise
+
+
+@_swiglu_mxfp8_forward.register_fake
+def _fake_swiglu_mxfp8_forward(
+    gated_input: torch.Tensor,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Forward emits h = silu(gate) * up, so the outputs are K wide.
+    return _fake_swiglu_mxfp8_outputs(
+        gated_input, gated_input.shape[1] // 2, rowwise, colwise
+    )
+
+
+@_swiglu_mxfp8_backward.register_fake
+def _fake_swiglu_mxfp8_backward(
+    grad_h: torch.Tensor,
+    gated_input: torch.Tensor,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del grad_h
+    # Backward emits the concatenated [dGate | dUp], so the outputs are 2K wide.
+    return _fake_swiglu_mxfp8_outputs(
+        gated_input, gated_input.shape[1], rowwise, colwise
+    )
 
 
 if _mxfp8_cutedsl_kernels_available:
@@ -1568,3 +1684,60 @@ def mxfp8_quantize_2d_32x1_cutedsl(
         offs=offs,
     )
     return qdata, scales
+
+
+def _require_cutedsl(name: str) -> None:
+    if _mxfp8_cutedsl_kernels_available:
+        return
+    missing_packages = _missing_cutedsl_runtime_packages()
+    if missing_packages:
+        missing = ", ".join(missing_packages)
+        raise NotImplementedError(
+            f"{name} requires additional Python runtime package(s): "
+            f"{missing}. Please install `nvidia-cutlass-dsl` and `apache-tvm-ffi`."
+        )
+    raise NotImplementedError(f"{name} requires CUDA, SM 10.x, and CUDA 12.8+.")
+
+
+def swiglu_mxfp8_quantize(
+    gated_input: torch.Tensor,
+    grad_h: Optional[torch.Tensor] = None,
+    *,
+    rowwise: bool = True,
+    colwise: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fuse a SwiGLU activation and its RCEIL MXFP8 cast into one pass on SM100.
+
+    Passing ``grad_h`` selects the backward direction. Both directions read
+    ``gated_input`` once and can emit rowwise scales, colwise scales, or both
+    from that single read.
+
+    Args:
+        gated_input: BF16 tensor of shape (M, 2K) holding ``gate`` in the first
+            K columns and ``up`` in the last K -- the layout a fused w13
+            projection produces. M and K must both be multiples of 128.
+        grad_h: optional BF16 gradient of shape (M, K), on the same device as
+            ``gated_input``. When given, the backward pass is computed and every
+            output is 2K wide, holding the concatenated ``[dGate | dUp]``.
+        rowwise: emit 1x32-scaled, row-major output.
+        colwise: emit 32x1-scaled, column-major (stride ``(1, M)``) output.
+
+    Returns:
+        Always four tensors, in the same order as
+        :func:`torchao.prototype.mx_formats.kernels.mxfp8_quantize_cuda`::
+
+            (output_rowwise, output_colwise, scales_rowwise, scales_colwise)
+
+        E8M0 scales use the same blocked tcgen05 layouts as
+        :func:`mxfp8_quantize_2d_1x32_cutedsl` (2D) and
+        :func:`mxfp8_quantize_2d_32x1_cutedsl` (flat 1D). Disabled directions
+        return zero-sized tensors of the right device and dtype, so the output
+        arity never varies.
+    """
+    _require_cutedsl("swiglu_mxfp8_quantize")
+    if not rowwise and not colwise:
+        raise ValueError("at least one of rowwise or colwise must be enabled")
+    if grad_h is None:
+        return _swiglu_mxfp8_forward(gated_input, rowwise, colwise)
+    return _swiglu_mxfp8_backward(grad_h, gated_input, rowwise, colwise)

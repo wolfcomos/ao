@@ -6,6 +6,7 @@ from torchao.prototype.moe_training.kernels.mxfp8.quant import (
     mxfp8_quantize_2d_1x32_cutedsl,  # noqa: F401
     mxfp8_quantize_2d_32x1_cutedsl,  # noqa: F401
     mxfp8_quantize_cuda_3d,  # noqa: F401
+    swiglu_mxfp8_quantize,  # noqa: F401
     torch_pad_token_groups,  # noqa: F401
     torch_to_blocked_2d_K_groups,  # noqa: F401
     torch_to_blocked_2d_M_groups,  # noqa: F401
