@@ -293,11 +293,13 @@ def swiglu_mxfp8_kernel(
                 one_minus_s0, one_minus_s1 = cute.arch.sub_packed_f32x2(
                     (ONE, ONE), (s0, s1)
                 )
-                gx0, gx1 = cute.arch.mul_packed_f32x2(
-                    (g0, g1), (one_minus_s0, one_minus_s1)
+                # fma, not a separate multiply and add: the Triton reference
+                # writes `1.0 + gate * (1.0 - sigmoid)`, which its compiler
+                # contracts into a single FMA. Splitting it rounds twice and
+                # costs bitwise agreement on a few codes per million.
+                deriv0, deriv1 = cute.arch.fma_packed_f32x2(
+                    (g0, g1), (one_minus_s0, one_minus_s1), (ONE, ONE)
                 )
-                deriv0 = ONE + gx0
-                deriv1 = ONE + gx1
                 silu_grad0, silu_grad1 = cute.arch.mul_packed_f32x2(
                     (s0, s1), (deriv0, deriv1)
                 )

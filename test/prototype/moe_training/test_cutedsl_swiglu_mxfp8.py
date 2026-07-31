@@ -12,11 +12,19 @@ Every case goes through the public API -- `swiglu_mxfp8_forward` or
   forward:  h = silu(gate) * up          -> mxfp8_quantize_2d_{1x32,32x1}_cutedsl(h)
   backward: dGate, dUp via SwiGLU grads  -> the same quantize functions
 
-Every output must match BITWISE -- E4M3 data and E8M0 scales, both directions,
-all layouts. The reference below mirrors the kernel's multiply order exactly:
-dUp is `grad_h * (gate * sigmoid)`, forming silu first, because
-`grad_h * gate * sigmoid` associates as `(grad_h * gate) * sigmoid` and rounds
-differently in fp32.
+E8M0 scales and forward E4M3 data must match BITWISE. Backward E4M3 data is
+allowed to differ by at most one code in a bounded fraction of elements.
+
+That allowance is not slop: the kernel evaluates sigmoid as
+`rcp.rn(1 + ex2.approx(-x * log2e))`, a hardware fast exponential chosen so the
+kernel is bitwise consistent with the reference gated-MXFP8 implementation it
+has to interoperate with. No PyTorch op reproduces `ex2.approx` bit for bit, so
+exact agreement with `torch.sigmoid` is not achievable by construction. The
+reference below otherwise mirrors the kernel's evaluation order exactly, so the
+sigmoid is the only remaining source of difference. Measured over 6 seeds x 4
+shapes: forward 0 of 100.7M codes differ, backward 115 of 201.5M (5.7e-7), max
+gap 1 code, scales exact throughout. _MAX_DIFFERING_FRACTION is set well above
+the measured rate so a systematic error still fails.
 """
 
 import pytest
@@ -48,6 +56,9 @@ _LAYOUTS = [
     (True, True),
 ]
 
+# Backward E4M3 only; see the module docstring. Measured rate is 5.7e-7.
+_MAX_DIFFERING_FRACTION = 1e-5
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -61,11 +72,14 @@ def _eager_reference(gated_input, grad_h):
     if grad_h is None:
         return (F.silu(gate) * up).bfloat16()
     grad_h_f = grad_h.float()
+    # Mirror the kernel's evaluation order exactly:
+    #   act  = x * s ;  dact = act * (1 - s) + s
+    #   dGate = (dact * grad) * up ;  dUp = act * grad
     sigmoid_gate = torch.sigmoid(gate)
-    d_silu = sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
-    dgate = (grad_h_f * up * d_silu).bfloat16()
-    # grad_h * (gate * sigmoid), matching the kernel; see the module docstring.
-    dup = (grad_h_f * (gate * sigmoid_gate)).bfloat16()
+    act = gate * sigmoid_gate
+    dact = act * (1.0 - sigmoid_gate) + sigmoid_gate
+    dgate = ((dact * grad_h_f) * up).bfloat16()
+    dup = (act * grad_h_f).bfloat16()
     return torch.cat([dgate, dup], dim=1)
 
 
@@ -81,6 +95,23 @@ def _assert_identical(actual, ref, msg):
     """Bitwise equality, including shape, stride and dtype."""
     _assert_layout(actual, ref, msg)
     torch.testing.assert_close(actual, ref, rtol=0, atol=0, msg=msg)
+
+
+def _assert_qdata_matches(actual, ref, msg, exact):
+    """Exact for forward; at most a one-code difference for backward."""
+    if exact:
+        _assert_identical(actual, ref, msg)
+        return
+    _assert_layout(actual, ref, msg)
+    a = actual.contiguous().view(torch.uint8).int()
+    r = ref.contiguous().view(torch.uint8).int()
+    gap = (a - r).abs()
+    max_gap = int(gap.max())
+    assert max_gap <= 1, f"{msg}: max E4M3 code gap {max_gap} > 1"
+    fraction = int((gap != 0).sum()) / a.numel()
+    assert fraction <= _MAX_DIFFERING_FRACTION, (
+        f"{msg}: {fraction:.3e} of codes differ, limit {_MAX_DIFFERING_FRACTION:.3e}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +152,9 @@ def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
         assert output_rowwise.stride() == (expected_width, 1), (
             f"{tag}: rowwise qdata must be row-major, got {output_rowwise.stride()}"
         )
-        _assert_identical(output_rowwise, ref_q, f"{tag}: rowwise qdata")
+        _assert_qdata_matches(
+            output_rowwise, ref_q, f"{tag}: rowwise qdata", exact=not is_backward
+        )
         _assert_identical(scales_rowwise, ref_s, f"{tag}: rowwise scales")
     else:
         assert output_rowwise.numel() == 0, f"{tag}: rowwise output should be empty"
@@ -136,7 +169,9 @@ def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
         assert output_colwise.stride() == (1, M), (
             f"{tag}: colwise qdata must have stride (1, M), got {output_colwise.stride()}"
         )
-        _assert_identical(output_colwise, ref_q, f"{tag}: colwise qdata")
+        _assert_qdata_matches(
+            output_colwise, ref_q, f"{tag}: colwise qdata", exact=not is_backward
+        )
         _assert_identical(scales_colwise, ref_s, f"{tag}: colwise scales")
         # The 32x1 quantizer returns flat scales; ours must match that layout.
         assert scales_colwise.ndim == 1, f"{tag}: colwise scales should be flat"

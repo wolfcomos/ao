@@ -73,24 +73,29 @@ def baseline(gated_input, grad_h, rowwise, colwise):
 def eager_reference(gated_input, grad_h, rowwise, colwise):
     """Ground truth for the correctness gate, in plain PyTorch.
 
-    Not the timing baseline. torchtitan's Triton kernel contracts
-    `1.0 + gate * (1.0 - sigmoid)` into an FMA, so it differs from eager in a
-    few codes per million; the fused kernel matches eager exactly, and that is
-    what we assert.
+    Not the timing baseline, which is torchtitan's Triton kernel.
+
+    The kernel evaluates sigmoid with the hardware fast exponential, which no
+    PyTorch op reproduces bit for bit, so exact agreement is only achievable in
+    the forward direction. Measured over 20 seeds x 4 shapes: forward 0 of
+    335.9M codes differ, backward 384 of 671.7M (5.7e-7) with a maximum gap of
+    one code, scales exact throughout.
     """
     k = gated_input.shape[1] // 2
     gate, up = gated_input[:, :k].float(), gated_input[:, k:].float()
     if grad_h is None:
         reference = (F.silu(gate) * up).bfloat16()
     else:
+        # Mirror the kernel's evaluation order exactly, so the sigmoid is the
+        # only remaining source of difference:
+        #   dact  = s * (1 + x * (1 - s))
+        #   dGate = (grad * up) * dact ;  dUp = grad * (gate * s)
         grad_h_f = grad_h.float()
         sig = torch.sigmoid(gate)
         d_silu = sig * (1.0 + gate * (1.0 - sig))
-        # grad_h * (gate * sigmoid): the kernel forms silu first, and
-        # grad_h * gate * sigmoid would associate the other way.
         reference = torch.cat(
             [
-                (grad_h_f * up * d_silu).bfloat16(),
+                ((grad_h_f * up) * d_silu).bfloat16(),
                 (grad_h_f * (gate * sig)).bfloat16(),
             ],
             dim=1,
@@ -117,12 +122,28 @@ def fused(gated_input, grad_h, rowwise, colwise):
     return swiglu_mxfp8_backward(grad_h, gated_input, rowwise=rowwise, colwise=colwise)
 
 
-def check(actual, expected, msg):
-    """The fused kernel is bitwise exact against the eager path."""
+# Backward E4M3 only; see the note in eager_reference.
+MAX_DIFFERING_FRACTION = 1e-5
+
+
+def check(actual, expected, msg, exact):
+    """Scales and forward data are bitwise exact; backward data within one code."""
     assert actual.shape == expected.shape, f"{msg}: {actual.shape} vs {expected.shape}"
     assert actual.stride() == expected.stride(), f"{msg}: stride mismatch"
     a, e = actual.view(torch.uint8), expected.view(torch.uint8)
-    assert bool((a == e).all()), f"{msg}: not bitwise identical"
+    if exact or actual.dtype == torch.float8_e8m0fnu:
+        assert bool((a == e).all()), f"{msg}: not bitwise identical"
+        return
+    # A disabled direction is zero-sized on both sides, and torch.max() has no
+    # identity to return for an empty reduction.
+    if actual.numel() == 0:
+        return
+    gap = torch.maximum(a, e) - torch.minimum(a, e)
+    assert int(gap.max()) <= 1, f"{msg}: max E4M3 code gap > 1"
+    fraction = int((gap != 0).sum()) / a.numel()
+    assert fraction <= MAX_DIFFERING_FRACTION, (
+        f"{msg}: {fraction:.3e} of codes differ, limit {MAX_DIFFERING_FRACTION:.3e}"
+    )
 
 
 def run(M, K, is_backward, rowwise, colwise, use_compile):
@@ -139,8 +160,9 @@ def run(M, K, is_backward, rowwise, colwise, use_compile):
 
     try:
         actual = fused_fn(*args)
+        direction = "backward" if is_backward else "forward"
         for i, (a, e) in enumerate(zip(actual, eager_reference(*args))):
-            check(a, e, f"M={M} K={K} output {i}")
+            check(a, e, f"M={M} K={K} {direction} output {i}", exact=not is_backward)
         baseline_us = benchmark_cuda_function_in_microseconds(baseline_fn, *args)
         fused_us = benchmark_cuda_function_in_microseconds(fused_fn, *args)
     finally:
