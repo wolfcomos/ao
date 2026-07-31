@@ -157,18 +157,40 @@ def _bf16x2(hi, lo, *, loc=None, ip=None):
     )
 
 
-@cute.jit
-def _rcp2(d0: F32, d1: F32):
-    """Correctly-rounded 1/d for d >= 1: rcp.approx + two Markstein FMA steps."""
-    one = F32(1.0)
-    x0 = cute.arch.rcp_approx(d0)
-    x1 = cute.arch.rcp_approx(d1)
-    n0, n1 = cute.arch.sub_packed_f32x2((F32(0.0), F32(0.0)), (d0, d1))
-    e0, e1 = cute.arch.fma_packed_f32x2((n0, n1), (x0, x1), (one, one))
-    x0, x1 = cute.arch.fma_packed_f32x2((x0, x1), (e0, e1), (x0, x1))
-    e0, e1 = cute.arch.fma_packed_f32x2((n0, n1), (x0, x1), (one, one))
-    x0, x1 = cute.arch.fma_packed_f32x2((x0, x1), (e0, e1), (x0, x1))
-    return x0, x1
+@dsl_user_op
+def _sigmoid(x, *, loc=None, ip=None):
+    """``1 / (1 + exp(-x))``, lowered exactly as the Triton reference does.
+
+    Emitted as raw PTX because bitwise agreement with that kernel depends on the
+    precise instruction choice, and both of these are approximations that a
+    higher-level formulation would not reproduce::
+
+        mul.f32        t, x, 0fBFB8AA3B    // -x * log2(e)
+        ex2.approx.f32 t, t                // fast exponential
+        add.f32        t, t, 0f3F800000
+        div.full.f32   s, 1.0, t           // fast division, ~2 ULP
+
+    Using an accurate exponential or a correctly rounded reciprocal here is both
+    slower and *less* compatible: it disagrees with the reference on a few codes
+    per million after the bf16 and E4M3 rounding.
+    """
+    return F32(
+        llvm.inline_asm(
+            T.f32(),
+            [F32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 t;\n"
+            "mul.f32 t, $1, 0fBFB8AA3B;\n"
+            "ex2.approx.f32 t, t;\n"
+            "add.f32 t, t, 0f3F800000;\n"
+            "div.full.f32 $0, 0f3F800000, t; }",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @cute.jit
@@ -282,9 +304,8 @@ def swiglu_mxfp8_kernel(
             u0 = fu[e].to(F32)
             u1 = fu[e + 1].to(F32)
 
-            d0 = ONE + cute.math.exp(-g0)
-            d1 = ONE + cute.math.exp(-g1)
-            s0, s1 = _rcp2(d0, d1)
+            s0 = _sigmoid(g0)
+            s1 = _sigmoid(g1)
             silu0, silu1 = cute.arch.mul_packed_f32x2((g0, g1), (s0, s1))
 
             if cutlass.const_expr(IS_BWD):
