@@ -1686,19 +1686,6 @@ def mxfp8_quantize_2d_32x1_cutedsl(
     return qdata, scales
 
 
-def _require_cutedsl(name: str) -> None:
-    if _mxfp8_cutedsl_kernels_available:
-        return
-    missing_packages = _missing_cutedsl_runtime_packages()
-    if missing_packages:
-        missing = ", ".join(missing_packages)
-        raise NotImplementedError(
-            f"{name} requires additional Python runtime package(s): "
-            f"{missing}. Please install `nvidia-cutlass-dsl` and `apache-tvm-ffi`."
-        )
-    raise NotImplementedError(f"{name} requires CUDA, SM 10.x, and CUDA 12.8+.")
-
-
 def swiglu_mxfp8_quantize(
     gated_input: torch.Tensor,
     grad_h: Optional[torch.Tensor] = None,
@@ -1735,7 +1722,6 @@ def swiglu_mxfp8_quantize(
         return zero-sized tensors of the right device and dtype, so the output
         arity never varies.
     """
-    _require_cutedsl("swiglu_mxfp8_quantize")
     if not rowwise and not colwise:
         raise ValueError("at least one of rowwise or colwise must be enabled")
     if grad_h is None:
