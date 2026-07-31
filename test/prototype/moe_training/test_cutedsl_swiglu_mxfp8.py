@@ -7,22 +7,15 @@
 """
 Correctness tests for the unified SwiGLU + MXFP8 kernel (cutedsl_swiglu_mxfp8).
 
-Every case goes through the single public API, `swiglu_mxfp8_quantize`, and is
-compared against the equivalent eager sequence:
+Every case goes through the public API -- `swiglu_mxfp8_forward` or
+`swiglu_mxfp8_backward` -- and is compared against the equivalent eager sequence:
   forward:  h = silu(gate) * up          -> mxfp8_quantize_2d_{1x32,32x1}_cutedsl(h)
   backward: dGate, dUp via SwiGLU grads  -> the same quantize functions
 
-Agreement is near-exact:
-
-  * E8M0 scales match BITWISE, in every direction and layout.
-  * Forward E4M3 data matches BITWISE.
-  * Backward E4M3 data may differ in a handful of codes, by at most one code
-    each. The kernel evaluates sigmoid with rcp.approx plus two Markstein
-    refinement steps and fuses the d_silu product differently than eager
-    PyTorch, so a result can land 1 ULP away in bfloat16 and tip a quantized
-    code. Measured rate over 4 seeds x 4 shapes is ~3.6e-7 of elements (48 of
-    134M, max gap 1 code, SQNR 110 dB); _MAX_DIFFERING_FRACTION is set two
-    orders of magnitude above that so a systematic off-by-one still fails.
+E8M0 scales and forward E4M3 data must match bitwise. Backward E4M3 data may
+differ by at most one code in a small fraction of elements, because the kernel
+evaluates sigmoid with rcp.approx plus Markstein refinement and fuses the d_silu
+product differently than eager PyTorch.
 """
 
 import pytest
@@ -35,7 +28,8 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 1
 from torchao.prototype.moe_training.kernels.mxfp8 import (
     mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_2d_32x1_cutedsl,
-    swiglu_mxfp8_quantize,
+    swiglu_mxfp8_backward,
+    swiglu_mxfp8_forward,
 )
 
 _SHAPES = [
@@ -116,7 +110,7 @@ def _assert_qdata_matches(actual, ref, msg, exact):
 @pytest.mark.parametrize("M,K", _SHAPES)
 @pytest.mark.parametrize("is_backward", _DIRECTIONS)
 @pytest.mark.parametrize("rowwise,colwise", _LAYOUTS)
-def test_swiglu_mxfp8_quantize(M, K, is_backward, rowwise, colwise):
+def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
     torch.manual_seed(42)
     gated_input = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
     grad_h = (
@@ -124,9 +118,12 @@ def test_swiglu_mxfp8_quantize(M, K, is_backward, rowwise, colwise):
     )
     tag = f"bwd={is_backward} rowwise={rowwise} colwise={colwise} M={M} K={K}"
 
-    outputs = swiglu_mxfp8_quantize(
-        gated_input, grad_h, rowwise=rowwise, colwise=colwise
-    )
+    if is_backward:
+        outputs = swiglu_mxfp8_backward(
+            grad_h, gated_input, rowwise=rowwise, colwise=colwise
+        )
+    else:
+        outputs = swiglu_mxfp8_forward(gated_input, rowwise=rowwise, colwise=colwise)
 
     # Fixed four-output tuple regardless of which directions are enabled.
     assert isinstance(outputs, tuple) and len(outputs) == 4, f"{tag}: arity"
@@ -174,14 +171,8 @@ def test_swiglu_mxfp8_quantize(M, K, is_backward, rowwise, colwise):
         assert output_colwise.device == gated_input.device
 
 
-def test_swiglu_mxfp8_quantize_requires_a_direction():
-    gated_input = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="rowwise or colwise"):
-        swiglu_mxfp8_quantize(gated_input, rowwise=False, colwise=False)
-
-
 @pytest.mark.parametrize("is_backward", _DIRECTIONS)
-def test_swiglu_mxfp8_quantize_compile(is_backward):
+def test_swiglu_mxfp8_compile(is_backward):
     """Fullgraph compile exercises the fake impls and the fixed operator schema."""
     torch.manual_seed(42)
     M, K = 512, 2048
@@ -190,8 +181,16 @@ def test_swiglu_mxfp8_quantize_compile(is_backward):
         torch.randn(M, K, device="cuda", dtype=torch.bfloat16) if is_backward else None
     )
 
-    def fn(gated_input, grad_h):
-        return swiglu_mxfp8_quantize(gated_input, grad_h, rowwise=True, colwise=True)
+    if is_backward:
+
+        def fn(gated_input, grad_h):
+            return swiglu_mxfp8_backward(
+                grad_h, gated_input, rowwise=True, colwise=True
+            )
+    else:
+
+        def fn(gated_input, grad_h):
+            return swiglu_mxfp8_forward(gated_input, rowwise=True, colwise=True)
 
     try:
         expected = fn(gated_input, grad_h)
