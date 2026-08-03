@@ -20,11 +20,13 @@ That allowance is not slop: the kernel evaluates sigmoid as
 kernel is bitwise consistent with the reference gated-MXFP8 implementation it
 has to interoperate with. No PyTorch op reproduces `ex2.approx` bit for bit, so
 exact agreement with `torch.sigmoid` is not achievable by construction. The
-reference below otherwise mirrors the kernel's evaluation order exactly, so the
-sigmoid is the only remaining source of difference. Measured over 6 seeds x 4
-shapes: forward 0 of 100.7M codes differ, backward 115 of 201.5M (5.7e-7), max
-gap 1 code, scales exact throughout. _MAX_DIFFERING_FRACTION is set well above
-the measured rate so a systematic error still fails.
+reference below otherwise mirrors the kernel's evaluation order exactly (the
+kernel additionally contracts the d_silu term into one FMA, which eager cannot
+reproduce), so those two lowerings are the only remaining sources of
+difference. Measured over 6 seeds x 4 shapes: forward 0 of 101.6M codes
+differ, backward 75 of 203.3M (3.7e-7), max gap 1 code, scales exact
+throughout. _MAX_DIFFERING_FRACTION is set well above the measured rate so a
+systematic error still fails.
 """
 
 import pytest
@@ -73,13 +75,16 @@ def _eager_reference(gated_input, grad_h):
         return (F.silu(gate) * up).bfloat16()
     grad_h_f = grad_h.float()
     # Mirror the kernel's evaluation order exactly:
-    #   act  = x * s ;  dact = act * (1 - s) + s
-    #   dGate = (dact * grad) * up ;  dUp = act * grad
+    #   silu = gate * s ;  deriv = 1 + gate * (1 - s) ;  silu_grad = s * deriv
+    #   dGate = (grad * up) * silu_grad ;  dUp = grad * silu
+    # The kernel contracts `deriv` into a single FMA; eager has no fp32 fma,
+    # so that term rounds twice here and stays a (tiny) source of divergence.
     sigmoid_gate = torch.sigmoid(gate)
-    act = gate * sigmoid_gate
-    dact = act * (1.0 - sigmoid_gate) + sigmoid_gate
-    dgate = ((dact * grad_h_f) * up).bfloat16()
-    dup = (act * grad_h_f).bfloat16()
+    silu = gate * sigmoid_gate
+    deriv = gate * (1.0 - sigmoid_gate) + 1.0
+    silu_grad = sigmoid_gate * deriv
+    dgate = ((grad_h_f * up) * silu_grad).bfloat16()
+    dup = (grad_h_f * silu).bfloat16()
     return torch.cat([dgate, dup], dim=1)
 
 
@@ -181,6 +186,69 @@ def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
         assert output_colwise.dtype == torch.float8_e4m3fn
         assert scales_colwise.dtype == torch.float8_e8m0fnu
         assert output_colwise.device == gated_input.device
+
+
+def test_swiglu_mxfp8_special_values():
+    """Zero, tiny, Inf, and NaN scale blocks must match the standalone
+    quantizers bitwise: a clamped-to-0 scale byte pairs with the 2^126
+    reciprocal (so tiny blocks don't collapse to zero codes), Inf amax
+    saturates the scale byte to 254, and NaN elements come through as E4M3
+    NaN. Special rows pin gate to 20 (sigmoid saturates identically under
+    both lowerings) and use power-of-two `up` values so the h tensor is
+    bitwise stable and any difference isolates the scale path."""
+    torch.manual_seed(7)
+    M, K = 128, 128
+    gated_input = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+    gate = gated_input[:, :K]
+    up = gated_input[:, K:]
+
+    gate[:5, :] = 20.0
+    up[:5, :] = 0.5
+    up[0, :64] = 0.0  # all-zero rowwise scale blocks
+    up[1, :64] = 2.0**-125  # tiny amax: scale byte clamps to 0
+    up[2, 0] = float("inf")  # Inf amax rowwise block
+    up[3, 0] = float("inf")
+    up[3, 1] = -3.0e38  # h overflows f32 to -Inf: mixed-sign Inf block
+    gate[4, 0] = float("inf")
+    up[4, 0] = 0.0  # silu(inf) * 0 -> NaN element
+    gate[:32, 100:103] = 20.0
+    up[:32, 100] = 2.0**-125  # tiny colwise block
+    up[:32, 101] = 0.0  # zero colwise block
+    gate[:32, 102] = float("inf")
+    up[:32, 102] = 0.0  # all-NaN colwise block
+
+    reference = _eager_reference(gated_input, None)
+    out_r, out_c, s_r, s_c = swiglu_mxfp8_forward(
+        gated_input, rowwise=True, colwise=True
+    )
+    ref_qr, ref_sr = mxfp8_quantize_2d_1x32_cutedsl(reference, scaling_mode="rceil")
+    ref_qc, ref_sc = mxfp8_quantize_2d_32x1_cutedsl(reference, scaling_mode="rceil")
+
+    def _assert_bitwise(actual, ref, msg):
+        # assert_close treats NaN as unequal even at zero tolerance, and NaN
+        # codes are expected content here, so compare raw bytes.
+        _assert_layout(actual, ref, msg)
+        torch.testing.assert_close(
+            actual.contiguous().view(torch.uint8),
+            ref.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+            msg=msg,
+        )
+
+    _assert_bitwise(out_r, ref_qr, "special rowwise qdata")
+    _assert_bitwise(s_r, ref_sr, "special rowwise scales")
+    _assert_bitwise(out_c, ref_qc, "special colwise qdata")
+    _assert_bitwise(s_c, ref_sc, "special colwise scales")
+
+    # The tiny blocks must not collapse to zero codes: q = v * 2^126, not v * 1.
+    assert bool(out_r.view(torch.uint8)[1, :64].ne(0).all()), (
+        "tiny-amax block quantized to zero codes"
+    )
+    # NaN elements survive as E4M3 NaN.
+    assert int(out_r.view(torch.uint8)[4, 0]) & 0x7F == 0x7F, (
+        "NaN element did not map to the E4M3 NaN code"
+    )
 
 
 @pytest.mark.parametrize("is_backward", _DIRECTIONS)

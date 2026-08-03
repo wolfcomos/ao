@@ -19,8 +19,9 @@ colwise (32x1) scales, or both are produced from that single read, with
 ``IS_BWD`` / ``ROWWISE`` / ``COLWISE`` as ``Constexpr`` flags so each combination
 specializes with no runtime branching.
 
-Requires M and K to be multiples of 128, and ``2*K*M <= INT32_MAX`` because the
-gmem layouts are built from Python ints, so CuTe emits 32-bit index math.
+Requires M and K to be multiples of 128, and ``2*K*M - K - 1 <= INT32_MAX``
+(the largest element offset the input layout reaches) because the gmem layouts
+are built from Python ints, so CuTe emits 32-bit index math.
 Scaling is RCEIL; scales use the blocked tcgen05 layouts.
 """
 
@@ -128,14 +129,16 @@ _prmt_odd = _binary_b32_op(
 
 _max_bf16x2 = _binary_b32_op(
     "_max_bf16x2",
-    "max.bf16x2 $0, $1, $2;",
-    "Elementwise max of two packed bf16x2 words (operands must be non-negative).",
+    "max.NaN.bf16x2 $0, $1, $2;",
+    "Elementwise max of two packed bf16x2 words (operands must be non-negative). "
+    "NaN-propagating, like the standalone quantizers' amax reduction.",
 )
 
 _amax_bf16x2 = _binary_b32_op(
     "_amax_bf16x2",
-    "max.xorsign.abs.bf16x2 $0, $1, $2;",
-    "max(|a|,|b|) per bf16 lane; result sign bits are junk and must be masked.",
+    "max.NaN.xorsign.abs.bf16x2 $0, $1, $2;",
+    "max(|a|,|b|) per bf16 lane; result sign bits are junk and must be masked. "
+    "NaN-propagating, like the standalone quantizers' amax reduction.",
 )
 
 
@@ -195,15 +198,42 @@ def _sigmoid(x, *, loc=None, ip=None):
 
 @cute.jit
 def _e8m0_bits(u: I32) -> I32:
-    """Biased E8M0 byte for a non-negative bf16 magnitude given as f32 bits."""
-    return cutlass.max(((u + I32(0x1F0000)) >> 23) - I32(8), I32(0))
+    """Biased E8M0 byte for a non-negative bf16 amax given as f32 bits.
+
+    Finite magnitudes take the RCEIL mantissa-carry path. Non-finite amax
+    matches the standalone quantizers (``compute_scale_from_amax``): Inf
+    saturates to the largest finite scale byte (254, what
+    ``cvt.rp.satfinite.ue8m0x2.f32`` emits), and NaN -- which their reduction
+    propagates, hence the max.NaN amax ops above -- fails their ``amax > 0``
+    gate and yields byte 0. Without the branch, Inf would land on 247 and a
+    NaN with its top mantissa bits set would carry into the sign bit and
+    produce a garbage byte.
+    """
+    e = cutlass.max(((u + I32(0x1F0000)) >> 23) - I32(8), I32(0))
+    if (u & I32(0x7F800000)) == I32(0x7F800000):
+        e = I32(254) if (u & I32(0x7F0000)) == I32(0) else I32(0)
+    return e
 
 
 @cute.jit
-def _rcp_b16(e: I32) -> I32:
-    """2^(127-e) as a bf16 bit pattern (1.0 for e == 0)."""
+def _rcp_b16(u: I32, e: I32) -> I32:
+    """bf16 reciprocal for amax bits ``u`` under byte ``e``, with
+    ``compute_scale_from_amax``'s special cases so quantized data matches the
+    standalone kernels bitwise:
+
+    * NaN amax: 1.0 -- the block passes through raw (finite values quantize
+      unscaled, NaNs become E4M3 NaN codes) under scale byte 0.
+    * Inf amax (byte 254): 2^-127, a bf16 subnormal (the generic path would
+      produce +0).
+    * clamped byte 0 from a tiny amax: 2^126, not 2^127; a zero amax gives
+      the same +/-0 codes either way.
+    """
     b = (I32(254) - e) << 7
-    return I32(0x3F80) if e == I32(0) else b
+    if (u & I32(0x7F800000)) == I32(0x7F800000):
+        b = I32(0x40) if (u & I32(0x7F0000)) == I32(0) else I32(0x3F80)
+    elif e == I32(0):
+        b = I32(0x7E80)
+    return b
 
 
 @cute.kernel
@@ -352,8 +382,9 @@ def swiglu_mxfp8_kernel(
             am0 = am0 & I32(0x7FFF7FFF)
             am0 = _max_bf16x2(am0, cute.arch.shuffle_sync_bfly(am0, 1))
             am0 = _max_bf16x2(am0, am0 >> 16)
-            e0 = _e8m0_bits((am0 & I32(0xFFFF)) << 16)
-            r0 = _rcp_b16(e0) * I32(0x10001)
+            u0 = (am0 & I32(0xFFFF)) << 16
+            e0 = _e8m0_bits(u0)
+            r0 = _rcp_b16(u0, e0) * I32(0x10001)
             for k in cutlass.range_constexpr(4):
                 fq4r[k] = _qpack(w0[2 * k], w0[2 * k + 1], r0)
             cute.autovec_copy(fq4r, mRQ[None, chunk, jt, row])
@@ -362,8 +393,9 @@ def swiglu_mxfp8_kernel(
                 am1 = am1 & I32(0x7FFF7FFF)
                 am1 = _max_bf16x2(am1, cute.arch.shuffle_sync_bfly(am1, 1))
                 am1 = _max_bf16x2(am1, am1 >> 16)
-                e1 = _e8m0_bits((am1 & I32(0xFFFF)) << 16)
-                r1 = _rcp_b16(e1) * I32(0x10001)
+                u1 = (am1 & I32(0xFFFF)) << 16
+                e1 = _e8m0_bits(u1)
+                r1 = _rcp_b16(u1, e1) * I32(0x10001)
                 for k in cutlass.range_constexpr(4):
                     fq4r[k] = _qpack(w1[2 * k], w1[2 * k + 1], r1)
                 cute.autovec_copy(
@@ -405,9 +437,11 @@ def swiglu_mxfp8_kernel(
                     ac = _amax_bf16x2(ac, vs[i][t])
             ac = ac & I32(0x7FFF7FFF)
 
-            ec0 = _e8m0_bits((ac & I32(0xFFFF)) << 16)
-            ec1 = _e8m0_bits(ac & I32(-65536))
-            s01 = _rcp_b16(ec0) | (_rcp_b16(ec1) << 16)
+            uc0 = (ac & I32(0xFFFF)) << 16
+            uc1 = ac & I32(-65536)
+            ec0 = _e8m0_bits(uc0)
+            ec1 = _e8m0_bits(uc1)
+            s01 = _rcp_b16(uc0, ec0) | (_rcp_b16(uc1, ec1) << 16)
 
             fq8 = cute.make_rmem_tensor(8, I32)
             fq8b = cute.make_rmem_tensor(8, I32)
@@ -565,7 +599,7 @@ def _validate_inputs(gated_input, grad_out=None):
     if 2 * K * M - K - 1 > _INT32_MAX:
         raise ValueError(
             f"M={M}, K={K} exceeds the kernel's 32-bit indexing limit "
-            f"(needs 2*K*M <= {_INT32_MAX})"
+            f"(needs 2*K*M - K - 1 <= {_INT32_MAX})"
         )
     if grad_out is not None:
         if (
