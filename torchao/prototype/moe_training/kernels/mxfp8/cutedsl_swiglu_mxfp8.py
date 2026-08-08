@@ -61,7 +61,13 @@ _INT32_MAX = 2**31 - 1
 
 @dsl_user_op
 def _qpack(w0, w1, s, *, loc=None, ip=None):
-    """Scale two bf16x2 words by bf16x2 `s`, convert to 4 packed e4m3 bytes."""
+    """Scale two bf16x2 words by bf16x2 ``s`` and pack four E4M3 bytes.
+
+    ``cvt.rn.satfinite.e4m3x2.bf16x2`` is not available on every Blackwell
+    architecture (notably GB300's sm_103a).  Keep the BF16 multiply so the
+    quantization input has the same rounding as before, widen the two packed
+    lanes exactly to FP32, and use the portable FP32-source E4M3 conversion.
+    """
     return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
@@ -70,12 +76,19 @@ def _qpack(w0, w1, s, *, loc=None, ip=None):
                 cutlass.Int32(w1).ir_value(loc=loc, ip=ip),
                 cutlass.Int32(s).ir_value(loc=loc, ip=ip),
             ],
-            "{ .reg .b16 a, b;\n"
+            "{ .reg .b16 a, b, t0_lo, t0_hi, t1_lo, t1_hi;\n"
             ".reg .b32 t0, t1;\n"
+            ".reg .f32 f0_lo, f0_hi, f1_lo, f1_hi;\n"
             "mul.rn.bf16x2 t0, $1, $3;\n"
             "mul.rn.bf16x2 t1, $2, $3;\n"
-            "cvt.rn.satfinite.e4m3x2.bf16x2 a, t0;\n"
-            "cvt.rn.satfinite.e4m3x2.bf16x2 b, t1;\n"
+            "mov.b32 {t0_lo, t0_hi}, t0;\n"
+            "mov.b32 {t1_lo, t1_hi}, t1;\n"
+            "cvt.f32.bf16 f0_lo, t0_lo;\n"
+            "cvt.f32.bf16 f0_hi, t0_hi;\n"
+            "cvt.f32.bf16 f1_lo, t1_lo;\n"
+            "cvt.f32.bf16 f1_hi, t1_hi;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 a, f0_hi, f0_lo;\n"
+            "cvt.rn.satfinite.e4m3x2.f32 b, f1_hi, f1_lo;\n"
             "mov.b32 $0, {a, b}; }",
             "=r,r,r,r",
             has_side_effects=False,
