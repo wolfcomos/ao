@@ -5,15 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 # this benchmarking script is a modified version of the original script from: https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/utils/benchmark.py
 #
-# The baseline is torchtitan's fused Triton SwiGLU, so torchtitan must be importable:
+# The SwiGLU baseline is torchtitan's fused Triton op, so torchtitan must be importable:
 #   PYTHONPATH=.:/path/to/torchtitan python \
-#     benchmarks/prototype/moe_training/mxfp8/bench_swiglu_mxfp8_unified.py [--compile]
+#     benchmarks/prototype/moe_training/mxfp8/bench_swiglu_mxfp8_unified.py \
+#       [--activation swiglu] [--compile]
 
 import argparse
 import itertools
 
 import torch
-import torch.nn.functional as F
 from tabulate import tabulate
 from torchtitan.overrides.fused_swiglu import (
     silu_and_mul_backward_op,
@@ -22,10 +22,10 @@ from torchtitan.overrides.fused_swiglu import (
 
 from benchmarks.utils import benchmark_cuda_function_in_microseconds
 from torchao.prototype.moe_training.kernels.mxfp8 import (
+    gated_mxfp8_backward,
+    gated_mxfp8_forward,
     mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_2d_32x1_cutedsl,
-    swiglu_mxfp8_backward,
-    swiglu_mxfp8_forward,
 )
 
 device = torch.device("cuda")
@@ -37,19 +37,64 @@ SHAPES = ((4096, 2048), (4096, 7168), (16384, 7168), (131072, 8192))
 
 # name, rowwise, colwise
 LAYOUTS = (("rowwise", True, False), ("colwise", False, True), ("both", True, True))
+ACTIVATIONS = ("reglu", "geglu", "swiglu", "qgeglu", "sreglu")
 
 
-def baseline(gated_input, grad_h, rowwise, colwise):
-    """torchtitan's fused Triton SwiGLU, then the standalone MXFP8 quantizers.
+def _activation_and_grad(x, activation):
+    """Transformer Engine activation formulas evaluated in FP32."""
+    if activation == "reglu":
+        return torch.relu(x), (x > 0).float()
+    if activation == "geglu":
+        act_t = torch.tanh(x * (0.79788456 + 0.03567741 * x * x))
+        act = x * (0.5 + 0.5 * act_t)
+        grad_t = torch.tanh(0.79788456 * x * (1.0 + 0.044715 * x * x))
+        dact = 0.5 * x * (
+            (1.0 - grad_t * grad_t) * (0.79788456 + 0.1070322243 * x * x)
+        ) + 0.5 * (1.0 + grad_t)
+        return act, dact
+    if activation == "swiglu":
+        s = torch.sigmoid(x)
+        return x * s, x * (s * (1.0 - s)) + s
+    if activation == "qgeglu":
+        ax = 1.702 * x
+        s = torch.sigmoid(ax)
+        return x * s, ax * (s * (1.0 - s)) + s
+    if activation == "sreglu":
+        relu = torch.relu(x)
+        return relu * relu, torch.relu(2.0 * x)
+    raise AssertionError(f"unknown activation {activation}")
 
-    This is the honest thing to beat: the activation is already fused, so the
-    remaining win is removing the bfloat16 round trip between it and the cast.
-    The backward concatenates [dGate | dUp] because the two Triton outputs are
-    separate tensors, whereas the fused kernel writes that layout directly.
+
+def _eager_gated(gated_input, grad_h, activation):
+    k = gated_input.shape[1] // 2
+    gate = gated_input[:, :k].float()
+    up = gated_input[:, k:].float()
+    act, dact = _activation_and_grad(gate, activation)
+    if grad_h is None:
+        return (act * up).bfloat16()
+    grad_h_f = grad_h.float()
+    return torch.cat(
+        [
+            ((dact * grad_h_f) * up).bfloat16(),
+            (act * grad_h_f).bfloat16(),
+        ],
+        dim=1,
+    )
+
+
+def baseline(gated_input, grad_h, activation, rowwise, colwise):
+    """An activation baseline followed by the standalone MXFP8 quantizers.
+
+    SwiGLU uses torchtitan's fused Triton implementation, making it the honest
+    performance baseline. Other activations use the eager TE formulas and are
+    useful for kernel timing, but their speedup is not an apples-to-apples fused
+    baseline comparison.
     """
     k = gated_input.shape[1] // 2
     gate, up = gated_input[:, :k], gated_input[:, k:]
-    if grad_h is None:
+    if activation != "swiglu":
+        reference = _eager_gated(gated_input, grad_h, activation)
+    elif grad_h is None:
         reference = silu_and_mul_op(gate, up, None)
     else:
         grad_gate, grad_up = silu_and_mul_backward_op(grad_h, gate, up, None)
@@ -70,36 +115,15 @@ def baseline(gated_input, grad_h, rowwise, colwise):
     return row[0], col[0], row[1], col[1]
 
 
-def eager_reference(gated_input, grad_h, rowwise, colwise):
+def eager_reference(gated_input, grad_h, activation, rowwise, colwise):
     """Ground truth for the correctness gate, in plain PyTorch.
 
     Not the timing baseline, which is torchtitan's Triton kernel.
 
-    The kernel evaluates sigmoid with the hardware fast exponential, which no
-    PyTorch op reproduces bit for bit, so exact agreement is only achievable in
-    the forward direction. Measured over 20 seeds x 4 shapes: forward 0 of
-    335.9M codes differ, backward 384 of 671.7M (5.7e-7) with a maximum gap of
-    one code, scales exact throughout.
+    Activation math is FP32 and rounded back to BF16 before the standalone
+    quantizer, matching Transformer Engine's numerical contract.
     """
-    k = gated_input.shape[1] // 2
-    gate, up = gated_input[:, :k].float(), gated_input[:, k:].float()
-    if grad_h is None:
-        reference = (F.silu(gate) * up).bfloat16()
-    else:
-        # Mirror the kernel's evaluation order exactly, so the sigmoid is the
-        # only remaining source of difference:
-        #   dact  = s * (1 + x * (1 - s))
-        #   dGate = (grad * up) * dact ;  dUp = grad * (gate * s)
-        grad_h_f = grad_h.float()
-        sig = torch.sigmoid(gate)
-        d_silu = sig * (1.0 + gate * (1.0 - sig))
-        reference = torch.cat(
-            [
-                ((grad_h_f * up) * d_silu).bfloat16(),
-                (grad_h_f * (gate * sig)).bfloat16(),
-            ],
-            dim=1,
-        )
+    reference = _eager_gated(gated_input, grad_h, activation)
 
     empty_qdata = gated_input.new_empty(0, dtype=torch.float8_e4m3fn)
     empty_scales = gated_input.new_empty(0, dtype=torch.float8_e8m0fnu)
@@ -116,10 +140,21 @@ def eager_reference(gated_input, grad_h, rowwise, colwise):
     return row[0], col[0], row[1], col[1]
 
 
-def fused(gated_input, grad_h, rowwise, colwise):
+def fused(gated_input, grad_h, activation, rowwise, colwise):
     if grad_h is None:
-        return swiglu_mxfp8_forward(gated_input, rowwise=rowwise, colwise=colwise)
-    return swiglu_mxfp8_backward(grad_h, gated_input, rowwise=rowwise, colwise=colwise)
+        return gated_mxfp8_forward(
+            gated_input,
+            activation=activation,
+            rowwise=rowwise,
+            colwise=colwise,
+        )
+    return gated_mxfp8_backward(
+        grad_h,
+        gated_input,
+        activation=activation,
+        rowwise=rowwise,
+        colwise=colwise,
+    )
 
 
 # Backward E4M3 only; see the note in eager_reference.
@@ -146,12 +181,12 @@ def check(actual, expected, msg, exact):
     )
 
 
-def run(M, K, is_backward, rowwise, colwise, use_compile):
+def run(M, K, is_backward, activation, rowwise, colwise, use_compile):
     gated_input = torch.randn(M, 2 * K, dtype=torch.bfloat16, device=device)
     grad_h = (
         torch.randn(M, K, dtype=torch.bfloat16, device=device) if is_backward else None
     )
-    args = (gated_input, grad_h, rowwise, colwise)
+    args = (gated_input, grad_h, activation, rowwise, colwise)
     if use_compile:
         baseline_fn = torch.compile(baseline, fullgraph=True)
         fused_fn = torch.compile(fused, fullgraph=True)
@@ -178,6 +213,12 @@ def main():
         action="store_true",
         help="benchmark torch.compile(fullgraph=True) instead of eager",
     )
+    parser.add_argument(
+        "--activation",
+        choices=ACTIVATIONS,
+        default="swiglu",
+        help="gated activation to benchmark (default: swiglu)",
+    )
     args = parser.parse_args()
 
     torch.random.manual_seed(123)
@@ -185,7 +226,15 @@ def main():
     for (M, K), is_backward, (layout, rowwise, colwise) in itertools.product(
         SHAPES, (False, True), LAYOUTS
     ):
-        baseline_us, fused_us = run(M, K, is_backward, rowwise, colwise, args.compile)
+        baseline_us, fused_us = run(
+            M,
+            K,
+            is_backward,
+            args.activation,
+            rowwise,
+            colwise,
+            args.compile,
+        )
         rows.append(
             [
                 f"({M}, {K})",
@@ -198,7 +247,13 @@ def main():
         )
         torch.cuda.empty_cache()
 
-    print(f"\nmode: {'compile' if args.compile else 'eager'}")
+    baseline_name = (
+        "torchtitan fused" if args.activation == "swiglu" else "PyTorch decomposition"
+    )
+    print(
+        f"\nactivation: {args.activation}; mode: "
+        f"{'compile' if args.compile else 'eager'}; baseline: {baseline_name}"
+    )
     headers = ["shape", "direction", "scales", "baseline_us", "fused_us", "speedup"]
     print(tabulate(rows, headers=headers))
 

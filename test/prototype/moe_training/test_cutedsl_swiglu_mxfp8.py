@@ -5,38 +5,29 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Correctness tests for the unified SwiGLU + MXFP8 kernel (cutedsl_swiglu_mxfp8).
+Correctness tests for the unified gated-activation + MXFP8 kernel.
 
-Every case goes through the public API -- `swiglu_mxfp8_forward` or
-`swiglu_mxfp8_backward` -- and is compared against the equivalent eager sequence:
-  forward:  h = silu(gate) * up          -> mxfp8_quantize_2d_{1x32,32x1}_cutedsl(h)
-  backward: dGate, dUp via SwiGLU grads  -> the same quantize functions
+The full shape/layout matrix also pins the backward-compatible
+`swiglu_mxfp8_{forward,backward}` APIs. The activation-family matrix exercises
+the generic `gated_mxfp8_{forward,backward}` APIs for ReGLU, GeGLU, SwiGLU,
+QGeGLU, and SReGLU against their eager decompositions.
 
-E8M0 scales and forward E4M3 data must match BITWISE. Backward E4M3 data is
-allowed to differ by at most one code in a bounded fraction of elements.
-
-That allowance is not slop: the kernel evaluates sigmoid as
-`rcp.rn(1 + ex2.approx(-x * log2e))`, a hardware fast exponential chosen so the
-kernel is bitwise consistent with the reference gated-MXFP8 implementation it
-has to interoperate with. No PyTorch op reproduces `ex2.approx` bit for bit, so
-exact agreement with `torch.sigmoid` is not achievable by construction. The
-reference below otherwise mirrors the kernel's evaluation order exactly (the
-kernel additionally contracts the d_silu term into one FMA, which eager cannot
-reproduce), so those two lowerings are the only remaining sources of
-difference. Measured over 6 seeds x 4 shapes: forward 0 of 101.6M codes
-differ, backward 75 of 203.3M (3.7e-7), max gap 1 code, scales exact
-throughout. _MAX_DIFFERING_FRACTION is set well above the measured rate so a
-systematic error still fails.
+The key numerical contract follows Transformer Engine: activation math is FP32,
+but its result is rounded to the input dtype before amax and MXFP8 conversion.
+E8M0 scales must match the eager decomposition bitwise. E4M3 data may differ by
+at most one adjacent code in a tightly bounded fraction because CuTe DSL and
+eager PyTorch do not guarantee identical transcendental instruction lowering.
 """
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
     pytest.skip("Requires CUDA SM 10.x (Blackwell)", allow_module_level=True)
 
 from torchao.prototype.moe_training.kernels.mxfp8 import (
+    gated_mxfp8_backward,
+    gated_mxfp8_forward,
     mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_2d_32x1_cutedsl,
     swiglu_mxfp8_backward,
@@ -58,33 +49,56 @@ _LAYOUTS = [
     (True, True),
 ]
 
-# Backward E4M3 only; see the module docstring. Measured rate is 5.7e-7.
+# E4M3 tolerance for eager-vs-CuTe transcendental lowering; see the docstring.
 _MAX_DIFFERING_FRACTION = 1e-5
+
+_ACTIVATIONS = ("reglu", "geglu", "swiglu", "qgeglu", "sreglu")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _eager_reference(gated_input, grad_h):
-    """The bf16 tensor the kernel is expected to quantize."""
+def _activation_and_grad(x, activation):
+    """Transformer Engine activation formulas evaluated in FP32."""
+    if activation == "reglu":
+        return torch.relu(x), (x > 0).float()
+    if activation == "geglu":
+        act_t = torch.tanh(x * (0.79788456 + 0.03567741 * x * x))
+        act = x * (0.5 + 0.5 * act_t)
+        grad_t = torch.tanh(0.79788456 * x * (1.0 + 0.044715 * x * x))
+        dact = 0.5 * x * (
+            (1.0 - grad_t * grad_t) * (0.79788456 + 0.1070322243 * x * x)
+        ) + 0.5 * (1.0 + grad_t)
+        return act, dact
+    if activation == "swiglu":
+        s = torch.sigmoid(x)
+        return x * s, x * (s * (1.0 - s)) + s
+    if activation == "qgeglu":
+        ax = 1.702 * x
+        s = torch.sigmoid(ax)
+        return x * s, ax * (s * (1.0 - s)) + s
+    if activation == "sreglu":
+        relu = torch.relu(x)
+        return relu * relu, torch.relu(2.0 * x)
+    raise AssertionError(f"unknown activation {activation}")
+
+
+def _eager_reference(gated_input, grad_h, activation="swiglu"):
+    """The BF16 tensor the kernel is expected to quantize.
+
+    FP32 activation math is rounded to BF16 before the standalone MXFP8
+    quantizer, matching Transformer Engine's gated-MXFP8 numerical contract.
+    """
     K = gated_input.shape[1] // 2
     gate = gated_input[:, :K].float()
     up = gated_input[:, K:].float()
+    act, dact = _activation_and_grad(gate, activation)
     if grad_h is None:
-        return (F.silu(gate) * up).bfloat16()
+        return (act * up).bfloat16()
     grad_h_f = grad_h.float()
-    # Mirror the kernel's evaluation order exactly:
-    #   silu = gate * s ;  deriv = 1 + gate * (1 - s) ;  silu_grad = s * deriv
-    #   dGate = (grad * up) * silu_grad ;  dUp = grad * silu
-    # The kernel contracts `deriv` into a single FMA; eager has no fp32 fma,
-    # so that term rounds twice here and stays a (tiny) source of divergence.
-    sigmoid_gate = torch.sigmoid(gate)
-    silu = gate * sigmoid_gate
-    deriv = gate * (1.0 - sigmoid_gate) + 1.0
-    silu_grad = sigmoid_gate * deriv
-    dgate = ((grad_h_f * up) * silu_grad).bfloat16()
-    dup = (grad_h_f * silu).bfloat16()
+    dgate = ((dact * grad_h_f) * up).bfloat16()
+    dup = (act * grad_h_f).bfloat16()
     return torch.cat([dgate, dup], dim=1)
 
 
@@ -103,7 +117,7 @@ def _assert_identical(actual, ref, msg):
 
 
 def _assert_qdata_matches(actual, ref, msg, exact):
-    """Exact for forward; at most a one-code difference for backward."""
+    """Exact when requested; otherwise allow rare adjacent E4M3 codes."""
     if exact:
         _assert_identical(actual, ref, msg)
         return
@@ -186,6 +200,47 @@ def test_swiglu_mxfp8(M, K, is_backward, rowwise, colwise):
         assert output_colwise.dtype == torch.float8_e4m3fn
         assert scales_colwise.dtype == torch.float8_e8m0fnu
         assert output_colwise.device == gated_input.device
+
+
+@pytest.mark.parametrize("activation", _ACTIVATIONS)
+@pytest.mark.parametrize("is_backward", _DIRECTIONS)
+def test_gated_activation_family_mxfp8(activation, is_backward):
+    """All TE gated activations share the fused quantization contract."""
+    torch.manual_seed(123)
+    M, K = 128, 128
+    gated_input = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+    grad_h = (
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) if is_backward else None
+    )
+
+    if is_backward:
+        outputs = gated_mxfp8_backward(
+            grad_h,
+            gated_input,
+            activation=activation,
+            rowwise=True,
+            colwise=True,
+        )
+    else:
+        outputs = gated_mxfp8_forward(
+            gated_input,
+            activation=activation,
+            rowwise=True,
+            colwise=True,
+        )
+
+    reference = _eager_reference(gated_input, grad_h, activation)
+    ref_qr, ref_sr = mxfp8_quantize_2d_1x32_cutedsl(reference, scaling_mode="rceil")
+    ref_qc, ref_sc = mxfp8_quantize_2d_32x1_cutedsl(reference, scaling_mode="rceil")
+    out_r, out_c, scales_r, scales_c = outputs
+
+    # Transcendental implementations can differ from eager FP32 by a few
+    # last bits before the required BF16 truncation. Any surviving E4M3 delta
+    # must stay within one adjacent code and a tiny fraction of elements.
+    _assert_qdata_matches(out_r, ref_qr, f"{activation} rowwise", exact=False)
+    _assert_qdata_matches(out_c, ref_qc, f"{activation} colwise", exact=False)
+    _assert_identical(scales_r, ref_sr, f"{activation} rowwise scales")
+    _assert_identical(scales_c, ref_sc, f"{activation} colwise scales")
 
 
 def test_swiglu_mxfp8_special_values():
@@ -281,5 +336,44 @@ def test_swiglu_mxfp8_compile(is_backward):
             # also pins the fake's shapes and strides to the real ones.
             _assert_layout(a, e, f"compile bwd={is_backward} output {i}")
             torch.testing.assert_close(a, e, rtol=0, atol=0)
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("is_backward", _DIRECTIONS)
+def test_gated_mxfp8_compile(is_backward):
+    """The activation string is captured correctly by the custom-op schema."""
+    torch.manual_seed(43)
+    M, K = 128, 128
+    gated_input = torch.randn(M, 2 * K, device="cuda", dtype=torch.bfloat16)
+    grad_h = (
+        torch.randn(M, K, device="cuda", dtype=torch.bfloat16) if is_backward else None
+    )
+
+    if is_backward:
+
+        def fn(gated_input, grad_h):
+            return gated_mxfp8_backward(
+                grad_h,
+                gated_input,
+                activation="qgeglu",
+                rowwise=True,
+                colwise=True,
+            )
+    else:
+
+        def fn(gated_input, grad_h):
+            return gated_mxfp8_forward(
+                gated_input,
+                activation="qgeglu",
+                rowwise=True,
+                colwise=True,
+            )
+
+    try:
+        expected = fn(gated_input, grad_h)
+        actual = torch.compile(fn, fullgraph=True)(gated_input, grad_h)
+        for i, (a, e) in enumerate(zip(actual, expected)):
+            _assert_identical(a, e, f"generic compile bwd={is_backward} output {i}")
     finally:
         torch._dynamo.reset()

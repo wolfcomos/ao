@@ -1176,7 +1176,7 @@ def _fake_mxfp8_quantize_2d_32x1_cutedsl_custom_op(
 
 
 # ---------------------------------------------------------------------------
-# Fused SwiGLU + MXFP8 quantization
+# Fused gated activation + MXFP8 quantization
 #
 # Two operators, both returning the same fixed four-tensor tuple in the order
 # used by torchao's generic CUDA MXFP8 API
@@ -1184,14 +1184,39 @@ def _fake_mxfp8_quantize_2d_32x1_cutedsl_custom_op(
 #
 #     (output_rowwise, output_colwise, scales_rowwise, scales_colwise)
 #
-# `rowwise` and `colwise` are static booleans that select a compile-time kernel
+# `activation`, `rowwise`, and `colwise` select a compile-time kernel
 # specialization. Disabled directions come back zero-sized so the arity never
-# varies. Input is a packed `gated_input` of shape (M, 2K) -- `gate` in the first
-# K columns, `up` in the last K -- which is what a fused w13 projection produces.
+# varies. Input is a packed `gated_input` of shape (M, 2K) -- nonlinear input in
+# the first K columns and the multiplicative branch in the last K -- which is
+# what a fused w13 projection produces.
 # ---------------------------------------------------------------------------
 
 
-def _swiglu_mxfp8_outputs(
+_GATED_ACTIVATION_ALIASES = {
+    "relu": "relu",
+    "reglu": "relu",
+    "gelu": "gelu",
+    "geglu": "gelu",
+    "silu": "silu",
+    "swiglu": "silu",
+    "qgelu": "qgelu",
+    "qgeglu": "qgelu",
+    "srelu": "srelu",
+    "sreglu": "srelu",
+}
+
+
+def _normalize_gated_activation(activation: str) -> str:
+    try:
+        return _GATED_ACTIVATION_ALIASES[activation.lower()]
+    except (AttributeError, KeyError) as exc:
+        supported = ", ".join(("reglu", "geglu", "swiglu", "qgeglu", "sreglu"))
+        raise ValueError(
+            f"unsupported gated activation {activation!r}; expected one of: {supported}"
+        ) from exc
+
+
+def _gated_mxfp8_outputs(
     gated_input: torch.Tensor,
     out_k: int,
     rowwise: bool,
@@ -1248,7 +1273,7 @@ def _swiglu_mxfp8_forward(
         _launch_swiglu_mxfp8,
     )
 
-    outputs = _swiglu_mxfp8_outputs(
+    outputs = _gated_mxfp8_outputs(
         gated_input, gated_input.shape[1] // 2, rowwise, colwise
     )
     _launch_swiglu_mxfp8(gated_input, None, outputs, rowwise, colwise)
@@ -1266,8 +1291,43 @@ def _swiglu_mxfp8_backward(
         _launch_swiglu_mxfp8,
     )
 
-    outputs = _swiglu_mxfp8_outputs(gated_input, gated_input.shape[1], rowwise, colwise)
+    outputs = _gated_mxfp8_outputs(gated_input, gated_input.shape[1], rowwise, colwise)
     _launch_swiglu_mxfp8(gated_input, grad_h, outputs, rowwise, colwise)
+    return outputs
+
+
+@torch.library.custom_op("torchao::gated_mxfp8_forward", mutates_args=())
+def _gated_mxfp8_forward(
+    gated_input: torch.Tensor,
+    activation: str,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_swiglu_mxfp8 import (
+        _launch_gated_mxfp8,
+    )
+
+    outputs = _gated_mxfp8_outputs(
+        gated_input, gated_input.shape[1] // 2, rowwise, colwise
+    )
+    _launch_gated_mxfp8(gated_input, None, outputs, activation, rowwise, colwise)
+    return outputs
+
+
+@torch.library.custom_op("torchao::gated_mxfp8_backward", mutates_args=())
+def _gated_mxfp8_backward(
+    grad_h: torch.Tensor,
+    gated_input: torch.Tensor,
+    activation: str,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_swiglu_mxfp8 import (
+        _launch_gated_mxfp8,
+    )
+
+    outputs = _gated_mxfp8_outputs(gated_input, gated_input.shape[1], rowwise, colwise)
+    _launch_gated_mxfp8(gated_input, grad_h, outputs, activation, rowwise, colwise)
     return outputs
 
 
@@ -1277,7 +1337,7 @@ def _fake_swiglu_mxfp8_forward(
     rowwise: bool,
     colwise: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _swiglu_mxfp8_outputs(
+    return _gated_mxfp8_outputs(
         gated_input, gated_input.shape[1] // 2, rowwise, colwise
     )
 
@@ -1290,7 +1350,32 @@ def _fake_swiglu_mxfp8_backward(
     colwise: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del grad_h
-    return _swiglu_mxfp8_outputs(gated_input, gated_input.shape[1], rowwise, colwise)
+    return _gated_mxfp8_outputs(gated_input, gated_input.shape[1], rowwise, colwise)
+
+
+@_gated_mxfp8_forward.register_fake
+def _fake_gated_mxfp8_forward(
+    gated_input: torch.Tensor,
+    activation: str,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del activation
+    return _gated_mxfp8_outputs(
+        gated_input, gated_input.shape[1] // 2, rowwise, colwise
+    )
+
+
+@_gated_mxfp8_backward.register_fake
+def _fake_gated_mxfp8_backward(
+    grad_h: torch.Tensor,
+    gated_input: torch.Tensor,
+    activation: str,
+    rowwise: bool,
+    colwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    del grad_h, activation
+    return _gated_mxfp8_outputs(gated_input, gated_input.shape[1], rowwise, colwise)
 
 
 if _mxfp8_cutedsl_kernels_available:
@@ -1676,23 +1761,28 @@ def mxfp8_quantize_2d_32x1_cutedsl(
     return qdata, scales
 
 
-def swiglu_mxfp8_forward(
+def gated_mxfp8_forward(
     gated_input: torch.Tensor,
     *,
+    activation: str = "swiglu",
     rowwise: bool = True,
     colwise: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fuse the SwiGLU forward and its RCEIL MXFP8 cast into one pass on SM100.
+    Fuse a gated activation and its RCEIL MXFP8 cast into one pass on SM100.
 
-    Computes ``h = silu(gate) * up`` and quantizes it without ever writing ``h``
-    back to global memory. ``gated_input`` is read once no matter how many scale
-    layouts are requested.
+    Computes ``h = act(gate) * up`` and quantizes it without ever writing ``h``
+    back to global memory. The supported gated activations match Transformer
+    Engine: ReGLU, GeGLU, SwiGLU, QGeGLU, and SReGLU. ``gated_input`` is read
+    once no matter how many scale layouts are requested.
 
     Args:
         gated_input: BF16 tensor of shape (M, 2K) holding ``gate`` in the first
             K columns and ``up`` in the last K -- the layout a fused w13
             projection produces. M and K must both be multiples of 128.
+        activation: one of ``"reglu"``, ``"geglu"``, ``"swiglu"``,
+            ``"qgeglu"``, or ``"sreglu"``. The corresponding unary names are
+            accepted as aliases.
         rowwise: emit 1x32-scaled, row-major output.
         colwise: emit 32x1-scaled, column-major (stride ``(1, M)``) output.
 
@@ -1708,6 +1798,53 @@ def swiglu_mxfp8_forward(
         return zero-sized tensors of the right device and dtype, so the output
         arity never varies.
     """
+    _require_cutedsl("gated_mxfp8_forward")
+    activation = _normalize_gated_activation(activation)
+    return _gated_mxfp8_forward(gated_input, activation, rowwise, colwise)
+
+
+def gated_mxfp8_backward(
+    grad_h: torch.Tensor,
+    gated_input: torch.Tensor,
+    *,
+    activation: str = "swiglu",
+    rowwise: bool = True,
+    colwise: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fuse a gated-activation backward and its RCEIL MXFP8 cast on SM100.
+
+    Computes ``dGate = (d_act(gate) * grad_h) * up`` and ``dUp = act(gate) *
+    grad_h``, then quantizes them as a single concatenated
+    ``[dGate | dUp]`` tensor -- the layout a fused w13 weight expects for the
+    wgrad GEMM.
+
+    Args:
+        grad_h: BF16 gradient of shape (M, K), on the same device as
+            ``gated_input``.
+        gated_input: the forward input, shape (M, 2K), as described in
+            :func:`gated_mxfp8_forward`.
+        activation: the same gated activation passed to
+            :func:`gated_mxfp8_forward`.
+        rowwise: emit 1x32-scaled, row-major output.
+        colwise: emit 32x1-scaled, column-major (stride ``(1, M)``) output.
+
+    Returns:
+        Four tensors of width 2K, in the same order and layouts as
+        :func:`gated_mxfp8_forward`.
+    """
+    _require_cutedsl("gated_mxfp8_backward")
+    activation = _normalize_gated_activation(activation)
+    return _gated_mxfp8_backward(grad_h, gated_input, activation, rowwise, colwise)
+
+
+def swiglu_mxfp8_forward(
+    gated_input: torch.Tensor,
+    *,
+    rowwise: bool = True,
+    colwise: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward-compatible SwiGLU specialization of :func:`gated_mxfp8_forward`."""
     _require_cutedsl("swiglu_mxfp8_forward")
     return _swiglu_mxfp8_forward(gated_input, rowwise, colwise)
 
@@ -1719,28 +1856,11 @@ def swiglu_mxfp8_backward(
     rowwise: bool = True,
     colwise: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fuse the SwiGLU backward and its RCEIL MXFP8 cast into one pass on SM100.
-
-    Computes ``dGate = grad_h * up * d_silu(gate)`` and ``dUp = grad_h *
-    silu(gate)``, then quantizes them as a single concatenated
-    ``[dGate | dUp]`` tensor -- the layout a fused w13 weight expects for the
-    wgrad GEMM.
-
-    Args:
-        grad_h: BF16 gradient of shape (M, K), on the same device as
-            ``gated_input``.
-        gated_input: the forward input, shape (M, 2K), as described in
-            :func:`swiglu_mxfp8_forward`.
-        rowwise: emit 1x32-scaled, row-major output.
-        colwise: emit 32x1-scaled, column-major (stride ``(1, M)``) output.
-
-    Returns:
-        Four tensors of width 2K, in the same order and layouts as
-        :func:`swiglu_mxfp8_forward`.
-    """
+    """Backward-compatible SwiGLU specialization of :func:`gated_mxfp8_backward`."""
     _require_cutedsl("swiglu_mxfp8_backward")
     return _swiglu_mxfp8_backward(grad_h, gated_input, rowwise, colwise)
+
+
 # =============================================================================
 # FlyDSL MXFP8 quantize kernels (AMD CDNA3+ via the FlyDSL stack).
 #

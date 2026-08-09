@@ -4,20 +4,29 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unified SwiGLU + MXFP8 CuTe DSL kernel for SM100.
+"""Unified gated-activation + MXFP8 CuTe DSL kernel for SM100.
 
-One pass computes the SwiGLU activation and its MXFP8 cast, so the activation
-never round-trips through global memory as bfloat16:
+One pass computes a gated activation and its MXFP8 cast, so the activation
+never round-trips through global memory as bfloat16. The supported activation
+family matches Transformer Engine's gated operators:
 
-    forward:   h     = silu(gate) * up
-    backward:  dGate = grad_h * up * d_silu(gate),  dUp = grad_h * silu(gate)
+    GeGLU, ReGLU, SwiGLU, QGeGLU, SReGLU
+
+For activation function ``act`` the math is:
+
+    forward:   h     = act(gate) * up
+    backward:  dGate = (d_act(gate) * grad_h) * up
+               dUp   = act(gate) * grad_h
 
 Input is a packed ``gated_input`` of shape (M, 2K) holding ``gate`` in the first
 K columns and ``up`` in the last K. Forward outputs are K wide; backward outputs
 are 2K wide and hold the concatenated ``[dGate | dUp]``. Rowwise (1x32) scales,
 colwise (32x1) scales, or both are produced from that single read, with
 ``IS_BWD`` / ``ROWWISE`` / ``COLWISE`` as ``Constexpr`` flags so each combination
-specializes with no runtime branching.
+specializes with no runtime branching. Activation math is evaluated in FP32,
+then rounded to BF16 *before* amax reduction and E4M3 conversion. This matches
+Transformer Engine's gated-MXFP8 numerical contract and the eager
+``activation(...).to(torch.bfloat16) -> MXFP8`` decomposition.
 
 Requires M and K to be multiples of 128, and ``2*K*M - K - 1 <= INT32_MAX``
 (the largest element offset the input layout reaches) because the gmem layouts
@@ -31,6 +40,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils
 import torch
+from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import llvm
 from cutlass.cute import AddressSpace
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -57,6 +67,23 @@ SP = 36  # padded row-stride, in 32-bit words
 SH = 64 * SP  # words per output half ([dGate | dUp] is two halves)
 
 _INT32_MAX = 2**31 - 1
+
+# Compile-time activation IDs. Public APIs accept the names; the launcher maps
+# them to these integers before entering CuTe DSL so every specialization has
+# zero runtime activation dispatch.
+ACT_RELU = 0
+ACT_GELU = 1
+ACT_SILU = 2
+ACT_QGELU = 3
+ACT_SRELU = 4
+
+_ACTIVATION_IDS = {
+    "relu": ACT_RELU,
+    "gelu": ACT_GELU,
+    "silu": ACT_SILU,
+    "qgelu": ACT_QGELU,
+    "srelu": ACT_SRELU,
+}
 
 
 @dsl_user_op
@@ -174,32 +201,18 @@ def _bf16x2(hi, lo, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _sigmoid(x, *, loc=None, ip=None):
-    """``1 / (1 + exp(-x))``, lowered exactly as the Triton reference does.
-
-    Emitted as raw PTX because bitwise agreement with that kernel depends on the
-    precise instruction choice, and both of these are approximations that a
-    higher-level formulation would not reproduce::
-
-        mul.f32        t, x, 0fBFB8AA3B    // -x * log2(e)
-        ex2.approx.f32 t, t                // fast exponential
-        add.f32        t, t, 0f3F800000
-        div.full.f32   s, 1.0, t           // fast division, ~2 ULP
-
-    Using an accurate exponential or a correctly rounded reciprocal here is both
-    slower and *less* compatible: it disagrees with the reference on a few codes
-    per million after the bf16 and E4M3 rounding.
-    """
+def _fma_f32(a, b, c, *, loc=None, ip=None):
+    """Compute ``a * b + c`` with one FP32 rounding."""
     return F32(
         llvm.inline_asm(
             T.f32(),
-            [F32(x).ir_value(loc=loc, ip=ip)],
-            "{ .reg .f32 t;\n"
-            "mul.f32 t, $1, 0fBFB8AA3B;\n"
-            "ex2.approx.f32 t, t;\n"
-            "add.f32 t, t, 0f3F800000;\n"
-            "div.full.f32 $0, 0f3F800000, t; }",
-            "=f,f",
+            [
+                F32(a).ir_value(loc=loc, ip=ip),
+                F32(b).ir_value(loc=loc, ip=ip),
+                F32(c).ir_value(loc=loc, ip=ip),
+            ],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -207,6 +220,71 @@ def _sigmoid(x, *, loc=None, ip=None):
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def _relu_grad(x, *, loc=None, ip=None):
+    """TE-compatible ReLU derivative: one for ``x > 0``, otherwise zero."""
+    cond = mlir_arith.cmpf(
+        mlir_arith.CmpFPredicate.OGT,
+        F32(x).ir_value(loc=loc, ip=ip),
+        F32(0.0).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return F32(
+        mlir_arith.select(
+            cond,
+            F32(1.0).ir_value(loc=loc, ip=ip),
+            F32(0.0).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _sigmoid(x):
+    """TE's FP32 sigmoid, with accurate (non-fast-math) exponential."""
+    return F32(1.0) / (F32(1.0) + cute.math.exp(-x, fastmath=False))
+
+
+def _act_gelu(x):
+    t = cute.math.tanh(
+        x * (F32(0.79788456) + F32(0.03567741) * x * x),
+        fastmath=False,
+    )
+    return x * (F32(0.5) + F32(0.5) * t)
+
+
+def _dact_gelu(x):
+    # Keep TE's derivative expression separate from the forward expression:
+    # the two are algebraically equivalent but not FP32 bit-equivalent.
+    t = cute.math.tanh(
+        F32(0.79788456) * x * (F32(1.0) + F32(0.044715) * x * x),
+        fastmath=False,
+    )
+    return F32(0.5) * x * (
+        (F32(1.0) - t * t) * (F32(0.79788456) + F32(0.1070322243) * x * x)
+    ) + F32(0.5) * (F32(1.0) + t)
+
+
+def _act_silu(x):
+    return x * _sigmoid(x)
+
+
+def _dact_silu(x):
+    s = _sigmoid(x)
+    return _fma_f32(x, s * (F32(1.0) - s), s)
+
+
+def _act_qgelu(x):
+    return x * _sigmoid(F32(1.702) * x)
+
+
+def _dact_qgelu(x):
+    ax = F32(1.702) * x
+    s = _sigmoid(ax)
+    return ax * (s * (F32(1.0) - s)) + s
 
 
 @cute.jit
@@ -250,7 +328,7 @@ def _rcp_b16(u: I32, e: I32) -> I32:
 
 
 @cute.kernel
-def swiglu_mxfp8_kernel(
+def gated_mxfp8_kernel(
     mG: cute.Tensor,
     mGate: cute.Tensor,
     mUp: cute.Tensor,
@@ -265,12 +343,14 @@ def swiglu_mxfp8_kernel(
     IS_BWD: cutlass.Constexpr,
     ROWWISE: cutlass.Constexpr,
     COLWISE: cutlass.Constexpr,
+    ACTIVATION: cutlass.Constexpr,
 ):
-    """TE-style SwiGLU + MXFP8 body specialized entirely at compile time.
+    """TE-style gated activation + MXFP8 body specialized at compile time.
 
     IS_BWD selects forward hidden output versus concatenated [dGate, dUp].
     ROWWISE enables row-major 1x32 data/scales.
     COLWISE enables column-major 32x1 data/scales.
+    ACTIVATION selects one of the five TE-compatible gated activations.
     """
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
@@ -279,8 +359,6 @@ def swiglu_mxfp8_kernel(
     NJ128 = K // 128
     CBrow = OUT_HALVES * K // 128
     CBcol = M // 128
-    ONE = F32(1.0)
-
     if cutlass.const_expr(COLWISE):
         smem = cutlass.utils.SmemAllocator()
         sptr = smem.allocate(OUT_HALVES * SH * 4, byte_alignment=16)
@@ -347,35 +425,55 @@ def swiglu_mxfp8_kernel(
             u0 = fu[e].to(F32)
             u1 = fu[e + 1].to(F32)
 
-            s0 = _sigmoid(g0)
-            s1 = _sigmoid(g1)
-            silu0, silu1 = cute.arch.mul_packed_f32x2((g0, g1), (s0, s1))
+            if cutlass.const_expr(ACTIVATION == ACT_RELU):
+                act0 = cute.arch.fmax(g0, F32(0.0))
+                act1 = cute.arch.fmax(g1, F32(0.0))
+                if cutlass.const_expr(IS_BWD):
+                    dact0 = _relu_grad(g0)
+                    dact1 = _relu_grad(g1)
+            elif cutlass.const_expr(ACTIVATION == ACT_GELU):
+                act0 = _act_gelu(g0)
+                act1 = _act_gelu(g1)
+                if cutlass.const_expr(IS_BWD):
+                    dact0 = _dact_gelu(g0)
+                    dact1 = _dact_gelu(g1)
+            elif cutlass.const_expr(ACTIVATION == ACT_SILU):
+                act0 = _act_silu(g0)
+                act1 = _act_silu(g1)
+                if cutlass.const_expr(IS_BWD):
+                    dact0 = _dact_silu(g0)
+                    dact1 = _dact_silu(g1)
+            elif cutlass.const_expr(ACTIVATION == ACT_QGELU):
+                act0 = _act_qgelu(g0)
+                act1 = _act_qgelu(g1)
+                if cutlass.const_expr(IS_BWD):
+                    dact0 = _dact_qgelu(g0)
+                    dact1 = _dact_qgelu(g1)
+            else:
+                # SReLU: square(ReLU(x)); d/dx = max(2*x, 0).
+                relu0 = cute.arch.fmax(g0, F32(0.0))
+                relu1 = cute.arch.fmax(g1, F32(0.0))
+                act0, act1 = cute.arch.mul_packed_f32x2((relu0, relu1), (relu0, relu1))
+                if cutlass.const_expr(IS_BWD):
+                    dact0 = cute.arch.fmax(F32(2.0) * g0, F32(0.0))
+                    dact1 = cute.arch.fmax(F32(2.0) * g1, F32(0.0))
 
             if cutlass.const_expr(IS_BWD):
                 h0 = fh[e].to(F32)
                 h1 = fh[e + 1].to(F32)
-                one_minus_s0, one_minus_s1 = cute.arch.sub_packed_f32x2(
-                    (ONE, ONE), (s0, s1)
+                # Preserve TE's left-to-right expression order:
+                #   dAct * grad * linear_gate, act * grad.
+                dact_grad0, dact_grad1 = cute.arch.mul_packed_f32x2(
+                    (dact0, dact1), (h0, h1)
                 )
-                # fma, not a separate multiply and add: the Triton reference
-                # writes `1.0 + gate * (1.0 - sigmoid)`, which its compiler
-                # contracts into a single FMA. Splitting it rounds twice and
-                # costs bitwise agreement on a few codes per million.
-                deriv0, deriv1 = cute.arch.fma_packed_f32x2(
-                    (g0, g1), (one_minus_s0, one_minus_s1), (ONE, ONE)
-                )
-                silu_grad0, silu_grad1 = cute.arch.mul_packed_f32x2(
-                    (s0, s1), (deriv0, deriv1)
-                )
-                grad_up0, grad_up1 = cute.arch.mul_packed_f32x2((h0, h1), (u0, u1))
                 dg0, dg1 = cute.arch.mul_packed_f32x2(
-                    (grad_up0, grad_up1), (silu_grad0, silu_grad1)
+                    (dact_grad0, dact_grad1), (u0, u1)
                 )
-                du0, du1 = cute.arch.mul_packed_f32x2((h0, h1), (silu0, silu1))
+                du0, du1 = cute.arch.mul_packed_f32x2((act0, act1), (h0, h1))
                 w0[e >> 1] = _bf16x2(dg1, dg0)
                 w1[e >> 1] = _bf16x2(du1, du0)
             else:
-                y0, y1 = cute.arch.mul_packed_f32x2((silu0, silu1), (u0, u1))
+                y0, y1 = cute.arch.mul_packed_f32x2((act0, act1), (u0, u1))
                 w0[e >> 1] = _bf16x2(y1, y0)
 
         if cutlass.const_expr(COLWISE):
@@ -491,6 +589,7 @@ def launcher(
     IS_BWD: cutlass.Constexpr,
     ROWWISE: cutlass.Constexpr,
     COLWISE: cutlass.Constexpr,
+    ACTIVATION: cutlass.Constexpr,
 ):
     OUT_HALVES = 2 if cutlass.const_expr(IS_BWD) else 1
     NJT = K // TJ
@@ -537,7 +636,7 @@ def launcher(
     )
 
     NT = 256 if NRT * NJT < 1184 else 128
-    swiglu_mxfp8_kernel(
+    gated_mxfp8_kernel(
         mG,
         mGate,
         mUp,
@@ -552,6 +651,7 @@ def launcher(
         IS_BWD,
         ROWWISE,
         COLWISE,
+        ACTIVATION,
     ).launch(
         grid=(NRT * NJT, 1, 1),
         block=(NT, 1, 1),
@@ -561,7 +661,7 @@ def launcher(
 
 
 @functools.cache
-def _compile_kernel(M, K, is_bwd, rowwise, colwise, device_index):
+def _compile_kernel(M, K, is_bwd, rowwise, colwise, activation, device_index):
     """Compile and cache one kernel specialization.
 
     Tensor addresses are runtime arguments, so a single compilation per
@@ -586,6 +686,7 @@ def _compile_kernel(M, K, is_bwd, rowwise, colwise, device_index):
         is_bwd,
         rowwise,
         colwise,
+        activation,
     )
 
 
@@ -635,7 +736,7 @@ def _ptr(tensor):
 
 
 @torch.no_grad()
-def _launch_swiglu_mxfp8(gated_input, grad_h, outputs, rowwise, colwise):
+def _launch_gated_mxfp8(gated_input, grad_h, outputs, activation, rowwise, colwise):
     """Validate, compile the matching specialization, and launch into ``outputs``.
 
     ``outputs`` is ``(output_rowwise, output_colwise, scales_rowwise,
@@ -643,6 +744,13 @@ def _launch_swiglu_mxfp8(gated_input, grad_h, outputs, rowwise, colwise):
     zero-sized and are not written.
     """
     M, K = _validate_inputs(gated_input, grad_h)
+    try:
+        activation_id = _ACTIVATION_IDS[activation]
+    except KeyError as exc:
+        supported = ", ".join(_ACTIVATION_IDS)
+        raise ValueError(
+            f"unsupported gated activation {activation!r}; expected one of: {supported}"
+        ) from exc
     output_rowwise, output_colwise, scales_rowwise, scales_colwise = outputs
 
     # Compile and launch under the input's device, not whatever device happens
@@ -658,6 +766,7 @@ def _launch_swiglu_mxfp8(gated_input, grad_h, outputs, rowwise, colwise):
             grad_h is not None,
             rowwise,
             colwise,
+            activation_id,
             gated_input.device.index,
         )
         fn(
@@ -669,3 +778,8 @@ def _launch_swiglu_mxfp8(gated_input, grad_h, outputs, rowwise, colwise):
             _ptr(scales_colwise) if colwise else 0,
             stream,
         )
+
+
+def _launch_swiglu_mxfp8(gated_input, grad_h, outputs, rowwise, colwise):
+    """Backward-compatible launcher for the original SwiGLU-only API."""
+    return _launch_gated_mxfp8(gated_input, grad_h, outputs, "silu", rowwise, colwise)
