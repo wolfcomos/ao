@@ -160,8 +160,39 @@ class _PermuteMXFP8FwdHPBwd(torch.autograd.Function):
             grad_input_padded[permuted_indices, :] = grad_output
 
             # Remove the padding row (last row)
-            grad_input = grad_input_padded[:input_rows]
+            grad_input = grad_input_padded[:-1]
         return grad_input, None, None, None, None, None
+
+
+class _PermuteBF16(torch.autograd.Function):
+    """Sentinel-gather permute with the Triton scatter backward.
+
+    Forward is the original eager advanced-indexing permute (vstack a zero
+    sentinel row, gather by the map). Backward routes through
+    ``torchao::_triton_permute_bwd`` instead of aten's accumulate-mode
+    ``index_put`` / ``indexing_backward``: the valid map entries are
+    one-to-one (see `generate_permute_indices`), so the gradient scatter
+    needs no accumulation, and the -1 pad entries' gradients are dropped
+    instead of all accumulating into the sentinel row.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, permuted_indices: torch.Tensor):
+        ctx.save_for_backward(permuted_indices)
+        ctx.num_input_rows = x.shape[0]
+        x_padded = torch.vstack((x, x.new_zeros((1, x.shape[-1]))))
+        return x_padded[permuted_indices, :]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (permuted_indices,) = ctx.saved_tensors
+        grad_input = _triton_permute_bwd(
+            grad_output.contiguous(),
+            permuted_indices,
+            ctx.num_input_rows,
+            grad_output.shape[1],
+        )
+        return grad_input, None
 
 
 def permute_and_pad(
@@ -174,6 +205,10 @@ def permute_and_pad(
     """
     Permute token groups from rank-major to expert-major order, and pad group sizes to alignment size,
     in preparation for grouped GEMM.
+
+    The forward is the eager advanced-indexing permute; the backward scatters
+    through ``torchao::_triton_permute_bwd`` (no accumulation is needed for
+    the bijective map).
 
     Args:
         x: BF16 input tensor
@@ -201,9 +236,8 @@ def permute_and_pad(
             alignment,
         )
 
-    x = torch.vstack((x, x.new_zeros((1, x.shape[-1]))))
-    input_shape = x.shape
-    x = x[permuted_indices, :]
+    input_shape = torch.Size((x.shape[0] + 1, x.shape[1]))
+    x = _PermuteBF16.apply(x, permuted_indices)
 
     return input_shape, x, permuted_indices, num_tokens_per_expert_padded, group_offsets
 
@@ -316,7 +350,9 @@ def _triton_permute_bwd_kernel(
         other=PADDING_VALUE,
     )
 
-    write_mask = (dest_rows[:, None] != PADDING_VALUE) & (
+    # Entries outside [0, original_rows) are invalid, exactly like the -1
+    # padding value, so no map value can address memory outside the output.
+    write_mask = ((dest_rows >= 0) & (dest_rows < original_rows))[:, None] & (
         col_offsets[None, :] < original_cols
     )
     tl.store(
