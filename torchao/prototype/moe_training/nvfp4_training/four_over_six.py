@@ -66,6 +66,11 @@ from torchao.prototype.mx_formats.kernels import (
 )
 from torchao.prototype.mx_formats.utils import to_blocked
 
+from .four_over_six_cutedsl import (
+    _cutedsl_quantize_eligible,
+    four_over_six_quantize_cutedsl,
+)
+
 FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 _FP32_MAX = torch.finfo(torch.float32).max
@@ -194,6 +199,14 @@ def four_over_six_quantize(
         raise ValueError(
             f"global_amax must be a scalar or a ({rows},) row vector, "
             f"got shape {tuple(global_amax.shape)}"
+        )
+
+    # Fast path: the CuTe DSL kernel is an op-for-op reimplementation of the
+    # arithmetic below with bitwise-identical codes and scales; ineligible
+    # shapes/dtypes silently fall through to the pure-PyTorch body.
+    if _cutedsl_quantize_eligible(x):
+        return four_over_six_quantize_cutedsl(
+            x, global_amax, block, err_mode, e4m3_scale_bound
         )
 
     xf = x.float().view(rows, cols // 16, 16)

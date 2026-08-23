@@ -8,12 +8,16 @@
 import pytest
 import torch
 
+import torchao.prototype.moe_training.nvfp4_training.four_over_six as four_over_six_module
 from torchao.float8.float8_utils import compute_error
 from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
     NVFP4FourOverSixLinear,
     four_over_six_global_encode_scale,
     four_over_six_linear,
     four_over_six_quantize,
+)
+from torchao.prototype.moe_training.nvfp4_training.four_over_six_cutedsl import (
+    _cutedsl_quantize_available,
 )
 from torchao.prototype.mx_formats.kernels import f4_unpacked_to_f32, unpack_uint4
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
@@ -29,6 +33,22 @@ _skip_no_sm100 = pytest.mark.skipif(
     ),
     reason="requires SM100+ and PyTorch 2.10+ (FP4 scaled_mm)",
 )
+_cutedsl_available = torch.cuda.is_available() and _cutedsl_quantize_available()
+_skip_no_cutedsl = pytest.mark.skipif(
+    not _cutedsl_available,
+    reason="requires SM100+ and the CuTe DSL runtime packages",
+)
+
+
+def _reference_quantize(x, global_amax, **kwargs):
+    """Run the pure-PyTorch four_over_six_quantize body (the bitwise oracle)
+    by disabling the CuTe DSL dispatch gate for the duration of the call."""
+    orig = four_over_six_module._cutedsl_quantize_eligible
+    four_over_six_module._cutedsl_quantize_eligible = lambda t: False
+    try:
+        return four_over_six_quantize(x, global_amax, **kwargs)
+    finally:
+        four_over_six_module._cutedsl_quantize_eligible = orig
 
 
 def _dequantize(codes, scales, global_amax, e4m3_scale_bound):
@@ -245,3 +265,137 @@ def test_bitwise_parity_with_transformer_engine(
     te_scales = t._rowwise_scale_inv[:M, : N // 16].view(torch.uint8)
     torch.testing.assert_close(te_codes, codes, atol=0, rtol=0)
     torch.testing.assert_close(te_scales, scales.view(torch.uint8), atol=0, rtol=0)
+    # Also run the CuTe DSL kernel explicitly against TE (the call above
+    # already dispatches to it when eligible; this pins the op itself).
+    if _cutedsl_available:
+        dsl_codes, dsl_scales = torch.ops.torchao.four_over_six_quantize_cutedsl(
+            x, amax, block, err_mode, e4m3_scale_bound
+        )
+        torch.testing.assert_close(te_codes, dsl_codes, atol=0, rtol=0)
+        torch.testing.assert_close(
+            te_scales, dsl_scales.view(torch.uint8), atol=0, rtol=0
+        )
+
+
+@_skip_no_cutedsl
+@pytest.mark.parametrize("err_mode", ["mae", "mse"])
+@pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
+@pytest.mark.parametrize("block", ["1x16", "16x16"])
+@pytest.mark.parametrize("row_scaled", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cutedsl_bitwise_matches_reference(
+    err_mode, e4m3_scale_bound, block, row_scaled, dtype
+):
+    """CuTe DSL fast path is bitwise identical to the pure-PyTorch body.
+
+    Shapes cover R < the kernel's 128-row tile (TMA-clipped stores), R not a
+    multiple of 16 (1x16 only), and multi-tile rows/columns.
+    """
+    if row_scaled and block == "16x16":
+        pytest.skip("row-scaled is 1x16 only")
+    shapes = [(128, 256), (64, 1024)]
+    if block == "1x16":
+        shapes.append((100, 320))
+    for shape in shapes:
+        torch.manual_seed(0)
+        x = torch.randn(*shape, dtype=dtype, device="cuda")
+        amax = (x.abs().amax(dim=1) if row_scaled else x.abs().amax()).to(torch.float32)
+        assert four_over_six_module._cutedsl_quantize_eligible(x)
+        codes, scales = four_over_six_quantize(
+            x, amax, block=block, err_mode=err_mode, e4m3_scale_bound=e4m3_scale_bound
+        )
+        ref_codes, ref_scales = _reference_quantize(
+            x, amax, block=block, err_mode=err_mode, e4m3_scale_bound=e4m3_scale_bound
+        )
+        torch.testing.assert_close(codes, ref_codes, atol=0, rtol=0)
+        torch.testing.assert_close(
+            scales.view(torch.uint8), ref_scales.view(torch.uint8), atol=0, rtol=0
+        )
+
+
+@_skip_no_cutedsl
+@pytest.mark.parametrize("block", ["1x16", "16x16"])
+def test_cutedsl_special_values(block):
+    """Zeros, Inf injections, and amax==0 rows stay bitwise vs the reference."""
+    torch.manual_seed(0)
+    # all zeros: S_enc falls back to 1.0, zero scales, zero codes
+    x = torch.zeros(64, 256, dtype=torch.bfloat16, device="cuda")
+    amax = x.abs().amax().to(torch.float32)
+    codes, scales = four_over_six_quantize(x, amax, block=block)
+    ref_codes, ref_scales = _reference_quantize(x, amax, block=block)
+    torch.testing.assert_close(codes, ref_codes, atol=0, rtol=0)
+    torch.testing.assert_close(
+        scales.view(torch.uint8), ref_scales.view(torch.uint8), atol=0, rtol=0
+    )
+    # Inf injections: block scale caps at 448, Inf encodes as +/-6, both
+    # candidate errors go Inf and the tie picks map-to-6
+    x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
+    x[7, 32] = float("inf")
+    x[23, 100] = float("-inf")
+    amax = x.abs().amax().to(torch.float32)
+    codes, scales = four_over_six_quantize(x, amax, block=block)
+    ref_codes, ref_scales = _reference_quantize(x, amax, block=block)
+    torch.testing.assert_close(codes, ref_codes, atol=0, rtol=0)
+    torch.testing.assert_close(
+        scales.view(torch.uint8), ref_scales.view(torch.uint8), atol=0, rtol=0
+    )
+    if block == "1x16":
+        # row-scaled with amax == 0 rows over nonzero data: identity S_enc
+        x = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
+        row_amax = x.abs().amax(dim=1).to(torch.float32)
+        row_amax[::3] = 0.0
+        codes, scales = four_over_six_quantize(x, row_amax, block=block)
+        ref_codes, ref_scales = _reference_quantize(x, row_amax, block=block)
+        torch.testing.assert_close(codes, ref_codes, atol=0, rtol=0)
+        torch.testing.assert_close(
+            scales.view(torch.uint8), ref_scales.view(torch.uint8), atol=0, rtol=0
+        )
+
+
+@_skip_no_cutedsl
+def test_cutedsl_nan_semantics():
+    """NaN inputs follow the TE kernel semantics, which the pure-PyTorch body
+    cannot reproduce (torch.amax propagates NaN into the block scales while
+    the kernel's fmaxf drops it): an all-NaN group gets amax 0 -> scale byte
+    0x00, and NaN elements encode to +6 (satfinite), i.e. code bytes 0x77."""
+    torch.manual_seed(0)
+    x = torch.randn(32, 256, dtype=torch.bfloat16, device="cuda")
+    x[3, 32:48] = float("nan")  # group (3, 2)
+    # a NaN-free global amax, as TE's own NaN-dropping amax kernel produces
+    amax = torch.nan_to_num(x.float(), nan=0.0).abs().amax().to(torch.float32)
+    codes, scales = four_over_six_quantize(x, amax, block="1x16")
+    assert scales.view(torch.uint8)[3, 2].item() == 0x00
+    assert (codes[3, 16:24] == 0x77).all()
+    # NaN-free groups are still bitwise vs the reference
+    ref_codes, ref_scales = _reference_quantize(x, amax, block="1x16")
+    keep = torch.ones_like(codes, dtype=torch.bool)
+    keep[3, 16:24] = False
+    torch.testing.assert_close(codes[keep], ref_codes[keep], atol=0, rtol=0)
+
+
+@_skip_no_cutedsl
+def test_cutedsl_ineligible_falls_back():
+    """Ineligible shapes/layouts silently use the pure-PyTorch body."""
+    x = torch.randn(64, 272, dtype=torch.bfloat16, device="cuda")  # C % 64 != 0
+    assert not four_over_six_module._cutedsl_quantize_eligible(x)
+    amax = x.abs().amax().to(torch.float32)
+    codes, scales = four_over_six_quantize(x, amax)
+    assert codes.shape == (64, 136) and scales.shape == (64, 17)
+    x_t = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda").t()
+    assert not four_over_six_module._cutedsl_quantize_eligible(x_t)
+
+
+@_skip_no_sm100
+@pytest.mark.skipif(not _cutedsl_available, reason="requires the CuTe DSL runtime")
+def test_cutedsl_linear_compile():
+    """torch.compile traces through the dispatch (custom op + fake impl)."""
+    torch.manual_seed(0)
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    def fn(x, w):
+        return four_over_six_linear(x, w, None, "mae", 256, False)
+
+    y_eager = fn(x, w)
+    y_compiled = torch.compile(fn, fullgraph=True)(x, w)
+    torch.testing.assert_close(y_compiled, y_eager, atol=0, rtol=0)
