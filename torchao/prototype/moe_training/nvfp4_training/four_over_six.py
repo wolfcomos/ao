@@ -314,6 +314,26 @@ def four_over_six_dequantize(
             f"global_amax must be a scalar or a ({rows},) row vector, "
             f"got shape {tuple(global_amax.shape)}"
         )
+    return _four_over_six_dequantize_op(
+        codes, scales, global_amax, e4m3_scale_bound, out_dtype
+    )
+
+
+# Registered as a custom op so torch.compile keeps the eager decode: inductor
+# codegen of the fused unpack + broadcast-scale graph miscompiles the
+# low-nibble lane (torch 2.14 nightly), and the dequantized backward's whole
+# contract is bitwise parity with the fprop operands.
+@torch.library.custom_op("torchao::four_over_six_dequantize", mutates_args=())
+def _four_over_six_dequantize_op(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_amax: torch.Tensor,
+    e4m3_scale_bound: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    rows, packed_cols = codes.shape
+    cols = packed_cols * 2
+    row_scaled = global_amax.dim() == 1 and global_amax.numel() == rows
     values = f4_unpacked_to_f32(unpack_uint4(codes)).view(rows, cols // 16, 16)
     amax = global_amax.to(torch.float32)
     if row_scaled:
@@ -328,6 +348,11 @@ def four_over_six_dequantize(
     )
     decode_scale = (scales.to(torch.float32) * amax) * factor_inv
     return (values * decode_scale.unsqueeze(-1)).to(out_dtype).view(rows, cols)
+
+
+@_four_over_six_dequantize_op.register_fake
+def _(codes, scales, global_amax, e4m3_scale_bound, out_dtype):
+    return codes.new_empty((codes.shape[0], codes.shape[1] * 2), dtype=out_dtype)
 
 
 def _standard_rtne_quantize(
