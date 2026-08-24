@@ -613,3 +613,56 @@ def test_cutedsl_linear_compile():
     y_eager = fn(x, w)
     y_compiled = torch.compile(fn, fullgraph=True)(x, w)
     torch.testing.assert_close(y_compiled, y_eager, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+@pytest.mark.skipif(not _cutedsl_available, reason="requires the CuTe DSL runtime")
+@pytest.mark.parametrize(
+    "backward_override", ["high_precision", "dequantized"]
+)
+def test_linear_compile_backward_overrides(backward_override):
+    """fullgraph compile of the override backwards, bitwise vs eager.
+
+    The quantize stays an opaque custom op under compile; the override
+    backwards are bf16 GEMMs (on original or dequantized operands), so
+    compiled gradients must match eager exactly.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    def fn(x, w):
+        return four_over_six_linear(
+            x, w, None, "mae", 256, False, backward_override
+        )
+
+    x_e = x.clone().requires_grad_(True)
+    w_e = w.clone().requires_grad_(True)
+    y_eager = fn(x_e, w_e)
+    dy = torch.randn_like(y_eager)
+    y_eager.backward(dy)
+
+    x_c = x.clone().requires_grad_(True)
+    w_c = w.clone().requires_grad_(True)
+    y_compiled = torch.compile(fn, fullgraph=True)(x_c, w_c)
+    y_compiled.backward(dy)
+
+    torch.testing.assert_close(y_compiled, y_eager, atol=0, rtol=0)
+    torch.testing.assert_close(x_c.grad, x_e.grad, atol=0, rtol=0)
+    torch.testing.assert_close(w_c.grad, w_e.grad, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+@pytest.mark.skipif(not _cutedsl_available, reason="requires the CuTe DSL runtime")
+def test_linear_compile_weight_block_1x16():
+    """fullgraph compile of the 1x16-weight forward, bitwise vs eager."""
+    torch.manual_seed(0)
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    def fn(x, w):
+        return four_over_six_linear(x, w, None, "mae", 256, False, None, "1x16")
+
+    y_eager = fn(x, w)
+    y_compiled = torch.compile(fn, fullgraph=True)(x, w)
+    torch.testing.assert_close(y_compiled, y_eager, atol=0, rtol=0)

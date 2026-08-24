@@ -311,3 +311,109 @@ def test_grouped_miles_recipe_point():
         y.float(),
     )
     assert sqnr > 14.0, f"quantization noise floor too high: {sqnr:.1f} dB"
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize("row_scaled_activation", [False, True])
+@pytest.mark.parametrize("weight_block", ["16x16", "1x16"])
+def test_grouped_backward_dequantized_ragged(row_scaled_activation, weight_block):
+    """Ragged groups + padding + dequantized backward, value-checked.
+
+    This is the composition the torchtitan grouped-experts hook ships;
+    the padded rows quantize to zeros and are unpadded away before the
+    backward GEMMs, so the reference can quantize the ragged rows directly.
+    """
+    group_sizes = [100, 220, 77]
+    K, N = 256, 384
+    A, B, offs = _make_grouped_inputs(group_sizes, K=K, N=N, seed=7)
+    A.requires_grad_(True)
+    B.requires_grad_(True)
+    y = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        err_mode="mse",
+        row_scaled_activation=row_scaled_activation,
+        weight_block=weight_block,
+        backward_override="dequantized",
+        pad_token_groups_for_grouped_mm=True,
+    )
+    dy = torch.randn_like(y)
+    y.backward(dy)
+
+    A_hp, B_hp = A.detach(), B.detach()
+    if row_scaled_activation:
+        x_amax = A_hp.abs().amax(dim=1).to(torch.float32)
+    else:
+        # Group amaxes come from the real rows; zero padding cannot raise them.
+        group_amax = []
+        start = 0
+        for end in offs.tolist():
+            group_amax.append(A_hp[start:end].abs().amax().to(torch.float32))
+            start = end
+        x_amax = torch.stack(group_amax).repeat_interleave(
+            torch.tensor(group_sizes, device=A.device)
+        )
+    x_codes, x_scales = four_over_six_quantize(A_hp, x_amax, err_mode="mse")
+    x_dq = four_over_six_dequantize(x_codes, x_scales, x_amax)
+    w_dq = []
+    for e in range(B.shape[0]):
+        w_amax = B_hp[e].abs().amax().to(torch.float32)
+        w_codes, w_scales = four_over_six_quantize(
+            B_hp[e], w_amax, block=weight_block, err_mode="mse"
+        )
+        w_dq.append(four_over_six_dequantize(w_codes, w_scales, w_amax))
+    w_dq = torch.stack(w_dq)
+
+    dx_ref = torch._grouped_mm(dy, w_dq, offs=offs, out_dtype=torch.bfloat16)
+    dw_ref = torch._grouped_mm(
+        dy.transpose(-2, -1), x_dq, offs=offs, out_dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(A.grad, dx_ref, atol=0, rtol=0)
+    torch.testing.assert_close(B.grad, dw_ref, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize(
+    "backward_override", ["high_precision", "dequantized"]
+)
+def test_grouped_compile(backward_override):
+    """fullgraph compile of the per-tensor grouped op, forward and backward.
+
+    The op is nonstrict-traced under compile, so eager numerics carry over
+    bitwise. Row-scaled mode is exempt: its per-group dense-GEMM loop reads
+    the offsets on the host, which fullgraph capture cannot express (the
+    titan converter rejects that combination at config time).
+    """
+    group_sizes = [128, 256, 128]
+    A, B, offs = _make_grouped_inputs(group_sizes, K=256, N=384, seed=11)
+
+    # Compile the decorated op directly (the mxfp8 grouped test's pattern);
+    # calling a nonstrict-traced function from a compiled frame is rejected.
+    A_e = A.clone().requires_grad_(True)
+    B_e = B.clone().requires_grad_(True)
+    y_eager = four_over_six_grouped_mm(
+        A_e, B_e, offs, err_mode="mse", backward_override=backward_override
+    )
+    dy = torch.randn_like(y_eager)
+    y_eager.backward(dy)
+
+    A_c = A.clone().requires_grad_(True)
+    B_c = B.clone().requires_grad_(True)
+    try:
+        y_compiled = torch.compile(four_over_six_grouped_mm, fullgraph=True)(
+            A_c, B_c, offs, err_mode="mse", backward_override=backward_override
+        )
+    except torch._dynamo.exc.Unsupported as e:
+        if "nonstrict_trace" in str(e):
+            pytest.skip(
+                "this torch build rejects autograd.Function outputs from "
+                "nonstrict_trace-ed functions (the mxfp8 grouped compile "
+                "test's pattern); coverage resumes on builds that accept it"
+            )
+        raise
+    y_compiled.backward(dy)
+
+    torch.testing.assert_close(y_compiled, y_eager, atol=0, rtol=0)
+    torch.testing.assert_close(A_c.grad, A_e.grad, atol=0, rtol=0)
+    torch.testing.assert_close(B_c.grad, B_e.grad, atol=0, rtol=0)
