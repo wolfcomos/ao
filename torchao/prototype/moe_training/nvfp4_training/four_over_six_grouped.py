@@ -265,12 +265,15 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
 
         padded_group_start_offsets = None
         if pad_token_groups_for_grouped_mm:
+            # The fused pad/unpad CUDA kernels only accept alignment_size 32
+            # and at most 32 groups; this op needs 128-row alignment with any
+            # expert count, so it pins the pure-torch path.
             input_act, padded_group_start_offsets, padded_group_end_offsets = (
                 pad_token_groups(
                     input_act,
                     group_end_offsets,
                     alignment_size=_ALIGNMENT,
-                    kernel_preference=KernelPreference.TRITON,
+                    kernel_preference=KernelPreference.EMULATED,
                 )
             )
         else:
@@ -368,7 +371,7 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
                 padded_group_start_offsets,
                 num_tokens,
                 alignment_size=_ALIGNMENT,
-                kernel_preference=KernelPreference.TRITON,
+                kernel_preference=KernelPreference.EMULATED,
             )
 
         if backward_override == "high_precision":
@@ -419,7 +422,7 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
                     padded_group_start_offsets,
                     ctx.num_tokens,
                     alignment_size=_ALIGNMENT,
-                    kernel_preference=KernelPreference.TRITON,
+                    kernel_preference=KernelPreference.EMULATED,
                 )
             weight = _dequantize_expert_weights(
                 w_codes, w_scales, weight_amax, ctx.e4m3_scale_bound
