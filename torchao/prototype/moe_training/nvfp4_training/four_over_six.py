@@ -51,6 +51,22 @@ there). Two details are load-bearing:
 * backward with row-scaled activations: high-precision (bf16) GEMMs. A
   row-scaled four-over-six tensor has no columnwise form — the per-row scales
   do not transpose — so the quantized wgrad operand cannot be produced.
+
+Those backward defaults can be overridden with ``backward_override``,
+mirroring TransformerEngine's ``NVTE_BACKWARD_OVERRIDE`` recipe field:
+
+* ``"quantized"``: the standard-NVFP4-gradient backward above (the
+  per-tensor default; rejected for row-scaled activations);
+* ``"high_precision"``: bf16 GEMMs on the saved original operands (the
+  row-scaled default);
+* ``"dequantized"``: bf16 GEMMs on dequantizations of the rowwise operands
+  the forward GEMM consumed, so the gradients differentiate the
+  quantized-forward function itself — the RL train/inference-consistency
+  mode. Only 4-bit codes and scales are saved for backward, the same
+  activation-memory win TransformerEngine PR #3141 documents.
+
+Weights quantize with 16x16 tiles by default; ``weight_block="1x16"`` mirrors
+TransformerEngine's ``disable_2d_quantization``.
 """
 
 from typing import Optional
@@ -63,6 +79,7 @@ from torchao.prototype.mx_formats.kernels import (
     f4_unpacked_to_f32,
     f32_to_f4_unpacked,
     pack_uint4,
+    unpack_uint4,
 )
 from torchao.prototype.mx_formats.utils import to_blocked
 
@@ -78,6 +95,7 @@ _FP32_MAX = torch.finfo(torch.float32).max
 __all__ = [
     "four_over_six_global_encode_scale",
     "four_over_six_quantize",
+    "four_over_six_dequantize",
     "four_over_six_mm",
     "four_over_six_linear",
     "NVFP4FourOverSixLinear",
@@ -255,6 +273,63 @@ def four_over_six_quantize(
     return pack_uint4(codes.view(rows, cols)), scales
 
 
+def four_over_six_dequantize(
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_amax: torch.Tensor,
+    *,
+    e4m3_scale_bound: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dequantize packed FP4 codes and block scales back to high precision.
+
+    Inverse of :func:`four_over_six_quantize`, transcribed operation for
+    operation from TransformerEngine's ``dequantize_nvfp4.cuh``: the per-block
+    decode scale is ``(f32(scale) * amax) * factor_inv`` with
+    ``factor_inv = 1 / (6 * bound)`` a correctly-rounded FP32 reciprocal, and
+    each element is ``f32(code) * decode_scale`` cast to ``out_dtype``.
+    Scales from either block granularity dequantize identically (a 16x16 tile
+    stores its scale byte on every row).
+
+    Args:
+        codes: (R, C//2) uint8 packed FP4 codes.
+        scales: (R, C//16) float8_e4m3fn block scales.
+        global_amax: scalar FP32 amax, or a (R,) per-row amax vector for the
+            row-scaled variant.
+        e4m3_scale_bound: the bound the codes were quantized with.
+        out_dtype: output dtype (the kernel's OType cast).
+    """
+    if e4m3_scale_bound not in (256, 448):
+        raise ValueError(f"e4m3_scale_bound must be 256 or 448, got {e4m3_scale_bound}")
+    rows, packed_cols = codes.shape
+    cols = packed_cols * 2
+    if scales.shape != (rows, cols // 16):
+        raise ValueError(
+            f"scales must have shape ({rows}, {cols // 16}), "
+            f"got {tuple(scales.shape)}"
+        )
+    row_scaled = global_amax.dim() == 1 and global_amax.numel() == rows
+    if not row_scaled and global_amax.numel() != 1:
+        raise ValueError(
+            f"global_amax must be a scalar or a ({rows},) row vector, "
+            f"got shape {tuple(global_amax.shape)}"
+        )
+    values = f4_unpacked_to_f32(unpack_uint4(codes)).view(rows, cols // 16, 16)
+    amax = global_amax.to(torch.float32)
+    if row_scaled:
+        amax = amax.view(rows, 1)
+    # The reciprocal must come from a true FP32 division (see _candidate_error
+    # on why a python-scalar denominator double-rounds).
+    factor_inv = torch.ones((), dtype=torch.float32, device=codes.device) / torch.full(
+        (),
+        FP4_E2M1_MAX * float(e4m3_scale_bound),
+        dtype=torch.float32,
+        device=codes.device,
+    )
+    decode_scale = (scales.to(torch.float32) * amax) * factor_inv
+    return (values * decode_scale.unsqueeze(-1)).to(out_dtype).view(rows, cols)
+
+
 def _standard_rtne_quantize(
     x: torch.Tensor, global_amax: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -323,6 +398,10 @@ class four_over_six_mm(torch.autograd.Function):
     With row-scaled activations the backward runs in bf16 instead (see the
     module docstring), saving the high-precision operands.
 
+    ``backward_override`` selects among the quantized, high-precision, and
+    dequantized backwards described in the module docstring; ``None`` keeps
+    the defaults above. ``weight_block`` selects the weight tile granularity.
+
     Requires: M % 128 == 0, K % 128 == 0, N % 128 == 0.
     """
 
@@ -335,6 +414,8 @@ class four_over_six_mm(torch.autograd.Function):
         err_mode: str = "mae",
         e4m3_scale_bound: int = 256,
         row_scaled_activation: bool = False,
+        backward_override: Optional[str] = None,
+        weight_block: str = "16x16",
     ):
         M = input_hp.shape[:-1].numel()
         K = input_hp.shape[-1]
@@ -347,6 +428,24 @@ class four_over_six_mm(torch.autograd.Function):
             raise ValueError(
                 f"four_over_six_mm requires M, K, N all divisible by 128; "
                 f"got M={M}, K={K}, N={N}"
+            )
+        if backward_override is None:
+            backward_override = (
+                "high_precision" if row_scaled_activation else "quantized"
+            )
+        if backward_override not in ("quantized", "high_precision", "dequantized"):
+            raise ValueError(
+                f"backward_override must be 'quantized', 'high_precision', or "
+                f"'dequantized', got {backward_override!r}"
+            )
+        if backward_override == "quantized" and row_scaled_activation:
+            raise ValueError(
+                "row-scaled four-over-six has no quantized backward; use "
+                "'high_precision' or 'dequantized'"
+            )
+        if weight_block not in ("1x16", "16x16"):
+            raise ValueError(
+                f"weight_block must be '1x16' or '16x16', got {weight_block!r}"
             )
         input_2d = input_hp.reshape(-1, K).contiguous()
 
@@ -366,7 +465,7 @@ class four_over_six_mm(torch.autograd.Function):
         w_codes, w_scales = four_over_six_quantize(
             weight_hp,
             w_amax,
-            block="16x16",
+            block=weight_block,
             err_mode=err_mode,
             e4m3_scale_bound=e4m3_scale_bound,
         )
@@ -407,8 +506,19 @@ class four_over_six_mm(torch.autograd.Function):
         if bias is not None:
             output = output + bias
 
-        if row_scaled_activation:
+        if backward_override == "high_precision":
             ctx.save_for_backward(input_2d, weight_hp)
+        elif backward_override == "dequantized":
+            # The rowwise operands the forward GEMM just consumed; backward
+            # dequantizes them, differentiating the quantized-forward function.
+            ctx.save_for_backward(
+                x_codes,
+                x_scales,
+                x_amax,
+                w_codes,
+                w_scales,
+                w_amax,
+            )
         else:
             x_col_codes, x_col_scales = four_over_six_quantize(
                 input_2d.t().contiguous(),
@@ -420,7 +530,7 @@ class four_over_six_mm(torch.autograd.Function):
             w_col_codes, w_col_scales = four_over_six_quantize(
                 weight_hp.t().contiguous(),
                 w_amax,
-                block="16x16",
+                block=weight_block,
                 err_mode=err_mode,
                 e4m3_scale_bound=e4m3_scale_bound,
             )
@@ -432,7 +542,7 @@ class four_over_six_mm(torch.autograd.Function):
                 w_col_scales,
                 w_amax,
             )
-        ctx.row_scaled_activation = row_scaled_activation
+        ctx.backward_override = backward_override
         ctx.e4m3_scale_bound = e4m3_scale_bound
         ctx.input_orig_shape = input_hp.shape
         ctx.has_bias = bias is not None
@@ -443,10 +553,27 @@ class four_over_six_mm(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1])
 
-        if ctx.row_scaled_activation:
+        if ctx.backward_override == "high_precision":
             input_2d, weight_hp = ctx.saved_tensors
             grad_input = (grad_output_2d @ weight_hp).reshape(ctx.input_orig_shape)
             grad_weight = grad_output_2d.t() @ input_2d
+        elif ctx.backward_override == "dequantized":
+            (
+                x_codes,
+                x_scales,
+                x_amax,
+                w_codes,
+                w_scales,
+                w_amax,
+            ) = ctx.saved_tensors
+            weight_dq = four_over_six_dequantize(
+                w_codes, w_scales, w_amax, e4m3_scale_bound=ctx.e4m3_scale_bound
+            )
+            input_dq = four_over_six_dequantize(
+                x_codes, x_scales, x_amax, e4m3_scale_bound=ctx.e4m3_scale_bound
+            )
+            grad_input = (grad_output_2d @ weight_dq).reshape(ctx.input_orig_shape)
+            grad_weight = grad_output_2d.t() @ input_dq
         else:
             (
                 x_col_codes,
@@ -488,7 +615,7 @@ class four_over_six_mm(torch.autograd.Function):
             if ctx.has_bias
             else None
         )
-        return grad_input, grad_weight, grad_bias, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
 four_over_six_linear = four_over_six_mm.apply
@@ -501,6 +628,8 @@ class NVFP4FourOverSixLinear(nn.Linear):
     forward GEMM operands use four-over-six NVFP4, gradients use standard
     NVFP4 (or bf16 when ``row_scaled_activation`` is set — see the module
     docstring for why row-scaled has no quantized backward).
+    ``backward_override`` and ``weight_block`` pass through to
+    :class:`four_over_six_mm`.
     """
 
     def __init__(
@@ -511,6 +640,8 @@ class NVFP4FourOverSixLinear(nn.Linear):
         err_mode: str = "mae",
         e4m3_scale_bound: int = 256,
         row_scaled_activation: bool = False,
+        backward_override: Optional[str] = None,
+        weight_block: str = "16x16",
         device=None,
         dtype=None,
     ):
@@ -518,6 +649,8 @@ class NVFP4FourOverSixLinear(nn.Linear):
         self.err_mode = err_mode
         self.e4m3_scale_bound = e4m3_scale_bound
         self.row_scaled_activation = row_scaled_activation
+        self.backward_override = backward_override
+        self.weight_block = weight_block
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return four_over_six_linear(
@@ -527,6 +660,8 @@ class NVFP4FourOverSixLinear(nn.Linear):
             self.err_mode,
             self.e4m3_scale_bound,
             self.row_scaled_activation,
+            self.backward_override,
+            self.weight_block,
         )
 
     @classmethod
@@ -536,6 +671,8 @@ class NVFP4FourOverSixLinear(nn.Linear):
         err_mode: str = "mae",
         e4m3_scale_bound: int = 256,
         row_scaled_activation: bool = False,
+        backward_override: Optional[str] = None,
+        weight_block: str = "16x16",
     ) -> "NVFP4FourOverSixLinear":
         new = cls(
             mod.in_features,
@@ -544,6 +681,8 @@ class NVFP4FourOverSixLinear(nn.Linear):
             err_mode=err_mode,
             e4m3_scale_bound=e4m3_scale_bound,
             row_scaled_activation=row_scaled_activation,
+            backward_override=backward_override,
+            weight_block=weight_block,
             device=mod.weight.device,
             dtype=mod.weight.dtype,
         )

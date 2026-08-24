@@ -12,6 +12,7 @@ import torchao.prototype.moe_training.nvfp4_training.four_over_six as four_over_
 from torchao.float8.float8_utils import compute_error
 from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
     NVFP4FourOverSixLinear,
+    four_over_six_dequantize,
     four_over_six_global_encode_scale,
     four_over_six_linear,
     four_over_six_quantize,
@@ -170,6 +171,44 @@ def test_dequant_sqnr(block):
     assert compute_error(x.float(), dq).item() > 14.0
 
 
+@_skip_no_cuda
+@pytest.mark.parametrize("block", ["1x16", "16x16"])
+@pytest.mark.parametrize("row_scaled", [False, True])
+def test_dequantize_roundtrip(block, row_scaled):
+    """four_over_six_dequantize reconstructs the quantized values."""
+    if row_scaled and block == "16x16":
+        pytest.skip("row-scaled is 1x16 only")
+    torch.manual_seed(0)
+    x = torch.randn(128, 512, dtype=torch.bfloat16, device="cuda")
+    amax = (x.abs().amax(dim=1) if row_scaled else x.abs().amax()).to(torch.float32)
+    codes, scales = four_over_six_quantize(x, amax, block=block)
+    dq = four_over_six_dequantize(codes, scales, amax, out_dtype=torch.float32)
+    assert compute_error(x.float(), dq).item() > 14.0
+    # Zero blocks reconstruct exactly: scale byte 0x00 makes the decode
+    # scale exactly zero regardless of the global amax.
+    x[:, :16] = 0.0
+    codes, scales = four_over_six_quantize(x, amax, block=block)
+    dq = four_over_six_dequantize(codes, scales, amax, out_dtype=torch.float32)
+    assert (dq[:, :16] == 0.0).all()
+
+
+@_skip_no_cuda
+def test_dequantize_validation():
+    codes = torch.zeros(32, 128, dtype=torch.uint8, device="cuda")
+    scales = torch.zeros(32, 16, dtype=torch.uint8, device="cuda").view(
+        torch.float8_e4m3fn
+    )
+    amax = torch.ones((), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="e4m3_scale_bound"):
+        four_over_six_dequantize(codes, scales, amax, e4m3_scale_bound=128)
+    with pytest.raises(ValueError, match="scales must have shape"):
+        four_over_six_dequantize(codes, scales[:, :8], amax)
+    with pytest.raises(ValueError, match="row vector"):
+        four_over_six_dequantize(
+            codes, scales, torch.ones(7, dtype=torch.float32, device="cuda")
+        )
+
+
 @_skip_no_sm100
 @pytest.mark.parametrize("row_scaled_activation", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
@@ -220,6 +259,138 @@ def test_linear_rejects_unaligned_dims():
     w = torch.randn(384, 512, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="divisible by 128"):
         four_over_six_linear(x, w, None, "mae", 256, False)
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize("row_scaled_activation", [False, True])
+def test_backward_override_high_precision(row_scaled_activation):
+    """dx/dw are the plain bf16 GEMMs on the original operands."""
+    torch.manual_seed(0)
+    M, K, N = 256, 512, 384
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    w = (torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.1).requires_grad_(
+        True
+    )
+    y = four_over_six_linear(
+        x, w, None, "mae", 256, row_scaled_activation, "high_precision"
+    )
+    dy = torch.randn_like(y)
+    y.backward(dy)
+    torch.testing.assert_close(x.grad, dy @ w.detach(), atol=0, rtol=0)
+    torch.testing.assert_close(w.grad, dy.t() @ x.detach(), atol=0, rtol=0)
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize("row_scaled_activation", [False, True])
+@pytest.mark.parametrize("weight_block", ["16x16", "1x16"])
+def test_backward_override_dequantized(row_scaled_activation, weight_block):
+    """dx/dw are bf16 GEMMs on dequantizations of the rowwise fprop operands."""
+    torch.manual_seed(0)
+    M, K, N = 256, 512, 384
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    w = (torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.1).requires_grad_(
+        True
+    )
+    y = four_over_six_linear(
+        x, w, None, "mae", 256, row_scaled_activation, "dequantized", weight_block
+    )
+    dy = torch.randn_like(y)
+    y.backward(dy)
+
+    x_hp, w_hp = x.detach(), w.detach()
+    x_amax = (
+        x_hp.abs().amax(dim=1) if row_scaled_activation else x_hp.abs().amax()
+    ).to(torch.float32)
+    w_amax = w_hp.abs().amax().to(torch.float32)
+    x_codes, x_scales = four_over_six_quantize(x_hp, x_amax)
+    w_codes, w_scales = four_over_six_quantize(w_hp, w_amax, block=weight_block)
+    x_dq = four_over_six_dequantize(x_codes, x_scales, x_amax)
+    w_dq = four_over_six_dequantize(w_codes, w_scales, w_amax)
+    torch.testing.assert_close(x.grad, dy @ w_dq, atol=0, rtol=0)
+    torch.testing.assert_close(w.grad, dy.t() @ x_dq, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+def test_row_scaled_default_backward_is_high_precision():
+    """row_scaled + backward_override=None keeps the pre-override behavior."""
+    torch.manual_seed(0)
+    M, K, N = 256, 512, 384
+    x_hp = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    w_hp = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    dy = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+
+    def run(override):
+        x = x_hp.clone().requires_grad_(True)
+        w = w_hp.clone().requires_grad_(True)
+        y = four_over_six_linear(x, w, None, "mae", 256, True, override)
+        y.backward(dy)
+        return y.detach(), x.grad, w.grad
+
+    y0, dx0, dw0 = run(None)
+    y1, dx1, dw1 = run("high_precision")
+    torch.testing.assert_close(y0, y1, atol=0, rtol=0)
+    torch.testing.assert_close(dx0, dx1, atol=0, rtol=0)
+    torch.testing.assert_close(dw0, dw1, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+def test_weight_block_1x16_forward():
+    """weight_block='1x16' quantizes the fprop weight with 1x16 blocks."""
+    from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
+        _global_decode_scale,
+        _scaled_mm_nvfp4,
+    )
+
+    torch.manual_seed(0)
+    M, K, N = 256, 512, 384
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    y = four_over_six_linear(x, w, None, "mae", 256, False, None, "1x16")
+
+    x_amax = x.abs().amax().to(torch.float32)
+    w_amax = w.abs().amax().to(torch.float32)
+    x_codes, x_scales = four_over_six_quantize(x, x_amax)
+    w_codes, w_scales = four_over_six_quantize(w, w_amax, block="1x16")
+    y_ref = _scaled_mm_nvfp4(
+        x_codes,
+        x_scales,
+        _global_decode_scale(x_amax, 256),
+        w_codes.t(),
+        w_scales,
+        _global_decode_scale(w_amax, 256),
+        torch.bfloat16,
+    )
+    torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+def test_backward_override_validation():
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(128, 256, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="no quantized backward"):
+        four_over_six_linear(x, w, None, "mae", 256, True, "quantized")
+    with pytest.raises(ValueError, match="backward_override"):
+        four_over_six_linear(x, w, None, "mae", 256, False, "bf16")
+    with pytest.raises(ValueError, match="weight_block"):
+        four_over_six_linear(x, w, None, "mae", 256, False, None, "8x8")
+
+
+@_skip_no_sm100
+def test_linear_module_backward_override():
+    lin = NVFP4FourOverSixLinear(
+        512,
+        384,
+        backward_override="dequantized",
+        weight_block="1x16",
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    x = torch.randn(128, 512, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    y = lin(x)
+    y.sum().backward()
+    assert y.shape == (128, 384)
+    assert lin.weight.grad is not None
+    assert x.grad is not None
 
 
 @_skip_no_cuda
@@ -275,6 +446,49 @@ def test_bitwise_parity_with_transformer_engine(
         torch.testing.assert_close(
             te_scales, dsl_scales.view(torch.uint8), atol=0, rtol=0
         )
+
+
+@_skip_no_cuda
+@pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
+@pytest.mark.parametrize("row_scaled", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_dequantize_bitwise_parity_with_transformer_engine(
+    e4m3_scale_bound, row_scaled, out_dtype
+):
+    """four_over_six_dequantize matches TE's NVFP4 dequantize kernel bitwise."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
+
+    if not te.is_nvfp4_available():
+        pytest.skip("NVFP4 not available in this TransformerEngine build")
+
+    torch.manual_seed(0)
+    M, N = 256, 512
+    x = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    quantizer = NVFP4Quantizer(
+        rowwise=True,
+        columnwise=False,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=False,
+        row_scaled_nvfp4=row_scaled,
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=e4m3_scale_bound,
+    )
+    t = quantizer(x)
+    te_dq = t.dequantize(dtype=out_dtype)
+    amax = (x.abs().amax(dim=1) if row_scaled else x.abs().amax()).to(torch.float32)
+    codes, scales = four_over_six_quantize(
+        x, amax, e4m3_scale_bound=e4m3_scale_bound
+    )
+    dq = four_over_six_dequantize(
+        codes,
+        scales,
+        amax,
+        e4m3_scale_bound=e4m3_scale_bound,
+        out_dtype=out_dtype,
+    )
+    torch.testing.assert_close(dq, te_dq, atol=0, rtol=0)
 
 
 @_skip_no_cutedsl
