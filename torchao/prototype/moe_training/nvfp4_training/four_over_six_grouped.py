@@ -19,11 +19,15 @@ as its own tensor:
   group separately, because the quantizer derives every row's scale chain
   from that row's amax entry. The forward GEMM is one
   ``F.scaled_grouped_mm`` with per-group second-level scales.
-* row-scaled activations: one global scale per token row. TransformerEngine
-  has no fused row-scaled NVFP4 grouped GEMM — its ``general_grouped_gemm``
-  runs a per-group loop of dense GEMMs — so the forward here is the same
-  loop over the dense four-over-six GEMM (FP32 output scaled by the raw
-  per-row amaxes, then the bf16 cast).
+* row-scaled activations: one global scale per token row. The forward is a
+  single ``F.scaled_grouped_mm`` carrying the constant per-tensor factor in
+  every group's slot, its FP32 output scaled by the raw per-row amaxes and
+  cast to bf16 once — the same numerics as a per-group loop of dense
+  four-over-six GEMMs, which stays as the fallback on builds whose grouped
+  GEMM cannot emit FP32 output. Those builds can opt into a bf16-output
+  fused GEMM (one extra rounding before the row scale) with the
+  ``FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT`` env knob; otherwise
+  the loop runs.
 
 Weights always quantize per expert with per-tensor scales
 (``weight_block`` selects 16x16 tiles or 1x16 blocks, as in the dense op).
@@ -44,6 +48,8 @@ quantization (zero rows quantize to zero codes and are sliced away from the
 output).
 """
 
+import functools
+import os
 from typing import Optional
 
 import torch
@@ -72,7 +78,48 @@ _ALIGNMENT = 128
 _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
 _SWIZZLE = [F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE]
 
+# Builds whose grouped GEMM only emits bf16 can still take the fused
+# row-scaled forward at the cost of one extra rounding before the row scale;
+# off by default, so those builds run the per-group dense-GEMM loop.
+FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT = (
+    os.environ.get("FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT", "0") == "1"
+)
+
 __all__ = ["four_over_six_grouped_mm"]
+
+
+@functools.cache
+def _grouped_mm_fp32_out_supported(device_index: int) -> bool:
+    """Whether this build's ``F.scaled_grouped_mm`` can emit FP32 output.
+
+    The fused row-scaled forward wants the grouped GEMM's FP32 output so the
+    raw per-row amax multiply and the single bf16 cast match the dense loop;
+    a minimal-shape probe records what the build accepts.
+    """
+    device = torch.device("cuda", device_index)
+    codes = torch.zeros(
+        _ALIGNMENT, _ALIGNMENT // 2, dtype=torch.uint8, device=device
+    )
+    scales = torch.ones(
+        _ALIGNMENT, _ALIGNMENT // 16, dtype=torch.float32, device=device
+    ).to(torch.float8_e4m3fn)
+    unit = torch.ones(1, dtype=torch.float32, device=device)
+    try:
+        F.scaled_grouped_mm(
+            codes.view(torch.float4_e2m1fn_x2),
+            codes.unsqueeze(0).view(torch.float4_e2m1fn_x2).transpose(-2, -1),
+            scale_a=[to_blocked(scales).view(scales.shape), unit],
+            scale_recipe_a=_SCALE_RECIPE,
+            scale_b=[to_blocked(scales).reshape(1, -1), unit],
+            scale_recipe_b=_SCALE_RECIPE,
+            swizzle_a=_SWIZZLE,
+            swizzle_b=_SWIZZLE,
+            offs=torch.full((1,), _ALIGNMENT, dtype=torch.int32, device=device),
+            output_dtype=torch.float32,
+        )
+    except (RuntimeError, NotImplementedError, ValueError):
+        return False
+    return True
 
 
 @conditional_nostrict_trace
@@ -140,7 +187,28 @@ def _quantize_expert_weights(
     err_mode: str,
     e4m3_scale_bound: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-expert four-over-six quantization of a stacked (E, N, K) weight."""
+    """Per-expert four-over-six quantization of a stacked (E, N, K) weight.
+
+    For 1x16 blocks, flattening experts along rows and expanding each
+    expert's amax over its rows quantizes the whole stack in one call —
+    bitwise identical to the per-expert loop, because the quantizer derives
+    every row's scale chain from that row's amax entry and 1x16 blocks never
+    cross rows. 16x16 keeps the loop: the quantizer rejects per-row amaxes
+    with 16x16 tiles.
+    """
+    num_experts, N, K = weight.shape
+    if weight_block == "1x16":
+        flat_codes, flat_scales = four_over_six_quantize(
+            weight.reshape(num_experts * N, K),
+            weight_amax.repeat_interleave(N),
+            block=weight_block,
+            err_mode=err_mode,
+            e4m3_scale_bound=e4m3_scale_bound,
+        )
+        return (
+            flat_codes.view(num_experts, N, K // 2),
+            flat_scales.view(num_experts, N, K // 16),
+        )
     codes = []
     scales = []
     for e in range(weight.shape[0]):
@@ -177,6 +245,110 @@ def _dequantize_expert_weights(
         e4m3_scale_bound=e4m3_scale_bound,
     )
     return flat.view(num_experts, N, -1)
+
+
+def _row_scaled_gemm_loop(
+    x_codes: torch.Tensor,
+    x_scales: torch.Tensor,
+    x_amax: torch.Tensor,
+    x_global: torch.Tensor,
+    w_codes: torch.Tensor,
+    w_scales: torch.Tensor,
+    w_global: torch.Tensor,
+    padded_group_end_offsets: torch.Tensor,
+    N: int,
+) -> torch.Tensor:
+    """Per-group dense-GEMM loop for the row-scaled forward.
+
+    The fallback when no fused grouped-GEMM output mode is available, and
+    the fused path's numerics oracle in tests.
+    """
+    # TransformerEngine has no fused row-scaled NVFP4 grouped GEMM;
+    # its general_grouped_gemm loops dense GEMMs per group, and so
+    # does this: FP32 output with the constant 1/(6*bound) factor in
+    # the per-tensor slot, scaled by the raw per-row amaxes.
+    group_bounds = torch.stack(
+        (
+            padded_group_end_offsets
+            - torch.diff(
+                padded_group_end_offsets,
+                prepend=padded_group_end_offsets.new_zeros(1),
+            ),
+            padded_group_end_offsets,
+        ),
+        dim=1,
+    ).tolist()
+    output = x_amax.new_zeros(x_codes.shape[0], N, dtype=torch.bfloat16)
+    for e, (start, end) in enumerate(group_bounds):
+        if start == end:
+            continue
+        group_out = _scaled_mm_nvfp4(
+            x_codes[start:end],
+            x_scales[start:end],
+            x_global,
+            w_codes[e].t(),
+            w_scales[e],
+            w_global[e],
+            torch.float32,
+        )
+        output[start:end] = (
+            group_out * x_amax[start:end].view(-1, 1)
+        ).to(torch.bfloat16)
+    return output
+
+
+def _row_scaled_single_grouped_gemm(
+    x_codes: torch.Tensor,
+    x_scales: torch.Tensor,
+    x_amax: torch.Tensor,
+    x_global: torch.Tensor,
+    w_codes: torch.Tensor,
+    w_scales: torch.Tensor,
+    w_global: torch.Tensor,
+    padded_group_end_offsets: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """One ``F.scaled_grouped_mm`` covering every group of the row-scaled
+    forward.
+
+    The GEMM epilogue applies the E4M3 block scales and the per-tensor
+    factors — the constant 1/(6*bound) in every group's activation slot and
+    each expert's amax/(6*bound) — so the raw per-row amax multiply and the
+    single bf16 cast happen afterwards, exactly as in the dense loop when
+    the GEMM emits FP32. A bf16 GEMM output adds one rounding before the
+    row scale. Rows past the final offset may hold garbage; the pad helper's
+    unpad drops them.
+    """
+    num_experts = w_codes.shape[0]
+    output = F.scaled_grouped_mm(
+        x_codes.view(torch.float4_e2m1fn_x2),
+        w_codes.view(torch.float4_e2m1fn_x2).transpose(-2, -1),
+        # scaled_grouped_mm consumes swizzled scale bytes viewed at the
+        # logical 2D shape, as in the per-tensor forward; the view needs
+        # the 128-row alignment the forward enforces. One to_blocked over
+        # the row-flattened expert scales equals the per-expert stack
+        # bitwise because N % 128 == 0 keeps expert boundaries on swizzle
+        # row-block boundaries.
+        scale_a=[
+            to_blocked(x_scales).view(x_scales.shape),
+            x_global.expand(num_experts).contiguous(),
+        ],
+        scale_recipe_a=_SCALE_RECIPE,
+        scale_b=[
+            to_blocked(
+                w_scales.reshape(-1, w_scales.shape[-1])
+            ).view(num_experts, -1),
+            w_global,
+        ],
+        scale_recipe_b=_SCALE_RECIPE,
+        swizzle_a=_SWIZZLE,
+        swizzle_b=_SWIZZLE,
+        offs=padded_group_end_offsets,
+        output_dtype=output_dtype,
+    )
+    if output_dtype != torch.float32:
+        output = output.to(torch.float32)
+    return (output * x_amax.view(-1, 1)).to(torch.bfloat16)
 
 
 class _FourOverSixGroupedMM(torch.autograd.Function):
@@ -302,43 +474,54 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
         w_global = _global_decode_scale(weight_amax, e4m3_scale_bound)
 
         if row_scaled_activation:
-            # TransformerEngine has no fused row-scaled NVFP4 grouped GEMM;
-            # its general_grouped_gemm loops dense GEMMs per group, and so
-            # does this: FP32 output with the constant 1/(6*bound) factor in
-            # the per-tensor slot, scaled by the raw per-row amaxes.
+            # The row-scaled forward carries the constant 1/(6*bound) factor
+            # in every group's per-tensor slot and scales the GEMM output by
+            # the raw per-row amaxes. One F.scaled_grouped_mm covers all
+            # groups when the build can emit its FP32 output — or, with one
+            # extra rounding, when the bf16-output knob is set; otherwise
+            # the per-group dense-GEMM loop runs.
             x_global = torch.full(
                 (),
                 1.0 / (FP4_E2M1_MAX * float(e4m3_scale_bound)),
                 dtype=torch.float32,
                 device=input_act.device,
             )
-            group_bounds = torch.stack(
-                (
-                    padded_group_end_offsets
-                    - torch.diff(
-                        padded_group_end_offsets,
-                        prepend=padded_group_end_offsets.new_zeros(1),
-                    ),
-                    padded_group_end_offsets,
-                ),
-                dim=1,
-            ).tolist()
-            output = input_act.new_zeros(input_act.shape[0], N)
-            for e, (start, end) in enumerate(group_bounds):
-                if start == end:
-                    continue
-                group_out = _scaled_mm_nvfp4(
-                    x_codes[start:end],
-                    x_scales[start:end],
+            if _grouped_mm_fp32_out_supported(input_act.device.index or 0):
+                output = _row_scaled_single_grouped_gemm(
+                    x_codes,
+                    x_scales,
+                    x_amax,
                     x_global,
-                    w_codes[e].t(),
-                    w_scales[e],
-                    w_global[e],
+                    w_codes,
+                    w_scales,
+                    w_global,
+                    padded_group_end_offsets,
                     torch.float32,
                 )
-                output[start:end] = (
-                    group_out * x_amax[start:end].view(-1, 1)
-                ).to(torch.bfloat16)
+            elif FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT:
+                output = _row_scaled_single_grouped_gemm(
+                    x_codes,
+                    x_scales,
+                    x_amax,
+                    x_global,
+                    w_codes,
+                    w_scales,
+                    w_global,
+                    padded_group_end_offsets,
+                    torch.bfloat16,
+                )
+            else:
+                output = _row_scaled_gemm_loop(
+                    x_codes,
+                    x_scales,
+                    x_amax,
+                    x_global,
+                    w_codes,
+                    w_scales,
+                    w_global,
+                    padded_group_end_offsets,
+                    N,
+                )
         else:
             output = F.scaled_grouped_mm(
                 x_codes.view(torch.float4_e2m1fn_x2),

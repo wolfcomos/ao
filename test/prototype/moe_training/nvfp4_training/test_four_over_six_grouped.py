@@ -14,6 +14,7 @@ from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
     four_over_six_linear,
     four_over_six_quantize,
 )
+from torchao.prototype.moe_training.nvfp4_training import four_over_six_grouped
 from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
     four_over_six_grouped_mm,
 )
@@ -119,7 +120,13 @@ def test_per_tensor_grouped_forward_matches_dense_loop(weight_block):
 
 @_skip_no_sm100
 def test_row_scaled_grouped_forward_matches_dense_loop():
-    """Row-scaled grouped forward is the per-group dense loop by construction."""
+    """Row-scaled grouped forward vs dense four_over_six GEMMs per group.
+
+    On builds without an FP32 grouped-GEMM output the default path is the
+    per-group dense loop, which matches bitwise; when the fused single-GEMM
+    path runs, the grouped kernel may reduce in a different order, so the
+    comparison falls back to an SQNR bound.
+    """
     group_sizes = [128, 256, 128]
     A, B, offs = _make_grouped_inputs(group_sizes, K=256, N=384)
     y = four_over_six_grouped_mm(A, B, offs, row_scaled_activation=True)
@@ -133,7 +140,170 @@ def test_row_scaled_grouped_forward_matches_dense_loop():
             )
         )
         start = end
-    torch.testing.assert_close(y, torch.cat(refs), atol=0, rtol=0)
+    y_ref = torch.cat(refs)
+    if not torch.equal(y, y_ref):
+        sqnr = compute_error(y_ref.float(), y.float())
+        assert sqnr > 85.0, f"row-scaled grouped vs dense-loop SQNR {sqnr:.1f} dB"
+        print(f"\nrow-scaled grouped forward differs from dense: SQNR {sqnr:.1f} dB")
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize(
+    "group_sizes, pad",
+    [
+        pytest.param([128] * 64, False, id="uniform-128-rows-per-expert"),
+        pytest.param(
+            [128 if e % 8 == 0 else 0 for e in range(64)],
+            False,
+            id="decode-like-8-active-56-empty",
+        ),
+        pytest.param([1, 220, 77], True, id="ragged-padded"),
+    ],
+)
+def test_row_scaled_fused_matches_loop_oracle(group_sizes, pad, monkeypatch):
+    """Fused single-GEMM row-scaled forward vs the per-group loop oracle.
+
+    The bf16-output fused GEMM rounds its output once before the fp32 row
+    scale — an unavoidable extra rounding worth ~51 dB — so the exactness
+    check compares against the loop oracle with that one rounding emulated
+    on its dense fp32 GEMMs (bitwise, with the reduction-order SQNR
+    fallback), and the raw loop comparison only bounds the rounding cost.
+    The quantized operands are identical by construction.
+    """
+    A, B, offs = _make_grouped_inputs(group_sizes, K=2048, N=768, seed=5)
+    monkeypatch.setattr(
+        four_over_six_grouped, "_grouped_mm_fp32_out_supported", lambda _i: False
+    )
+    monkeypatch.setattr(
+        four_over_six_grouped,
+        "FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT",
+        False,
+    )
+    y_loop = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        row_scaled_activation=True,
+        pad_token_groups_for_grouped_mm=pad,
+    )
+
+    # Loop oracle with the fused path's bf16 GEMM-output rounding emulated.
+    dense_gemm = four_over_six_grouped._scaled_mm_nvfp4
+
+    def _dense_gemm_bf16_rounded(*args):
+        return dense_gemm(*args).to(torch.bfloat16).to(torch.float32)
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_scaled_mm_nvfp4", _dense_gemm_bf16_rounded
+    )
+    y_emul = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        row_scaled_activation=True,
+        pad_token_groups_for_grouped_mm=pad,
+    )
+    monkeypatch.setattr(four_over_six_grouped, "_scaled_mm_nvfp4", dense_gemm)
+
+    monkeypatch.setattr(
+        four_over_six_grouped,
+        "FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT",
+        True,
+    )
+    y_fused = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        row_scaled_activation=True,
+        pad_token_groups_for_grouped_mm=pad,
+    )
+    assert y_fused.shape == y_loop.shape
+    if not torch.equal(y_fused, y_emul):
+        sqnr = compute_error(y_emul.float(), y_fused.float())
+        assert sqnr > 85.0, f"fused vs rounding-emulated oracle SQNR {sqnr:.1f} dB"
+        print(f"\nfused grouped GEMM reduction differs from dense: SQNR {sqnr:.1f} dB")
+    rounding_sqnr = compute_error(y_loop.float(), y_fused.float())
+    assert rounding_sqnr > 45.0, f"fused vs loop-oracle SQNR {rounding_sqnr:.1f} dB"
+    print(f"\nbf16 GEMM-output rounding cost vs loop: SQNR {rounding_sqnr:.1f} dB")
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize("err_mode", ["mae", "mse"])
+@pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
+def test_batched_weight_quantize_matches_per_expert_loop(
+    err_mode, e4m3_scale_bound
+):
+    """The one-call flattened 1x16 weight quantize == the per-expert loop."""
+    torch.manual_seed(2)
+    E, N, K = 5, 128, 256
+    B = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda") * 0.1
+    weight_amax = B.abs().amax(dim=(1, 2)).to(torch.float32)
+    codes, scales = four_over_six_grouped._quantize_expert_weights(
+        B, weight_amax, "1x16", err_mode, e4m3_scale_bound
+    )
+    for e in range(E):
+        ref_codes, ref_scales = four_over_six_quantize(
+            B[e],
+            weight_amax[e],
+            block="1x16",
+            err_mode=err_mode,
+            e4m3_scale_bound=e4m3_scale_bound,
+        )
+        torch.testing.assert_close(codes[e], ref_codes, atol=0, rtol=0)
+        torch.testing.assert_close(
+            scales[e].view(torch.uint8),
+            ref_scales.view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+
+
+@_skip_no_sm100
+def test_row_scaled_dispatch_and_loop_fallback(monkeypatch):
+    """The dispatch takes the loop when no fused output mode is available,
+    and the fused single GEMM when the bf16-output knob is set."""
+    group_sizes = [128, 256, 128]
+    A, B, offs = _make_grouped_inputs(group_sizes, K=256, N=384, seed=13)
+    fused_gemm = four_over_six_grouped._row_scaled_single_grouped_gemm
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_grouped_mm_fp32_out_supported", lambda _i: False
+    )
+    monkeypatch.setattr(
+        four_over_six_grouped,
+        "FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT",
+        False,
+    )
+
+    def _reject_fused(*args, **kwargs):
+        raise AssertionError("fused single grouped GEMM must not run")
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_row_scaled_single_grouped_gemm", _reject_fused
+    )
+    y_loop = four_over_six_grouped_mm(A, B, offs, row_scaled_activation=True)
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_row_scaled_single_grouped_gemm", fused_gemm
+    )
+    monkeypatch.setattr(
+        four_over_six_grouped,
+        "FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT",
+        True,
+    )
+
+    def _reject_loop(*args, **kwargs):
+        raise AssertionError("loop fallback must not run")
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_row_scaled_gemm_loop", _reject_loop
+    )
+    y_fused = four_over_six_grouped_mm(A, B, offs, row_scaled_activation=True)
+
+    # The bf16 GEMM-output rounding costs ~51 dB vs the loop's fp32 output;
+    # the exactness contract is pinned by the rounding-emulated oracle test.
+    sqnr = compute_error(y_loop.float(), y_fused.float())
+    assert sqnr > 45.0, f"fused vs loop SQNR {sqnr:.1f} dB"
 
 
 @_skip_no_sm100
