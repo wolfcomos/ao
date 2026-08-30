@@ -46,11 +46,17 @@ groups must be 128-row aligned unless ``pad_token_groups_for_grouped_mm``
 is set, which zero-pads each group to the next 128 multiple before
 quantization (zero rows quantize to zero codes and are sliced away from the
 output).
+
+For inference, ``four_over_six_quantize_expert_weights`` +
+``four_over_six_grouped_mm_prequantized`` split the weight quantization out
+of the per-forward path so callers can quantize each weight once per weight
+version instead of on every forward — bitwise identical to the differentiable
+op's forward, gradients disabled.
 """
 
 import functools
 import os
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -85,7 +91,12 @@ FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT = (
     os.environ.get("FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT", "0") == "1"
 )
 
-__all__ = ["four_over_six_grouped_mm"]
+__all__ = [
+    "FourOverSixQuantizedExperts",
+    "four_over_six_grouped_mm",
+    "four_over_six_grouped_mm_prequantized",
+    "four_over_six_quantize_expert_weights",
+]
 
 
 @functools.cache
@@ -157,13 +168,236 @@ def four_over_six_grouped_mm(
     return output
 
 
+class FourOverSixQuantizedExperts(NamedTuple):
+    """Pre-quantized stacked expert weights for the inference fast path.
+
+    Produced by ``four_over_six_quantize_expert_weights`` and consumed by
+    ``four_over_six_grouped_mm_prequantized``. Carries the quantization knobs
+    so activations quantize consistently with the cached weights.
+    """
+
+    codes: torch.Tensor
+    scales: torch.Tensor
+    blocked_scales: torch.Tensor
+    amax: torch.Tensor
+    global_scale: torch.Tensor
+    err_mode: str
+    e4m3_scale_bound: int
+    weight_block: str
+
+
+def four_over_six_quantize_expert_weights(
+    weight: torch.Tensor,
+    *,
+    err_mode: str = "mae",
+    e4m3_scale_bound: int = 256,
+    weight_block: str = "16x16",
+) -> FourOverSixQuantizedExperts:
+    """Quantize a stacked (E, N, K) expert weight once for reuse at inference.
+
+    The codes and scales are exactly what the grouped forward computes per
+    call, so reusing them across forwards is numerics-neutral while the weight
+    data is unchanged.
+    """
+    with torch.no_grad():
+        weight = weight.to(torch.bfloat16).contiguous()
+        num_experts, N, K = weight.shape
+        if K % _ALIGNMENT != 0 or N % _ALIGNMENT != 0:
+            raise ValueError(
+                f"K and N must be divisible by {_ALIGNMENT}; got K={K}, N={N}"
+            )
+        weight_amax = weight.abs().amax(dim=(1, 2)).to(torch.float32)
+        w_codes, w_scales = _quantize_expert_weights(
+            weight, weight_amax, weight_block, err_mode, e4m3_scale_bound
+        )
+        return FourOverSixQuantizedExperts(
+            codes=w_codes,
+            scales=w_scales,
+            blocked_scales=_blocked_expert_scales(w_scales),
+            amax=weight_amax,
+            global_scale=_global_decode_scale(weight_amax, e4m3_scale_bound),
+            err_mode=err_mode,
+            e4m3_scale_bound=e4m3_scale_bound,
+            weight_block=weight_block,
+        )
+
+
+def four_over_six_grouped_mm_prequantized(
+    A: torch.Tensor,
+    quantized_weight: FourOverSixQuantizedExperts,
+    offs: torch.Tensor,
+    *,
+    row_scaled_activation: bool = False,
+) -> torch.Tensor:
+    """Inference-only grouped forward on pre-quantized expert weights.
+
+    Bitwise identical to ``four_over_six_grouped_mm`` with the same knobs
+    (activations quantize with the knobs recorded on ``quantized_weight``),
+    with three contract deltas:
+
+    * gradients must be disabled — there is no backward (and no bias:
+      callers add bias themselves, on the real rows);
+    * token groups must already be 128-row aligned (no internal padding),
+      and the over-allocated total must keep ``A.shape[0] % 128 == 0``;
+    * ``A`` may be over-allocated past ``offs[-1]``. The final GEMM group is
+      extended over the tail on device instead of the eager dispatcher's
+      host read of ``offs[-1]`` + slice, and the tail row amaxes are masked
+      to zero, so zero tail rows (what the padded token dispatchers gather
+      from their zero dummy row) reproduce the dispatcher's
+      slice-and-zero-extend bitwise. In row-scaled mode arbitrary tail
+      content is tolerated — masked amaxes zero the tail output rows and
+      keep real rows exact; per-tensor mode keeps real rows exact for any
+      tail but returns garbage (not zeros) in the tail rows unless the tail
+      is zero-filled.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError(
+            "four_over_six_grouped_mm_prequantized is inference-only; call it "
+            "under torch.no_grad() (a forward on cached quantized weights "
+            "cannot produce weight gradients)"
+        )
+    if offs.ndim != 1 or offs.dtype != torch.int32:
+        raise ValueError("offs must be a 1D int32 tensor")
+    if not offs.is_contiguous():
+        raise ValueError("offs must be contiguous")
+    num_experts, N, _ = quantized_weight.codes.shape
+    if offs.numel() != num_experts:
+        raise ValueError("offs must contain one group-end offset per expert")
+    if not is_sm_at_least_100():
+        raise NotImplementedError("NVFP4 four-over-six grouped GEMM requires SM100+")
+
+    input_act = A.to(torch.bfloat16).contiguous()
+    num_rows, K = input_act.shape
+    if K != 2 * quantized_weight.codes.shape[-1]:
+        raise ValueError(
+            f"A and the quantized weight disagree on K: A has K={K}, the "
+            f"weight codes pack K={2 * quantized_weight.codes.shape[-1]}"
+        )
+    if _DEVICE_ASSERTS:
+        group_sizes = torch.diff(offs, prepend=offs.new_zeros(1))
+        torch.ops.aten._assert_async.msg(
+            torch.all(group_sizes >= 0), "offs must be non-decreasing"
+        )
+        torch.ops.aten._assert_async.msg(
+            offs[-1] <= num_rows,
+            "the final group-end offset cannot exceed A.shape[0]",
+        )
+        torch.ops.aten._assert_async.msg(
+            torch.all(group_sizes % _ALIGNMENT == 0),
+            "every token group must be 128-row aligned",
+        )
+
+    err_mode = quantized_weight.err_mode
+    e4m3_scale_bound = quantized_weight.e4m3_scale_bound
+
+    row_amax = input_act.abs().amax(dim=1)
+    # Dispatchers that over-allocate may leave tail rows unwritten; masking
+    # tail amaxes keeps their content out of the group reductions and, in
+    # row-scaled mode, zeroes the tail output rows exactly. Bitwise no-op
+    # for zero-filled tails, whose amaxes are already zero.
+    row_amax = torch.where(
+        torch.arange(num_rows, device=row_amax.device) < offs[-1],
+        row_amax,
+        row_amax.new_zeros(()),
+    )
+    group_amax = None
+    if row_scaled_activation:
+        x_amax = row_amax.to(torch.float32)
+    else:
+        x_amax, group_amax = _expand_group_amax(row_amax, offs, num_experts)
+
+    x_codes, x_scales = four_over_six_quantize(
+        input_act,
+        x_amax,
+        block="1x16",
+        err_mode=err_mode,
+        e4m3_scale_bound=e4m3_scale_bound,
+    )
+
+    # Extending the final group's end offset over the (all-zero) over-allocated
+    # tail keeps the GEMM's offs[-1] == rows contract without a host read;
+    # writing the same value back is a no-op when A is exactly sized.
+    gemm_offs = offs.clone()
+    gemm_offs[-1].fill_(num_rows)
+
+    if row_scaled_activation:
+        x_global = torch.full(
+            (),
+            1.0 / (FP4_E2M1_MAX * float(e4m3_scale_bound)),
+            dtype=torch.float32,
+            device=input_act.device,
+        )
+        if _grouped_mm_fp32_out_supported(input_act.device.index or 0):
+            output = _row_scaled_single_grouped_gemm(
+                x_codes,
+                x_scales,
+                x_amax,
+                x_global,
+                quantized_weight.codes,
+                quantized_weight.blocked_scales,
+                quantized_weight.global_scale,
+                gemm_offs,
+                torch.float32,
+            )
+        elif FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT:
+            output = _row_scaled_single_grouped_gemm(
+                x_codes,
+                x_scales,
+                x_amax,
+                x_global,
+                quantized_weight.codes,
+                quantized_weight.blocked_scales,
+                quantized_weight.global_scale,
+                gemm_offs,
+                torch.bfloat16,
+            )
+        else:
+            output = _row_scaled_gemm_loop(
+                x_codes,
+                x_scales,
+                x_amax,
+                x_global,
+                quantized_weight.codes,
+                quantized_weight.scales,
+                quantized_weight.global_scale,
+                gemm_offs,
+                N,
+            )
+    else:
+        output = F.scaled_grouped_mm(
+            x_codes.view(torch.float4_e2m1fn_x2),
+            quantized_weight.codes.view(torch.float4_e2m1fn_x2).transpose(-2, -1),
+            # scaled_grouped_mm consumes swizzled scale bytes viewed at the
+            # logical 2D shape (the layout the group quantize kernels
+            # return); the view needs the 128-row alignment enforced above.
+            scale_a=[
+                to_blocked(x_scales).view(x_scales.shape),
+                _global_decode_scale(group_amax, e4m3_scale_bound),
+            ],
+            scale_recipe_a=_SCALE_RECIPE,
+            scale_b=[
+                quantized_weight.blocked_scales,
+                quantized_weight.global_scale,
+            ],
+            scale_recipe_b=_SCALE_RECIPE,
+            swizzle_a=_SWIZZLE,
+            swizzle_b=_SWIZZLE,
+            offs=gemm_offs,
+            output_dtype=torch.bfloat16,
+        )
+
+    return output
+
+
 def _expand_group_amax(
     row_amax: torch.Tensor, group_end_offsets: torch.Tensor, num_experts: int
 ) -> torch.Tensor:
     """Per-row amax vector holding each row's group amax.
 
-    Rows past the final offset (the pad-helper's over-allocated tail) take
-    the last group's amax; they are all-zero and never enter the GEMM.
+    Rows past the final offset (an over-allocated tail) take the last
+    group's amax; their own amaxes are zero when they reach this function
+    (all-zero pad rows in the differentiable op, masked in the prequantized
+    forward), so they never perturb a group's amax.
     """
     group_idx = torch.searchsorted(
         group_end_offsets,
@@ -245,6 +479,17 @@ def _dequantize_expert_weights(
     return flat.view(num_experts, N, -1)
 
 
+def _blocked_expert_scales(w_scales: torch.Tensor) -> torch.Tensor:
+    """Swizzle stacked (E, N, K//16) expert scales for ``F.scaled_grouped_mm``.
+
+    One to_blocked over the row-flattened expert scales equals the per-expert
+    stack bitwise because N % 128 == 0 keeps expert boundaries on swizzle
+    row-block boundaries.
+    """
+    num_experts = w_scales.shape[0]
+    return to_blocked(w_scales.reshape(-1, w_scales.shape[-1])).view(num_experts, -1)
+
+
 def _row_scaled_gemm_loop(
     x_codes: torch.Tensor,
     x_scales: torch.Tensor,
@@ -301,7 +546,7 @@ def _row_scaled_single_grouped_gemm(
     x_amax: torch.Tensor,
     x_global: torch.Tensor,
     w_codes: torch.Tensor,
-    w_scales: torch.Tensor,
+    w_blocked_scales: torch.Tensor,
     w_global: torch.Tensor,
     padded_group_end_offsets: torch.Tensor,
     output_dtype: torch.dtype,
@@ -315,7 +560,8 @@ def _row_scaled_single_grouped_gemm(
     single bf16 cast happen afterwards, exactly as in the dense loop when
     the GEMM emits FP32. A bf16 GEMM output adds one rounding before the
     row scale. Rows past the final offset may hold garbage; the pad helper's
-    unpad drops them.
+    unpad drops them. ``w_blocked_scales`` carries the expert scales already
+    swizzled by ``_blocked_expert_scales``.
     """
     num_experts = w_codes.shape[0]
     output = F.scaled_grouped_mm(
@@ -323,17 +569,14 @@ def _row_scaled_single_grouped_gemm(
         w_codes.view(torch.float4_e2m1fn_x2).transpose(-2, -1),
         # scaled_grouped_mm consumes swizzled scale bytes viewed at the
         # logical 2D shape, as in the per-tensor forward; the view needs
-        # the 128-row alignment the forward enforces. One to_blocked over
-        # the row-flattened expert scales equals the per-expert stack
-        # bitwise because N % 128 == 0 keeps expert boundaries on swizzle
-        # row-block boundaries.
+        # the 128-row alignment the forward enforces.
         scale_a=[
             to_blocked(x_scales).view(x_scales.shape),
             x_global.expand(num_experts).contiguous(),
         ],
         scale_recipe_a=_SCALE_RECIPE,
         scale_b=[
-            to_blocked(w_scales.reshape(-1, w_scales.shape[-1])).view(num_experts, -1),
+            w_blocked_scales,
             w_global,
         ],
         scale_recipe_b=_SCALE_RECIPE,
@@ -471,7 +714,7 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
                     x_amax,
                     x_global,
                     w_codes,
-                    w_scales,
+                    _blocked_expert_scales(w_scales),
                     w_global,
                     padded_group_end_offsets,
                     torch.float32,
@@ -483,7 +726,7 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
                     x_amax,
                     x_global,
                     w_codes,
-                    w_scales,
+                    _blocked_expert_scales(w_scales),
                     w_global,
                     padded_group_end_offsets,
                     torch.bfloat16,
