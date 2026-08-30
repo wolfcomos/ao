@@ -6,12 +6,12 @@
 
 """MXFP8 MLA Q-projection + RoPE + dual-quantize op over the cuDNN-frontend kernel.
 
-One custom op, one launch of the ``cudnn.gemm_proj_rope_mxfp8_wrapper_sm100``
-kernel from the standalone cudnn-frontend python package (>= 1.27, Blackwell
-SM 10.0 exactly -- the wrapper is sm100-specific; no TransformerEngine
-dependency), ported from the fusion TE PR #3303 wires for DeepSeek-V3 MLA
-MXFP8 training; the matching public wrapper lives at the bottom of this
-module:
+One custom op, one launch of the kernel behind
+``cudnn.gemm_proj_rope_mxfp8_wrapper_sm100`` from the standalone
+cudnn-frontend python package (>= 1.27, Blackwell SM 10.0 exactly -- the
+kernel is sm100-specific; no TransformerEngine dependency), ported from the
+fusion TE PR #3303 wires for DeepSeek-V3 MLA MXFP8 training; the matching
+public wrapper lives at the bottom of this module:
 
 * :func:`mxfp8_mla_q_proj_rope_cudnn` -- Q-projection GEMM (BF16, or MXFP8 on
   prequantized operands) + per-head YARN RoPE on the trailing 64 features of
@@ -42,12 +42,26 @@ the rotation identity holds ONLY for duplicated tables -- a non-duplicated
 table produces a silent non-rotation. YARN lives in the table values (and any
 mscale in the caller's softmax scale); the op applies no scaling of its own.
 
+Launch path: the op compiles the cudnn-frontend kernel host once per shape
+with the CuTe DSL's tvm-ffi entry point (``cute.compile(...,
+options="--enable-tvm-ffi")``) and thereafter launches it with raw torch
+tensors, skipping the package wrapper's ``execute``, which re-wraps every
+operand through DLPack on each call. Measured on GB200: the launch call
+itself drops 119-144 us -> 20-22 us (~6x, output allocations included), and
+the op boundary -- which also carries the op's own output allocation and
+dispatch -- drops 189.4 us -> 45.3 us (4.2x) at DeepSeek-V3 16B dims.
+Outputs are bitwise identical between the two paths (same kernel, same grid
+parameters; only the calling convention differs). When the installed
+nvidia-cutlass-dsl cannot build the tvm-ffi entry, the op falls back to the
+package wrapper and logs one warning.
+
 Importing this module registers the ``torchao::`` custom op; the ``cudnn``
 package itself is imported lazily inside the op body at first real launch.
 :func:`is_supported` is the static shape predicate to call before selecting
 this op.
 """
 
+import logging
 from typing import Optional, Tuple
 
 import torch
@@ -148,6 +162,123 @@ def _proj_dims(x, w):
     return tokens, num_heads
 
 
+# Shape-keyed tvm-ffi-compiled kernel hosts; grid/constexpr args are baked at
+# compile, so one entry per (path, tokens, in_features, proj_dim, device).
+_tvm_ffi_kernels: dict = {}
+_tvm_ffi_unavailable = False
+
+
+def _compile_tvm_ffi_kernel(x, w, cos, sin, x_scale, w_scale, outputs):
+    """Compile the cudnn-frontend kernel host for this shape with the CuTe
+    DSL's tvm-ffi entry point; the returned callable takes raw torch tensors
+    plus a stream. Sample layouts and grid parameters mirror the package
+    wrapper's own compile (``cudnn.gemm.cutedsl.dense.proj_rope_mxfp8.api``)
+    so the generated kernel is identical -- only the entry differs."""
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.utils
+    from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8.api import TILE_M
+    from cutlass.cute.runtime import from_dlpack
+
+    def dyn(tensor, leading_dim):
+        wrapped = from_dlpack(tensor.detach(), assumed_align=16, enable_tvm_ffi=True)
+        return wrapped.mark_layout_dynamic(leading_dim=leading_dim)
+
+    def dyn_e8m0(tensor):
+        # The kernel consumes E8M0 scales; torch carries them as uint8 bytes
+        # (raw uint8 tensors are accepted at call time under this spec).
+        wrapped = from_dlpack(tensor.detach(), assumed_align=16, enable_tvm_ffi=True)
+        wrapped.element_type = cutlass.Float8E8M0FNU
+        return wrapped.mark_layout_dynamic(leading_dim=1)
+
+    tokens, num_heads = _proj_dims(x, w)
+    grid_m = tokens // TILE_M
+    max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+    stream = _stream(x.device)
+    outs = [dyn(o, 2) for o in outputs]
+
+    if x_scale is None:
+        from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8.gemm_proj_rope_mxfp8_bf16in import (
+            gemm_proj_rope_mxfp8_host,
+        )
+
+        return cute.compile(
+            gemm_proj_rope_mxfp8_host,
+            dyn(x, 1),
+            dyn(w, 1),
+            dyn(cos, 1),
+            dyn(sin, 1),
+            *outs,
+            grid_m,
+            num_heads,
+            max_active_clusters,
+            8,
+            stream,
+            options="--enable-tvm-ffi",
+        )
+
+    from cudnn.gemm.cutedsl.dense.proj_rope_mxfp8.gemm_proj_rope_mxfp8_mxfp8in import (
+        gemm_proj_rope_mxfp8_host,
+    )
+
+    # Grid heuristics reproduced from cudnn-frontend's own ``_grid_params``
+    # (NVIDIA cudnn-frontend, Apache-2.0). These are compile-time constexprs
+    # of the kernel host, so they must match the wrapper's choice exactly or
+    # the two launch paths stop producing bitwise-identical output.
+    t2r_x8 = tokens >= 2048
+    limit = min(grid_m, num_heads)
+    if limit < 4:
+        swizzle_size = 4
+    else:
+        swizzle_size = 1
+        while swizzle_size * 2 <= limit:
+            swizzle_size *= 2
+    return cute.compile(
+        gemm_proj_rope_mxfp8_host,
+        dyn(x, 1),
+        dyn_e8m0(x_scale),
+        dyn(w, 1),
+        dyn_e8m0(w_scale),
+        dyn(cos, 1),
+        dyn(sin, 1),
+        *outs,
+        grid_m,
+        num_heads,
+        max_active_clusters,
+        swizzle_size,
+        t2r_x8,
+        x.shape[1] // DIM_ALIGNMENT,
+        stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def _tvm_ffi_kernel_for(x, w, cos, sin, x_scale, w_scale, outputs):
+    """Shape-cached tvm-ffi compile; None when the installed stack cannot
+    build the tvm-ffi entry (older nvidia-cutlass-dsl, missing tvm_ffi) --
+    the op then launches through the package wrapper instead."""
+    global _tvm_ffi_unavailable
+    key = (x_scale is not None, x.shape[0], x.shape[1], w.shape[0], x.device.index)
+    kernel = _tvm_ffi_kernels.get(key)
+    if kernel is None:
+        # Latch checked after the cache lookup: a compile failure disables
+        # FURTHER compiles, but must not demote shapes that already work.
+        if _tvm_ffi_unavailable:
+            return None
+        try:
+            kernel = _compile_tvm_ffi_kernel(x, w, cos, sin, x_scale, w_scale, outputs)
+        except Exception:
+            _tvm_ffi_unavailable = True
+            logging.getLogger(__name__).warning(
+                "mxfp8_mla_q_proj_rope_cudnn: tvm-ffi compile failed; falling "
+                "back to the cudnn package wrapper (higher CPU launch cost)",
+                exc_info=True,
+            )
+            return None
+        _tvm_ffi_kernels[key] = kernel
+    return kernel
+
+
 @torch.library.custom_op("torchao::mxfp8_mla_q_proj_rope_cudnn", mutates_args=())
 def _mxfp8_mla_q_proj_rope_cudnn(
     x: torch.Tensor,
@@ -190,6 +321,33 @@ def _mxfp8_mla_q_proj_rope_cudnn(
     """
     tokens, num_heads = _proj_dims(x, w)
     specs = _output_specs(tokens, num_heads)
+
+    outputs = _allocate_from_specs(specs, x.device)
+    kernel = _tvm_ffi_kernel_for(x, w, cos, sin, x_scale, w_scale, outputs)
+    if kernel is not None:
+        # detach: DLPack export refuses grad-tracking tensors; the scales are
+        # uint8 and cannot carry grad.
+        if x_scale is None:
+            kernel(
+                x.detach(),
+                w.detach(),
+                cos.detach(),
+                sin.detach(),
+                *outputs,
+                _stream(x.device),
+            )
+        else:
+            kernel(
+                x.detach(),
+                x_scale,
+                w.detach(),
+                w_scale,
+                cos.detach(),
+                sin.detach(),
+                *outputs,
+                _stream(x.device),
+            )
+        return outputs
 
     import cudnn
 

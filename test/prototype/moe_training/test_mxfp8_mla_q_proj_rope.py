@@ -31,7 +31,9 @@ if not (torch.cuda.is_available() and is_sm_version(10, 0)):
 
 try:
     # Importing the module registers the torchao:: custom op.
-    import torchao.prototype.moe_training.kernels.mxfp8.cudnn_mla_q_proj_rope  # noqa: F401
+    from torchao.prototype.moe_training.kernels.mxfp8 import (
+        cudnn_mla_q_proj_rope as _op_module,
+    )
 except ImportError:
     pytest.skip(
         "installed torchao does not provide the cudnn_mla_q_proj_rope module",
@@ -213,3 +215,43 @@ def test_mxfp8_mla_q_proj_rope_cudnn_matches_reference(case, path):
     outs = _OPS.mxfp8_mla_q_proj_rope_cudnn(*args)
     refs = _ref_mla_q_proj_rope(*args)
     _assert_outputs_match(outs, refs, f"{case} {path}")
+
+
+@pytest.mark.parametrize("path", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("case", list(_CASES))
+def test_mxfp8_mla_q_proj_rope_cudnn_matches_stock_wrapper(case, path):
+    """The op's tvm-ffi launch path runs the same kernel as the cudnn
+    package wrapper under a different calling convention: outputs must be
+    BITWISE identical. SKIPPED when the tvm-ffi path is unavailable -- there
+    the op launches through the wrapper too and this would compare the
+    wrapper with itself."""
+    import cudnn
+
+    c = _build_case(*_CASES[case])
+    if path == "bf16":
+        args = (c["x"], c["w"], c["cos"], c["sin"])
+        scales = {}
+    else:
+        args = (c["x_q"], c["w_q"], c["cos"], c["sin"], c["x_sf"], c["w_sf"])
+        scales = {"x_scale": c["x_sf"], "w_scale": c["w_sf"]}
+    outs = _OPS.mxfp8_mla_q_proj_rope_cudnn(*args)
+    if _op_module._tvm_ffi_unavailable:
+        pytest.skip(
+            "tvm-ffi launch path unavailable on this stack; the op ran through "
+            "the package wrapper, so this comparison would be vacuous"
+        )
+    ref = cudnn.gemm_proj_rope_mxfp8_wrapper_sm100(
+        args[0], args[1], c["cos"], c["sin"], w_out_in=True, **scales
+    )
+    refs = (
+        ref["out_fp8_row"],
+        ref["out_scales_row"],
+        ref["out_fp8_col"],
+        ref["out_scales_col"],
+    )
+    for name, actual, expected in zip(
+        ("row codes", "row scales", "col codes", "col scales"), outs, refs
+    ):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), (
+            f"{case} {path} {name}: tvm-ffi launch differs from the wrapper"
+        )
