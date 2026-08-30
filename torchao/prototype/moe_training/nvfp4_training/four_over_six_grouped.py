@@ -142,18 +142,7 @@ def four_over_six_grouped_mm(
     contains the cumulative row-end offset for each expert. Knobs match
     ``four_over_six_mm``; see the module docstring for the grouped-specific
     backward and alignment semantics.
-
-    ``A`` may be over-allocated past ``offs[-1]`` (padded token dispatchers
-    hand over such buffers): the unwritten tail rows must not feed the
-    per-group amaxes, so they are sliced off before quantization and the
-    output is zero-extended back, which also routes zero gradients to the
-    tail. The host read of ``offs[-1]`` makes this data-dependent slicing
-    incompatible with torch.compile capture, like the rest of this op.
     """
-    num_tokens = int(offs[-1])
-    tail_rows = A.shape[0] - num_tokens
-    if tail_rows > 0:
-        A = A[:num_tokens]
     output = _FourOverSixGroupedMM.apply(
         A,
         B,
@@ -167,8 +156,6 @@ def four_over_six_grouped_mm(
     )
     if bias is not None:
         output = output + bias.to(output.dtype)
-    if tail_rows > 0:
-        output = F.pad(output, (0, 0, 0, tail_rows))
     return output
 
 

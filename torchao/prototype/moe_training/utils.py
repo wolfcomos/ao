@@ -414,8 +414,16 @@ def _quantize_then_scaled_grouped_mm(
 
         # The dispatcher hands expert weights over as B_t with shape (E, K, N);
         # the four-over-six op takes them in their stored (E, N, K) layout.
-        return four_over_six_grouped_mm(
-            A,
+        # Callers with padded token dispatchers over-allocate A past offs[-1],
+        # while the op requires offs[-1] == A.shape[0] and the unwritten tail
+        # rows must not feed its per-group amaxes: slice to the logical rows
+        # and zero-extend the output, which also routes zero gradients to the
+        # tail. The host read of offs[-1] keeps this branch out of
+        # torch.compile capture, matching the op's own eager-only contract.
+        num_tokens = int(offs[-1])
+        tail_rows = A.shape[0] - num_tokens
+        output = four_over_six_grouped_mm(
+            A[:num_tokens] if tail_rows > 0 else A,
             B_t.transpose(-2, -1),
             offs,
             bias,
@@ -426,6 +434,9 @@ def _quantize_then_scaled_grouped_mm(
             backward_override=config.backward_override,
             pad_token_groups_for_grouped_mm=config.pad_token_groups_for_grouped_mm,
         )
+        if tail_rows > 0:
+            output = torch.nn.functional.pad(output, (0, 0, 0, tail_rows))
+        return output
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
