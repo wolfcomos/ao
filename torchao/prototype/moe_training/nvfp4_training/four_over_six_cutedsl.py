@@ -637,7 +637,11 @@ def four_over_six_quantize_cutedsl(
         (rows, cols // 16), (cols // 16, 1), device=x.device, dtype=torch.uint8
     )
     scales_u32 = scales_u8.view(torch.uint32)
-    amax_f32 = global_amax.to(torch.float32).reshape(-1).contiguous()
+    # The kernel reads the amax through a raw device pointer, so a CPU scalar
+    # amax (fine for the pure-PyTorch body) must be moved to x's device here.
+    amax_f32 = (
+        global_amax.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous()
+    )
 
     device_index = x.device.index
     if device_index is None:

@@ -57,10 +57,16 @@ if _cutedsl_runtime_available():
     from cutlass.cutlass_dsl import T, dsl_user_op
 
     # cutlass-dsl <=4.5.x takes the result type as a leading `res` argument;
-    # 4.6.0 dropped it and infers the type instead.
-    _CUTLASS_DSL_BEFORE_4_6_0 = parse_version(
-        importlib.metadata.version("nvidia-cutlass-dsl")
-    ) < parse_version("4.6.0")
+    # 4.6.0 dropped it and infers the type instead. The runtime probe checks
+    # importability, not distribution names, so the version lookup can miss
+    # (e.g. cutlass vendored under another distribution); assume the current
+    # API in that case rather than failing the whole package import.
+    try:
+        _CUTLASS_DSL_BEFORE_4_6_0 = parse_version(
+            importlib.metadata.version("nvidia-cutlass-dsl")
+        ) < parse_version("4.6.0")
+    except importlib.metadata.PackageNotFoundError:
+        _CUTLASS_DSL_BEFORE_4_6_0 = False
 
     # FP8 constants
     INV_F8_MAX = cutlass.Float32(1.0 / 448.0)

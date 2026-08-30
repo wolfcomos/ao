@@ -529,7 +529,7 @@ class four_over_six_mm(torch.autograd.Function):
             )
         output = output.reshape(*input_hp.shape[:-1], N)
         if bias is not None:
-            output = output + bias
+            output = output + bias.to(output.dtype)
 
         if backward_override == "high_precision":
             ctx.save_for_backward(input_2d, weight_hp)
