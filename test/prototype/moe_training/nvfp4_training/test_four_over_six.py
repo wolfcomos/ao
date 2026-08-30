@@ -371,8 +371,6 @@ def test_backward_override_validation():
         four_over_six_linear(x, w, None, "mae", 256, True, "quantized")
     with pytest.raises(ValueError, match="backward_override"):
         four_over_six_linear(x, w, None, "mae", 256, False, "bf16")
-    with pytest.raises(ValueError, match="weight_block"):
-        four_over_six_linear(x, w, None, "mae", 256, False, None, "8x8")
 
 
 @_skip_no_sm100

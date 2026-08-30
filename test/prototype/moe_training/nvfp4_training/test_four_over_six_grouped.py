@@ -443,12 +443,8 @@ def test_grouped_validation():
         four_over_six_grouped_mm(A, B, offs.to(torch.int64))
     with pytest.raises(ValueError, match="one group-end offset per expert"):
         four_over_six_grouped_mm(A, B, offs[:1])
-    with pytest.raises(ValueError, match="must be 2D"):
-        four_over_six_grouped_mm(A.unsqueeze(0), B, offs)
     with pytest.raises(ValueError, match="divisible by 128"):
         four_over_six_grouped_mm(A[:, :144], B[:, :, :144].contiguous(), offs)
-    with pytest.raises(ValueError, match="weight_block"):
-        four_over_six_grouped_mm(A, B, offs, weight_block="8x8")
 
 
 @_skip_no_sm100

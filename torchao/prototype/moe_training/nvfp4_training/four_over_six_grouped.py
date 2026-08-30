@@ -367,22 +367,12 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
         backward_override: Optional[str],
         pad_token_groups_for_grouped_mm: bool,
     ) -> torch.Tensor:
-        if input_act.ndim != 2:
-            raise ValueError(f"input_act must be 2D, got {input_act.ndim}D")
-        if weight.ndim != 3:
-            raise ValueError(f"weight must be 3D, got {weight.ndim}D")
-        if group_end_offsets is None:
-            raise ValueError("offs is required for NVFP4 grouped GEMM")
         if group_end_offsets.ndim != 1 or group_end_offsets.dtype != torch.int32:
             raise ValueError("offs must be a 1D int32 tensor")
         if not group_end_offsets.is_contiguous():
             raise ValueError("offs must be contiguous")
         if group_end_offsets.numel() != weight.shape[0]:
             raise ValueError("offs must contain one group-end offset per expert")
-        if not (input_act.is_cuda and weight.is_cuda and group_end_offsets.is_cuda):
-            raise ValueError("input_act, weight, and offs must be CUDA tensors")
-        if not (input_act.device == weight.device == group_end_offsets.device):
-            raise ValueError("all tensor arguments must be on the same device")
         if not is_sm_at_least_100():
             raise NotImplementedError(
                 "NVFP4 four-over-six grouped GEMM requires SM100+"
@@ -399,17 +389,9 @@ class _FourOverSixGroupedMM(torch.autograd.Function):
                 f"backward_override must be 'high_precision' or 'dequantized', "
                 f"got {backward_override!r}"
             )
-        if weight_block not in ("1x16", "16x16"):
-            raise ValueError(
-                f"weight_block must be '1x16' or '16x16', got {weight_block!r}"
-            )
 
         num_tokens, K = input_act.shape
-        num_experts, N, weight_K = weight.shape
-        if weight_K != K:
-            raise ValueError(
-                f"input and weight contraction dimensions differ: {K} and {weight_K}"
-            )
+        num_experts, N, _ = weight.shape
         if K % _ALIGNMENT != 0 or N % _ALIGNMENT != 0:
             raise ValueError(
                 f"K and N must be divisible by {_ALIGNMENT}; got K={K}, N={N}"

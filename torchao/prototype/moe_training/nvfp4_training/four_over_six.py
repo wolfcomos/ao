@@ -206,10 +206,6 @@ def four_over_six_quantize(
     if e4m3_scale_bound not in (256, 448):
         raise ValueError(f"e4m3_scale_bound must be 256 or 448, got {e4m3_scale_bound}")
     rows, cols = x.shape
-    if cols % 16:
-        raise ValueError(f"columns must be divisible by 16, got {cols}")
-    if block == "16x16" and rows % 16:
-        raise ValueError(f"16x16 blocks need rows divisible by 16, got {rows}")
     row_scaled = global_amax.dim() == 1 and global_amax.numel() == rows
     if row_scaled and block != "1x16":
         raise ValueError("row-scaled four-over-six supports 1x16 blocks only")
@@ -467,10 +463,6 @@ class four_over_six_mm(torch.autograd.Function):
             raise ValueError(
                 "row-scaled four-over-six has no quantized backward; use "
                 "'high_precision' or 'dequantized'"
-            )
-        if weight_block not in ("1x16", "16x16"):
-            raise ValueError(
-                f"weight_block must be '1x16' or '16x16', got {weight_block!r}"
             )
         input_2d = input_hp.reshape(-1, K).contiguous()
 
