@@ -84,6 +84,32 @@ def _map6_reference(x, global_amax, e4m3_scale_bound):
     return dequant6.view(rows, cols)
 
 
+def _make_test_data(init_data, shape, dtype):
+    """Deterministic input constructions for the kernel-vs-oracle tests."""
+    n = shape[0] * shape[1]
+    if init_data == "random":
+        return torch.randn(*shape, dtype=dtype, device="cuda")
+    if init_data == "boundary":
+        # A linspace across the FP4 range interleaved with the same values
+        # nudged outward by 1e-3, straddling every rounding-decision boundary.
+        base = torch.linspace(-12.0, 12.0, n // 2, dtype=torch.float32, device="cuda")
+        nudge = torch.where(base < 0, base - 1e-3, base + 1e-3)
+        return torch.stack((base, nudge), dim=1).view(shape).to(dtype)
+    if init_data == "maxes":
+        return torch.full(
+            shape, torch.finfo(dtype).max, dtype=dtype, device="cuda"
+        )
+    if init_data == "denormal":
+        # bf16 subnormals with mixed signs (randn never generates them).
+        tiny = torch.finfo(torch.bfloat16).smallest_normal
+        x = (torch.rand(*shape, dtype=torch.float32, device="cuda") - 0.5) * tiny
+        return x.to(dtype)
+    assert init_data == "negzero"
+    x = torch.randn(*shape, dtype=dtype, device="cuda")
+    x[::2, ::3] = -0.0
+    return x
+
+
 @_skip_no_cuda
 @pytest.mark.parametrize("err_mode", ["mae", "mse"])
 @pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
@@ -132,6 +158,62 @@ def test_selection_not_worse_than_map6(e4m3_scale_bound):
     assert (err <= err6 + 1e-4).all()
     # And the recipe must actually engage: some blocks pick map-to-4.
     assert (err < err6 - 1e-4).any()
+
+
+@_skip_no_cuda
+@pytest.mark.parametrize("err_mode", ["mae", "mse"])
+@pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
+def test_selection_minimizes_err_mode(err_mode, e4m3_scale_bound):
+    """The stored encoding's per-block error is the minimum over both
+    candidates under the configured metric (the map-to-6 comparison above
+    only bounds the mae side)."""
+    from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
+        _FP32_MAX,
+        FP4_E2M1_MAX,
+        FP8_E4M3_MAX,
+        _candidate_error,
+        _fp4_rtne,
+    )
+
+    torch.manual_seed(0)
+    rows, cols = 256, 512
+    x = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
+    amax = x.abs().amax().to(torch.float32)
+    _, scales = four_over_six_quantize(
+        x, amax, block="1x16", err_mode=err_mode, e4m3_scale_bound=e4m3_scale_bound
+    )
+
+    # Recompute both candidate encodings with the quantizer's own chain.
+    xf = x.float().view(rows, cols // 16, 16)
+    s_enc = four_over_six_global_encode_scale(amax, e4m3_scale_bound)
+    fp4_max = torch.full((), FP4_E2M1_MAX, dtype=torch.float32, device=x.device)
+    base = (xf.abs().amax(dim=-1) / fp4_max) * s_enc
+    scale6 = base.clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    scale4 = (base * 1.5).clamp(max=FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    s_dec = 1.0 / s_enc
+    inv6 = (1.0 / (scale6.to(torch.float32) * s_dec)).clamp(max=_FP32_MAX)
+    inv4 = (1.0 / (scale4.to(torch.float32) * s_dec)).clamp(max=_FP32_MAX)
+    _, values6 = _fp4_rtne(xf * inv6.unsqueeze(-1))
+    _, values4 = _fp4_rtne(xf * inv4.unsqueeze(-1))
+    err6 = _candidate_error(
+        values6, scale6.unsqueeze(-1), xf, amax, err_mode, e4m3_scale_bound
+    )
+    err4 = _candidate_error(
+        values4, scale4.unsqueeze(-1), xf, amax, err_mode, e4m3_scale_bound
+    )
+
+    # Every stored scale is one of the candidates, and its error is the
+    # candidate minimum (equal candidate bytes encode identically, so the
+    # attribution below is unambiguous).
+    stored = scales.view(torch.uint8)
+    scale6_u8 = scale6.view(torch.uint8)
+    scale4_u8 = scale4.view(torch.uint8)
+    assert ((stored == scale6_u8) | (stored == scale4_u8)).all()
+    stored_err = torch.where(stored == scale4_u8, err4, err6)
+    min_err = torch.where(err4 < err6, err4, err6)
+    torch.testing.assert_close(stored_err, min_err, atol=0, rtol=0)
+    # Both candidates must win somewhere for the check to bite.
+    assert (err4 < err6).any() and (err6 < err4).any()
 
 
 @_skip_no_cuda
@@ -397,22 +479,28 @@ def test_linear_module_backward_override():
 @pytest.mark.parametrize("block", ["1x16", "16x16"])
 @pytest.mark.parametrize("row_scaled", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "init_data", ["random", "boundary", "maxes", "denormal", "negzero"]
+)
 def test_cutedsl_bitwise_matches_reference(
-    err_mode, e4m3_scale_bound, block, row_scaled, dtype
+    err_mode, e4m3_scale_bound, block, row_scaled, dtype, init_data
 ):
     """CuTe DSL fast path is bitwise identical to the pure-PyTorch body.
 
     Shapes cover R < the kernel's 128-row tile (TMA-clipped stores), R not a
-    multiple of 16 (1x16 only), and multi-tile rows/columns.
+    multiple of 16 (1x16 only), multi-tile rows/columns, and R > 128 (a
+    grid.y > 1 launch). The data constructions mirror the miles NVFP4
+    bitwise-parity matrix: rounding-boundary straddles, dtype-max
+    saturation, bf16 subnormals, and negative zeros.
     """
     if row_scaled and block == "16x16":
         pytest.skip("row-scaled is 1x16 only")
-    shapes = [(128, 256), (64, 1024)]
+    shapes = [(128, 256), (64, 1024), (384, 256)]
     if block == "1x16":
         shapes.append((100, 320))
     for shape in shapes:
         torch.manual_seed(0)
-        x = torch.randn(*shape, dtype=dtype, device="cuda")
+        x = _make_test_data(init_data, shape, dtype)
         amax = (x.abs().amax(dim=1) if row_scaled else x.abs().amax()).to(torch.float32)
         assert four_over_six_module._cutedsl_quantize_eligible(x)
         codes, scales = four_over_six_quantize(

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from torchao.float8.float8_utils import compute_error
+from torchao.prototype.moe_training.config import NVFP4FourOverSixTrainingOpConfig
 from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
     four_over_six_dequantize,
     four_over_six_linear,
@@ -18,6 +19,7 @@ from torchao.prototype.moe_training.nvfp4_training import four_over_six_grouped
 from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
     four_over_six_grouped_mm,
 )
+from torchao.prototype.moe_training.utils import _quantize_then_scaled_grouped_mm
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 _skip_no_sm100 = pytest.mark.skipif(
@@ -228,6 +230,68 @@ def test_row_scaled_fused_matches_loop_oracle(group_sizes, pad, monkeypatch):
 
 
 @_skip_no_sm100
+@pytest.mark.parametrize(
+    "group_sizes, pad",
+    [
+        pytest.param([128, 256, 128], False, id="uniform-128-aligned"),
+        pytest.param([1, 220, 77], True, id="ragged-padded"),
+    ],
+)
+def test_row_scaled_fused_fp32_out_matches_loop_oracle(group_sizes, pad, monkeypatch):
+    """Fused single-GEMM row-scaled forward with FP32 GEMM output vs the
+    per-group loop oracle.
+
+    Unlike the bf16-output arm above, the FP32-output fused GEMM applies
+    the raw per-row amaxes and the single bf16 cast exactly as the loop
+    does — no rounding to emulate — so the outputs match bitwise up to the
+    grouped kernel's reduction order.
+    """
+    if not four_over_six_grouped._grouped_mm_fp32_out_supported(0):
+        pytest.skip("this build's scaled_grouped_mm cannot emit FP32 output")
+    A, B, offs = _make_grouped_inputs(group_sizes, K=2048, N=768, seed=19)
+
+    loop_gemm = four_over_six_grouped._row_scaled_gemm_loop
+
+    def _reject_loop(*args, **kwargs):
+        raise AssertionError("loop fallback must not run")
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_row_scaled_gemm_loop", _reject_loop
+    )
+    y_fused = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        row_scaled_activation=True,
+        pad_token_groups_for_grouped_mm=pad,
+    )
+
+    monkeypatch.setattr(
+        four_over_six_grouped, "_row_scaled_gemm_loop", loop_gemm
+    )
+    monkeypatch.setattr(
+        four_over_six_grouped, "_grouped_mm_fp32_out_supported", lambda _i: False
+    )
+    monkeypatch.setattr(
+        four_over_six_grouped,
+        "FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT",
+        False,
+    )
+    y_loop = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        row_scaled_activation=True,
+        pad_token_groups_for_grouped_mm=pad,
+    )
+    assert y_fused.shape == y_loop.shape
+    if not torch.equal(y_fused, y_loop):
+        sqnr = compute_error(y_loop.float(), y_fused.float())
+        assert sqnr > 85.0, f"fused FP32-out vs loop oracle SQNR {sqnr:.1f} dB"
+        print(f"\nfused grouped GEMM reduction differs from dense: SQNR {sqnr:.1f} dB")
+
+
+@_skip_no_sm100
 @pytest.mark.parametrize("err_mode", ["mae", "mse"])
 @pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
 def test_batched_weight_quantize_matches_per_expert_loop(
@@ -384,6 +448,55 @@ def test_grouped_backward_dequantized(row_scaled_activation, weight_block):
 
 
 @_skip_no_sm100
+@pytest.mark.parametrize("backward_override", ["high_precision", "dequantized"])
+def test_grouped_backward_empty_groups(backward_override):
+    """Decode-like offsets with zero-size groups, forward and backward.
+
+    dx/dw are bitwise vs the same grouped GEMMs on the reference operands;
+    experts that received no tokens get all-zero weight gradients.
+    """
+    group_sizes = [128, 0, 256, 0, 0, 128]
+    K, N = 256, 384
+    A, B, offs = _make_grouped_inputs(group_sizes, K=K, N=N, seed=9)
+    A.requires_grad_(True)
+    B.requires_grad_(True)
+    y = four_over_six_grouped_mm(
+        A,
+        B,
+        offs,
+        row_scaled_activation=True,
+        backward_override=backward_override,
+    )
+    dy = torch.randn_like(y)
+    y.backward(dy)
+
+    A_hp, B_hp = A.detach(), B.detach()
+    if backward_override == "high_precision":
+        x_ref, w_ref = A_hp, B_hp
+    else:
+        x_amax = A_hp.abs().amax(dim=1).to(torch.float32)
+        x_codes, x_scales = four_over_six_quantize(A_hp, x_amax)
+        x_ref = four_over_six_dequantize(x_codes, x_scales, x_amax)
+        w_dq = []
+        for e in range(B.shape[0]):
+            w_amax = B_hp[e].abs().amax().to(torch.float32)
+            w_codes, w_scales = four_over_six_quantize(
+                B_hp[e], w_amax, block="16x16"
+            )
+            w_dq.append(four_over_six_dequantize(w_codes, w_scales, w_amax))
+        w_ref = torch.stack(w_dq)
+
+    dx_ref = torch._grouped_mm(dy, w_ref, offs=offs, out_dtype=torch.bfloat16)
+    dw_ref = torch._grouped_mm(
+        dy.transpose(-2, -1), x_ref, offs=offs, out_dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(A.grad, dx_ref, atol=0, rtol=0)
+    torch.testing.assert_close(B.grad, dw_ref, atol=0, rtol=0)
+    empty = [e for e, size in enumerate(group_sizes) if size == 0]
+    assert (B.grad[empty] == 0).all()
+
+
+@_skip_no_sm100
 @pytest.mark.parametrize("row_scaled_activation", [False, True])
 def test_grouped_padding_matches_aligned(row_scaled_activation):
     """Unaligned groups with padding == an aligned construction, per group."""
@@ -537,6 +650,59 @@ def test_grouped_backward_dequantized_ragged(row_scaled_activation, weight_block
     )
     torch.testing.assert_close(A.grad, dx_ref, atol=0, rtol=0)
     torch.testing.assert_close(B.grad, dw_ref, atol=0, rtol=0)
+
+
+@_skip_no_sm100
+@pytest.mark.parametrize("tail_rows", [0, 128])
+def test_dispatcher_grouped_mm_four_over_six(tail_rows):
+    """NVFP4FourOverSixTrainingOpConfig drives this op through the grouped
+    GEMM dispatcher, bitwise vs a direct call.
+
+    The dispatcher hands weights over as B_t = (E, K, N). Activation
+    buffers over-allocated past offs[-1] (the mxfp8 backward-override
+    test's tail contract) come back zero-extended with zero tail
+    gradients, and the logical rows match the exact-shape reference —
+    proof the garbage tail cannot feed the per-group amaxes.
+    """
+    group_sizes = [128, 256, 128]
+    K, N = 256, 384
+    A, B, offs = _make_grouped_inputs(group_sizes, K=K, N=N, seed=17)
+    M_logical = A.shape[0]
+    if tail_rows:
+        # Garbage tail: any leak into the last group's amax would flip its
+        # scale chain and break the bitwise comparison below.
+        tail = torch.full((tail_rows, K), 123.0, dtype=A.dtype, device=A.device)
+        A = torch.cat([A, tail])
+    kwargs = dict(
+        err_mode="mse",
+        e4m3_scale_bound=256,
+        row_scaled_activation=False,
+        weight_block="1x16",
+        backward_override="dequantized",
+        pad_token_groups_for_grouped_mm=False,
+    )
+    config = NVFP4FourOverSixTrainingOpConfig(**kwargs)
+
+    A_d = A.clone().requires_grad_(True)
+    B_d = B.clone().requires_grad_(True)
+    y_d = _quantize_then_scaled_grouped_mm(
+        A_d, B_d.transpose(-2, -1), config=config, offs=offs
+    )
+    assert y_d.shape == (A.shape[0], N)
+    dy = torch.randn_like(y_d)
+    y_d.backward(dy)
+
+    A_r = A[:M_logical].clone().requires_grad_(True)
+    B_r = B.clone().requires_grad_(True)
+    y_r = four_over_six_grouped_mm(A_r, B_r, offs, **kwargs)
+    y_r.backward(dy[:M_logical])
+
+    torch.testing.assert_close(y_d[:M_logical], y_r, atol=0, rtol=0)
+    torch.testing.assert_close(A_d.grad[:M_logical], A_r.grad, atol=0, rtol=0)
+    torch.testing.assert_close(B_d.grad, B_r.grad, atol=0, rtol=0)
+    if tail_rows:
+        assert (y_d[M_logical:] == 0).all()
+        assert (A_d.grad[M_logical:] == 0).all()
 
 
 @_skip_no_sm100
