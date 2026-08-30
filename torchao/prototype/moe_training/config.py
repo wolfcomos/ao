@@ -170,6 +170,12 @@ class MXFP8TrainingOpConfig(TrainingOpBaseConfig):
     # Whether to pad the token group sizes to multiples of 32 (MXFP8 scaling block size).
     pad_token_groups_for_grouped_mm: bool = False
 
+    # Backward computation override for the grouped GEMM. None or "quantized" uses the
+    # quantized MXFP8 backward (default). "high_precision" computes both gradients with
+    # plain grouped GEMMs on the saved high-precision operands. "dequantized" computes
+    # them from the dequantized forward operands.
+    backward_override: Optional[str] = None
+
     @classmethod
     def from_recipe(
         cls,
@@ -212,6 +218,7 @@ class MXFP8TrainingOpConfig(TrainingOpBaseConfig):
                 and self.scale_calculation_mode == other.scale_calculation_mode
                 and self.pad_token_groups_for_grouped_mm
                 == other.pad_token_groups_for_grouped_mm
+                and self.backward_override == other.backward_override
             )
         return NotImplemented
 
@@ -223,6 +230,7 @@ class MXFP8TrainingOpConfig(TrainingOpBaseConfig):
                 self.wgrad_with_hp,
                 self.scale_calculation_mode,
                 self.pad_token_groups_for_grouped_mm,
+                self.backward_override,
             )
         )
 

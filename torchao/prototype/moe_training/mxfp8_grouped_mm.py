@@ -17,6 +17,7 @@ from torchao.prototype.moe_training.kernels.mxfp8 import (
     mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_cuda_3d,
     triton_mx_block_rearrange_2d_K_groups,
+    triton_mx_block_rearrange_2d_M_groups,
     triton_mx_block_rearrange_per_group_3d,
 )
 from torchao.prototype.moe_training.utils import (
@@ -63,6 +64,7 @@ def _to_mxfp8_then_scaled_grouped_mm(
     wgrad_with_hp: bool = False,
     scale_calculation_mode: ScaleCalculationMode = ScaleCalculationMode.RCEIL,
     pad_token_groups_for_grouped_mm: bool = False,
+    backward_override: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Differentiable mxfp8 grouped gemm with dynamic mxfp8 quantization.
@@ -82,6 +84,10 @@ def _to_mxfp8_then_scaled_grouped_mm(
         wgrad_with_hp (bool): Whether to compute weight gradient in high precision. Defaults to False.
         scale_calculation_mode (ScaleCalculationMode): Mode for scale calculation (RCEIL, FLOOR, etc.). Defaults to ScaleCalculationMode.RCEIL.
         pad_token_groups_for_grouped_mm (bool): Whether to pad token groups to the next multiple of 32 (requirement for MXFP8 grouped GEMM). If your tokens are already padded, set to False.
+        backward_override (Optional[str]): Backward computation override. None or "quantized" uses the
+            quantized MXFP8 backward (default). "high_precision" saves the high-precision operands and
+            computes both gradients with plain grouped GEMMs. "dequantized" saves the quantized forward
+            operands and computes both gradients from their dequantized values.
 
     Returns:
         out (torch.Tensor): The result of the mxfp8 scaled grouped gemm.
@@ -98,6 +104,7 @@ def _to_mxfp8_then_scaled_grouped_mm(
         wgrad_with_hp,
         scale_calculation_mode,
         pad_token_groups_for_grouped_mm,
+        backward_override,
     )
 
     # add bias outside the autograd function so that autograd
@@ -128,6 +135,7 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         wgrad_with_hp: bool = False,
         scale_calculation_mode: ScaleCalculationMode = ScaleCalculationMode.RCEIL,
         pad_token_groups_for_grouped_mm: bool = False,
+        backward_override: Optional[str] = None,
     ) -> torch.Tensor:
         """
         Forward pass: Quantize inputs and perform grouped GEMM.
@@ -141,6 +149,9 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             wgrad_with_hp: Compute weight gradient in high precision
             scale_calculation_mode: Mode for scale calculation (RCEIL, FLOOR, etc.)
             pad_token_groups_for_grouped_mm: Whether to pad token groups to the next multiple of 32
+            backward_override: None/"quantized" for the quantized backward, "high_precision"
+                to compute gradients from the saved high-precision operands, or "dequantized"
+                to compute them from the dequantized forward operands
 
         Returns:
             Output tensor, shape (M, N)
@@ -152,6 +163,37 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             KernelPreference.AUTO,
             KernelPreference.EMULATED,
         ), "kernel_preference must be AUTO or EMULATED"
+
+        assert backward_override in (
+            None,
+            "quantized",
+            "high_precision",
+            "dequantized",
+        ), (
+            "backward_override must be None, 'quantized', 'high_precision', or "
+            f"'dequantized', got {backward_override!r}"
+        )
+        # None and "quantized" both select the quantized backward default.
+        if backward_override == "quantized":
+            backward_override = None
+        if backward_override is not None:
+            assert not isinstance(input_act, MXTensor), (
+                "backward_override requires high-precision input activations"
+            )
+            # The override backwards quantize saved operands with the bf16-only
+            # dim0 Triton cast, so reject other dtypes here rather than deep
+            # inside the kernel.
+            assert (
+                input_act.dtype == torch.bfloat16 and weight_t.dtype == torch.bfloat16
+            ), (
+                "backward_override supports bfloat16 operands only, got "
+                f"{input_act.dtype} and {weight_t.dtype}"
+            )
+        if backward_override == "dequantized":
+            assert kernel_preference != KernelPreference.EMULATED, (
+                "the dequantized backward saves quantized operands from the SM100 "
+                "forward and does not support kernel_preference=EMULATED"
+            )
 
         # Validate SM100 kernels are available if not using emulated mode
         if kernel_preference != KernelPreference.EMULATED:
@@ -198,15 +240,33 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             padded_group_end_offsets = group_end_offsets
 
         # Perform forward computation using appropriate path
-        output = _compute_fwd(
-            padded_input_act,
-            weight_t,
-            padded_group_end_offsets,
-            block_size,
-            out_dtype,
-            scale_calculation_mode,
-            kernel_preference,
-        )
+        if backward_override == "dequantized":
+            # The dequantized backward needs the quantized operands with
+            # logical scales, which this forward variant also returns.
+            (
+                output,
+                input_act_e4m3,
+                input_act_scales,
+                weight_e4m3,
+                weight_scales,
+            ) = _compute_fwd_sm100_logical_scales(
+                padded_input_act,
+                weight_t,
+                padded_group_end_offsets,
+                block_size,
+                out_dtype,
+                scale_calculation_mode,
+            )
+        else:
+            output = _compute_fwd(
+                padded_input_act,
+                weight_t,
+                padded_group_end_offsets,
+                block_size,
+                out_dtype,
+                scale_calculation_mode,
+                kernel_preference,
+            )
 
         # Unpad output if padding was used
         if pad_token_groups_for_grouped_mm:
@@ -220,13 +280,31 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             )
 
         # Save tensors and config for backward
-        ctx.save_for_backward(
-            padded_input_act,
-            weight_t,
-            group_end_offsets,
-            padded_group_start_offsets,
-            padded_group_end_offsets,
-        )
+        if backward_override == "high_precision":
+            # The high-precision backward only needs the unpadded operands.
+            ctx.save_for_backward(input_act, weight_t, group_end_offsets)
+        elif backward_override == "dequantized":
+            if padded_group_start_offsets is None:
+                padded_group_start_offsets = group_end_offsets.new_zeros(0)
+            ctx.save_for_backward(
+                input_act_e4m3,
+                input_act_scales,
+                weight_e4m3,
+                weight_scales,
+                group_end_offsets,
+                padded_group_start_offsets,
+            )
+            ctx.input_hp_dtype = padded_input_act.dtype
+            ctx.weight_hp_dtype = weight_t.dtype
+        else:
+            ctx.save_for_backward(
+                padded_input_act,
+                weight_t,
+                group_end_offsets,
+                padded_group_start_offsets,
+                padded_group_end_offsets,
+            )
+        ctx.backward_override = backward_override
         ctx.out_dtype = out_dtype
         ctx.kernel_preference = kernel_preference
         ctx.wgrad_with_hp = wgrad_with_hp
@@ -249,6 +327,65 @@ class _MXFP8GroupedMM(torch.autograd.Function):
         Returns:
             tuple: (grad_input, grad_weight_t, None, ...) matching forward args
         """
+        # block_size is always 32 for MXFP8
+        block_size = 32
+
+        # The backward overrides compute both gradients with plain grouped
+        # GEMMs on high-precision operands instead of the quantized backward.
+        if ctx.backward_override == "high_precision":
+            input_act, weight_t, group_end_offsets = ctx.saved_tensors
+            grad_input, grad_weight_t = _compute_grads_from_hp_operands(
+                grad_output,
+                input_act,
+                weight_t.transpose(-2, -1),
+                group_end_offsets,
+                ctx.out_dtype,
+            )
+            return _backward_override_grads_tuple(grad_input, grad_weight_t)
+        elif ctx.backward_override == "dequantized":
+            (
+                input_act_e4m3,
+                input_act_scales,
+                weight_e4m3,
+                weight_scales,
+                group_end_offsets,
+                padded_group_start_offsets,
+            ) = ctx.saved_tensors
+            input_act = triton_mxfp8_dequant_dim0(
+                input_act_e4m3,
+                input_act_scales.view(
+                    torch.uint8
+                ),  # Triton can't handle e8m0 directly yet
+                out_dtype=ctx.input_hp_dtype,
+                scale_block_size=block_size,
+            )
+            if ctx.pad_token_groups_for_grouped_mm:
+                input_act = unpad_token_groups(
+                    input_act,
+                    group_end_offsets,
+                    padded_group_start_offsets,
+                    ctx.num_tokens,
+                    alignment_size=block_size,
+                    kernel_preference=ctx.kernel_preference,
+                )
+            num_experts, weight_n, weight_k = weight_e4m3.shape
+            weight = triton_mxfp8_dequant_dim0(
+                weight_e4m3.reshape(num_experts * weight_n, weight_k),
+                weight_scales.view(torch.uint8).reshape(
+                    num_experts * weight_n, weight_k // block_size
+                ),
+                out_dtype=ctx.weight_hp_dtype,
+                scale_block_size=block_size,
+            ).reshape(num_experts, weight_n, weight_k)
+            grad_input, grad_weight_t = _compute_grads_from_hp_operands(
+                grad_output,
+                input_act,
+                weight,
+                group_end_offsets,
+                ctx.out_dtype,
+            )
+            return _backward_override_grads_tuple(grad_input, grad_weight_t)
+
         # Retrieve saved tensors and config
         (
             padded_input_act,
@@ -257,9 +394,6 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             padded_group_start_offsets,
             padded_group_end_offsets,
         ) = ctx.saved_tensors
-
-        # block_size is always 32 for MXFP8
-        block_size = 32
         out_dtype = ctx.out_dtype
         kernel_preference = ctx.kernel_preference
         wgrad_with_hp = ctx.wgrad_with_hp
@@ -324,7 +458,67 @@ class _MXFP8GroupedMM(torch.autograd.Function):
             None,  # wgrad_with_hp
             None,  # scale_calculation_mode
             None,  # pad_token_groups_for_grouped_mm
+            None,  # backward_override
         )
+
+
+def _backward_override_grads_tuple(
+    grad_input: torch.Tensor,
+    grad_weight_t: torch.Tensor,
+) -> tuple:
+    """Pad the override gradients with Nones for forward's non-tensor args."""
+    return (
+        grad_input,
+        grad_weight_t,
+        None,  # group_end_offsets
+        None,  # out_dtype
+        None,  # kernel_preference
+        None,  # wgrad_with_hp
+        None,  # scale_calculation_mode
+        None,  # pad_token_groups_for_grouped_mm
+        None,  # backward_override
+    )
+
+
+def _compute_grads_from_hp_operands(
+    grad_output: torch.Tensor,
+    input_act: torch.Tensor,
+    weight: torch.Tensor,
+    group_end_offsets: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute both gradients with plain grouped GEMMs on high-precision operands.
+
+    Shared by the "high_precision" and "dequantized" backward overrides. The
+    grouped GEMMs only read rows covered by group_end_offsets, so
+    over-allocated tail rows past the final offset are tolerated.
+
+    Args:
+        grad_output: Gradient output, shape (M, N)
+        input_act: High-precision input activations, shape (M, K)
+        weight: High-precision expert weights, shape (E, N, K)
+        group_end_offsets: End index of each token group, shape (E,)
+        out_dtype: Output dtype for the gradients
+
+    Returns:
+        tuple: (grad_input, grad_weight_t) with shapes (M, K) and (E, K, N)
+    """
+    grad_output = grad_output.contiguous()
+    grad_input = torch._grouped_mm(
+        grad_output,
+        weight,
+        offs=group_end_offsets,
+        out_dtype=out_dtype,
+    )
+    grad_weight = torch._grouped_mm(
+        grad_output.transpose(-2, -1),
+        input_act,
+        offs=group_end_offsets,
+        out_dtype=out_dtype,
+    )
+    # Transpose to match weight_t shape in forward: (E, N, K) -> (E, K, N)
+    return grad_input, grad_weight.transpose(-2, -1)
 
 
 def _compute_fwd(
@@ -547,6 +741,65 @@ def _compute_fwd_sm100(
         out_dtype=out_dtype,
     )
     return output
+
+
+def _compute_fwd_sm100_logical_scales(
+    padded_input_act: torch.Tensor,
+    weight_t: torch.Tensor,
+    padded_group_end_offsets: torch.Tensor,
+    block_size: int,
+    out_dtype: torch.dtype,
+    scale_calculation_mode: ScaleCalculationMode,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Forward computation using AUTO path (SM100 kernels), also returning the
+    quantized operands with logical (pre-blocking) scales.
+
+    Used when the backward needs to dequantize the forward operands. The
+    Triton dim0 quantizer produces qdata bitwise identical to the CuTe DSL
+    1x32 rceil kernel used by `_compute_fwd_sm100`, but returns logical
+    scales (the CuTe DSL kernel returns blocked-only scales and no
+    unswizzler exists), so this path quantizes input activations with Triton
+    and blocks the scales separately for the grouped GEMM.
+
+    Args:
+        padded_input_act: Input activations (possibly padded), shape (M, K)
+        weight_t: Expert weights transposed, shape (E, K, N)
+        padded_group_end_offsets: Group offsets (possibly padded)
+        block_size: Block size for quantization
+        out_dtype: Output dtype
+        scale_calculation_mode: Mode for scale calculation
+
+    Returns:
+        tuple: (output, input_act_e4m3, input_act_scales, weight_e4m3, weight_scales)
+            - output: shape (M, N)
+            - input_act_e4m3: shape (M, K) with logical scales (M, K//block_size)
+            - weight_e4m3: shape (E, N, K) with logical scales (E, N, K//block_size)
+    """
+    # Quantize input activations along dim0, keeping the logical scales
+    input_act_e4m3, input_act_scales = triton_to_mxfp8_dim0(
+        padded_input_act, block_size, scale_calculation_mode.value.lower()
+    )
+    input_act_scales_blocked = triton_mx_block_rearrange_2d_M_groups(
+        input_act_scales, padded_group_end_offsets
+    )
+
+    # Quantize weights along dim0 (after transposing from (E, K, N) to (E, N, K))
+    weight_e4m3, weight_scales = triton_to_mxfp8_dim0(
+        weight_t.transpose(-2, -1), block_size, scale_calculation_mode.value.lower()
+    )
+    weight_scales_blocked = triton_mx_block_rearrange_per_group_3d(weight_scales)
+
+    # Compute output using SM100 kernel
+    output = torch._scaled_grouped_mm(
+        input_act_e4m3,
+        weight_e4m3.transpose(-2, -1),  # Transpose back to (E, K, N)
+        input_act_scales_blocked,
+        weight_scales_blocked,
+        offs=padded_group_end_offsets,
+        out_dtype=out_dtype,
+    )
+    return output, input_act_e4m3, input_act_scales, weight_e4m3, weight_scales
 
 
 def _compute_fwd_emulated(
