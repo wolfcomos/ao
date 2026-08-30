@@ -20,9 +20,11 @@ pytest.importorskip("triton", reason="Triton required to run this test")
 from torchao.prototype.moe_training.config import MXFP8TrainingOpConfig
 from torchao.prototype.moe_training.mxfp8_grouped_mm import (
     _SM100_KERNELS_AVAILABLE,
+    _compute_wgrad_sm100,
     _to_mxfp8_then_scaled_grouped_mm,
 )
 from torchao.prototype.moe_training.utils import _quantize_then_scaled_grouped_mm
+from torchao.prototype.mx_formats.config import ScaleCalculationMode
 
 if not _SM100_KERNELS_AVAILABLE:
     pytest.skip(
@@ -167,6 +169,39 @@ def test_tail_rows_past_final_offset_tolerated(backward_override):
         for grad, ref in ((grad_A[:M_logical], ref_grad_A), (grad_B, ref_grad_B)):
             rel_err = ((grad - ref).abs().max() / ref.abs().max()).item()
             assert rel_err < 0.15, f"relative error too large: {rel_err}"
+
+
+def test_noncontiguous_grad_output_wgrad():
+    """The CUDA dim1 cast in the quantized wgrad requires contiguous inputs;
+    expanded (stride-0) and other non-contiguous gradient views must not
+    crash it."""
+    A, B, offs = _make_inputs()
+    N = B.shape[1]
+    M = A.shape[0]
+
+    # Direct wgrad call with an expanded (stride-0) grad_output.
+    grad_output_expanded = torch.randn(
+        M, 1, dtype=torch.bfloat16, device="cuda"
+    ).expand(M, N)
+    grad_weight_t = _compute_wgrad_sm100(
+        grad_output_expanded,
+        A,
+        offs,
+        32,
+        torch.bfloat16,
+        ScaleCalculationMode.RCEIL,
+        wgrad_with_hp=False,
+    )
+    assert torch.isfinite(grad_weight_t).all()
+
+    # End-to-end: sum().backward() feeds an expanded ones gradient into the
+    # default quantized backward.
+    A_leaf = A.detach().clone().requires_grad_(True)
+    B_leaf = B.detach().clone().requires_grad_(True)
+    out = _to_mxfp8_then_scaled_grouped_mm(A_leaf, B_leaf.transpose(-2, -1), offs=offs)
+    out.sum().backward()
+    assert torch.isfinite(A_leaf.grad).all()
+    assert torch.isfinite(B_leaf.grad).all()
 
 
 def test_invalid_backward_override_rejected():

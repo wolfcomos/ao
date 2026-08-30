@@ -878,8 +878,12 @@ def _compute_dgrad_sm100(
                 grad_output.scales, group_end_offsets
             )
     else:
+        # As in the wgrad path: autograd can hand backward an expanded or
+        # otherwise non-contiguous grad_output view (sum().backward()'s
+        # stride-0 ones), and the CuTe DSL quantize kernel's handling of such
+        # strides is unverified — materialize first (no-op when contiguous).
         grad_out_e4m3, grad_output_scales_blocked = mxfp8_quantize_2d_1x32_cutedsl(
-            grad_output,
+            grad_output.contiguous(),
             scaling_mode=scale_calculation_mode.value.lower(),
             offs=group_end_offsets,
         )
@@ -1000,6 +1004,11 @@ def _compute_wgrad_sm100(
         return grad_weight.transpose(-2, -1)
 
     # Use CUDA kernel for dim1 quant
+    # The kernel requires contiguous inputs; autograd can hand backward an
+    # expanded or otherwise non-contiguous grad_output view (e.g. from
+    # sum().backward()), so make both operands contiguous first.
+    grad_output = grad_output.contiguous()
+    input_act = input_act.contiguous()
     grad_output_t_mx = _to_mxfp8_dim1_kernel_wrapper(
         grad_output,
         block_size,
