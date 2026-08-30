@@ -96,9 +96,7 @@ def _make_test_data(init_data, shape, dtype):
         nudge = torch.where(base < 0, base - 1e-3, base + 1e-3)
         return torch.stack((base, nudge), dim=1).view(shape).to(dtype)
     if init_data == "maxes":
-        return torch.full(
-            shape, torch.finfo(dtype).max, dtype=dtype, device="cuda"
-        )
+        return torch.full(shape, torch.finfo(dtype).max, dtype=dtype, device="cuda")
     if init_data == "denormal":
         # bf16 subnormals with mixed signs (randn never generates them).
         tiny = torch.finfo(torch.bfloat16).smallest_normal
@@ -605,9 +603,7 @@ def test_cutedsl_linear_compile():
 
 @_skip_no_sm100
 @pytest.mark.skipif(not _cutedsl_available, reason="requires the CuTe DSL runtime")
-@pytest.mark.parametrize(
-    "backward_override", ["high_precision", "dequantized"]
-)
+@pytest.mark.parametrize("backward_override", ["high_precision", "dequantized"])
 def test_linear_compile_backward_overrides(backward_override):
     """fullgraph compile of the override backwards, bitwise vs eager.
 
@@ -620,9 +616,7 @@ def test_linear_compile_backward_overrides(backward_override):
     w = torch.randn(384, 256, dtype=torch.bfloat16, device="cuda") * 0.1
 
     def fn(x, w):
-        return four_over_six_linear(
-            x, w, None, "mae", 256, False, backward_override
-        )
+        return four_over_six_linear(x, w, None, "mae", 256, False, backward_override)
 
     x_e = x.clone().requires_grad_(True)
     w_e = w.clone().requires_grad_(True)

@@ -301,8 +301,7 @@ def four_over_six_dequantize(
     cols = packed_cols * 2
     if scales.shape != (rows, cols // 16):
         raise ValueError(
-            f"scales must have shape ({rows}, {cols // 16}), "
-            f"got {tuple(scales.shape)}"
+            f"scales must have shape ({rows}, {cols // 16}), got {tuple(scales.shape)}"
         )
     row_scaled = global_amax.dim() == 1 and global_amax.numel() == rows
     if not row_scaled and global_amax.numel() != 1:

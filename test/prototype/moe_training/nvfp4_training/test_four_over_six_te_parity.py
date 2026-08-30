@@ -129,9 +129,7 @@ def test_dequantize_bitwise_parity_with_transformer_engine(
     t = quantizer(x)
     te_dq = t.dequantize(dtype=out_dtype)
     amax = (x.abs().amax(dim=1) if row_scaled else x.abs().amax()).to(torch.float32)
-    codes, scales = four_over_six_quantize(
-        x, amax, e4m3_scale_bound=e4m3_scale_bound
-    )
+    codes, scales = four_over_six_quantize(x, amax, e4m3_scale_bound=e4m3_scale_bound)
     dq = four_over_six_dequantize(
         codes,
         scales,

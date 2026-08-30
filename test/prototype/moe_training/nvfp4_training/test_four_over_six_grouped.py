@@ -10,12 +10,12 @@ import torch
 
 from torchao.float8.float8_utils import compute_error
 from torchao.prototype.moe_training.config import NVFP4FourOverSixTrainingOpConfig
+from torchao.prototype.moe_training.nvfp4_training import four_over_six_grouped
 from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
     four_over_six_dequantize,
     four_over_six_linear,
     four_over_six_quantize,
 )
-from torchao.prototype.moe_training.nvfp4_training import four_over_six_grouped
 from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
     four_over_six_grouped_mm,
 )
@@ -58,9 +58,7 @@ def test_group_expanded_amax_matches_per_split_quantize(err_mode, e4m3_scale_bou
             for start, end in zip([0, *offs.tolist()[:-1]], offs.tolist())
         ]
     )
-    expanded = group_amax.repeat_interleave(
-        torch.tensor(group_sizes, device=A.device)
-    )
+    expanded = group_amax.repeat_interleave(torch.tensor(group_sizes, device=A.device))
     codes, scales = four_over_six_quantize(
         A, expanded, err_mode=err_mode, e4m3_scale_bound=e4m3_scale_bound
     )
@@ -255,9 +253,7 @@ def test_row_scaled_fused_fp32_out_matches_loop_oracle(group_sizes, pad, monkeyp
     def _reject_loop(*args, **kwargs):
         raise AssertionError("loop fallback must not run")
 
-    monkeypatch.setattr(
-        four_over_six_grouped, "_row_scaled_gemm_loop", _reject_loop
-    )
+    monkeypatch.setattr(four_over_six_grouped, "_row_scaled_gemm_loop", _reject_loop)
     y_fused = four_over_six_grouped_mm(
         A,
         B,
@@ -266,9 +262,7 @@ def test_row_scaled_fused_fp32_out_matches_loop_oracle(group_sizes, pad, monkeyp
         pad_token_groups_for_grouped_mm=pad,
     )
 
-    monkeypatch.setattr(
-        four_over_six_grouped, "_row_scaled_gemm_loop", loop_gemm
-    )
+    monkeypatch.setattr(four_over_six_grouped, "_row_scaled_gemm_loop", loop_gemm)
     monkeypatch.setattr(
         four_over_six_grouped, "_grouped_mm_fp32_out_supported", lambda _i: False
     )
@@ -294,9 +288,7 @@ def test_row_scaled_fused_fp32_out_matches_loop_oracle(group_sizes, pad, monkeyp
 @_skip_no_sm100
 @pytest.mark.parametrize("err_mode", ["mae", "mse"])
 @pytest.mark.parametrize("e4m3_scale_bound", [256, 448])
-def test_batched_weight_quantize_matches_per_expert_loop(
-    err_mode, e4m3_scale_bound
-):
+def test_batched_weight_quantize_matches_per_expert_loop(err_mode, e4m3_scale_bound):
     """The one-call flattened 1x16 weight quantize == the per-expert loop."""
     torch.manual_seed(2)
     E, N, K = 5, 128, 256
@@ -359,9 +351,7 @@ def test_row_scaled_dispatch_and_loop_fallback(monkeypatch):
     def _reject_loop(*args, **kwargs):
         raise AssertionError("loop fallback must not run")
 
-    monkeypatch.setattr(
-        four_over_six_grouped, "_row_scaled_gemm_loop", _reject_loop
-    )
+    monkeypatch.setattr(four_over_six_grouped, "_row_scaled_gemm_loop", _reject_loop)
     y_fused = four_over_six_grouped_mm(A, B, offs, row_scaled_activation=True)
 
     # The bf16 GEMM-output rounding costs ~51 dB vs the loop's fp32 output;
@@ -384,9 +374,7 @@ def test_grouped_backward_high_precision(row_scaled_activation):
     dy = torch.randn_like(y)
     y.backward(dy)
 
-    dx_ref = torch._grouped_mm(
-        dy, B.detach(), offs=offs, out_dtype=torch.bfloat16
-    )
+    dx_ref = torch._grouped_mm(dy, B.detach(), offs=offs, out_dtype=torch.bfloat16)
     dw_ref = torch._grouped_mm(
         dy.transpose(-2, -1), A.detach(), offs=offs, out_dtype=torch.bfloat16
     )
@@ -480,9 +468,7 @@ def test_grouped_backward_empty_groups(backward_override):
         w_dq = []
         for e in range(B.shape[0]):
             w_amax = B_hp[e].abs().amax().to(torch.float32)
-            w_codes, w_scales = four_over_six_quantize(
-                B_hp[e], w_amax, block="16x16"
-            )
+            w_codes, w_scales = four_over_six_quantize(B_hp[e], w_amax, block="16x16")
             w_dq.append(four_over_six_dequantize(w_codes, w_scales, w_amax))
         w_ref = torch.stack(w_dq)
 
@@ -513,9 +499,9 @@ def test_grouped_padding_matches_aligned(row_scaled_activation):
         ragged_rows.append(A_al[start : start + ragged])
         start += size
     A_rg = torch.cat(ragged_rows).contiguous()
-    offs_rg = torch.tensor(
-        ragged_sizes, dtype=torch.int32, device=A_al.device
-    ).cumsum(0, dtype=torch.int32)
+    offs_rg = torch.tensor(ragged_sizes, dtype=torch.int32, device=A_al.device).cumsum(
+        0, dtype=torch.int32
+    )
 
     y_rg = four_over_six_grouped_mm(
         A_rg,
@@ -530,7 +516,9 @@ def test_grouped_padding_matches_aligned(row_scaled_activation):
     start = 0
     for e, ragged in enumerate(ragged_sizes):
         rows = A_rg[start : start + ragged]
-        padded = torch.zeros(128 * ((ragged + 127) // 128), K, dtype=rows.dtype, device=rows.device)
+        padded = torch.zeros(
+            128 * ((ragged + 127) // 128), K, dtype=rows.dtype, device=rows.device
+        )
         padded[:ragged] = rows
         if row_scaled_activation:
             ref = four_over_six_linear(padded, B[e], None, "mae", 256, True)
@@ -584,9 +572,7 @@ def test_grouped_miles_recipe_point():
     assert A.grad is not None and A.grad.shape == A.shape
     assert B.grad is not None and B.grad.shape == B.shape
     sqnr = compute_error(
-        torch._grouped_mm(
-            A.detach(), B.detach().transpose(-2, -1), offs=offs
-        ).float(),
+        torch._grouped_mm(A.detach(), B.detach().transpose(-2, -1), offs=offs).float(),
         y.float(),
     )
     assert sqnr > 14.0, f"quantization noise floor too high: {sqnr:.1f} dB"
@@ -706,9 +692,7 @@ def test_dispatcher_grouped_mm_four_over_six(tail_rows):
 
 
 @_skip_no_sm100
-@pytest.mark.parametrize(
-    "backward_override", ["high_precision", "dequantized"]
-)
+@pytest.mark.parametrize("backward_override", ["high_precision", "dequantized"])
 def test_grouped_compile(backward_override):
     """fullgraph compile of the per-tensor grouped op, forward and backward.
 

@@ -97,9 +97,7 @@ def _grouped_mm_fp32_out_supported(device_index: int) -> bool:
     a minimal-shape probe records what the build accepts.
     """
     device = torch.device("cuda", device_index)
-    codes = torch.zeros(
-        _ALIGNMENT, _ALIGNMENT // 2, dtype=torch.uint8, device=device
-    )
+    codes = torch.zeros(_ALIGNMENT, _ALIGNMENT // 2, dtype=torch.uint8, device=device)
     scales = torch.ones(
         _ALIGNMENT, _ALIGNMENT // 16, dtype=torch.float32, device=device
     ).to(torch.float8_e4m3fn)
@@ -291,9 +289,9 @@ def _row_scaled_gemm_loop(
             w_global[e],
             torch.float32,
         )
-        output[start:end] = (
-            group_out * x_amax[start:end].view(-1, 1)
-        ).to(torch.bfloat16)
+        output[start:end] = (group_out * x_amax[start:end].view(-1, 1)).to(
+            torch.bfloat16
+        )
     return output
 
 
@@ -335,9 +333,7 @@ def _row_scaled_single_grouped_gemm(
         ],
         scale_recipe_a=_SCALE_RECIPE,
         scale_b=[
-            to_blocked(
-                w_scales.reshape(-1, w_scales.shape[-1])
-            ).view(num_experts, -1),
+            to_blocked(w_scales.reshape(-1, w_scales.shape[-1])).view(num_experts, -1),
             w_global,
         ],
         scale_recipe_b=_SCALE_RECIPE,
