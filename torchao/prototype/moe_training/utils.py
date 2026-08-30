@@ -10,6 +10,7 @@ from torchao.float8.float8_utils import tensor_to_scale, to_fp8_saturated
 from torchao.prototype.moe_training.config import (
     Float8TrainingOpConfig,
     MXFP8TrainingOpConfig,
+    NVFP4FourOverSixTrainingOpConfig,
     TrainingOpBaseConfig,
 )
 from torchao.prototype.mx_formats.mx_tensor import to_mx
@@ -405,6 +406,25 @@ def _quantize_then_scaled_grouped_mm(
             B_t,
             offs,
             **kwargs,
+        )
+    elif isinstance(config, NVFP4FourOverSixTrainingOpConfig):
+        from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
+            four_over_six_grouped_mm,
+        )
+
+        # The dispatcher hands expert weights over as B_t with shape (E, K, N);
+        # the four-over-six op takes them in their stored (E, N, K) layout.
+        return four_over_six_grouped_mm(
+            A,
+            B_t.transpose(-2, -1),
+            offs,
+            bias,
+            err_mode=config.err_mode,
+            e4m3_scale_bound=config.e4m3_scale_bound,
+            row_scaled_activation=config.row_scaled_activation,
+            weight_block=config.weight_block,
+            backward_override=config.backward_override,
+            pad_token_groups_for_grouped_mm=config.pad_token_groups_for_grouped_mm,
         )
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
