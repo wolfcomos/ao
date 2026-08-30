@@ -14,14 +14,7 @@ validated against a standalone PyTorch reference (``_ref_mla_q_proj_rope``:
 dequantization, an FP64 ``torch`` matmul, the BF16 staging round, the
 halves-out RoPE, and ``to_mx`` requantization only) under fixed gates; the
 gate rationale and measured margins live next to the gate constants below.
-
-The reference requantizes with the same ``to_mx``/RCEIL step the kernel
-applies, so the comparison is matched-requant: both sides carry the identical
-output quantization and agreement is GEMM/RoPE exactness, not a quantization
-band.
 """
-
-import math
 
 import pytest
 import torch
@@ -68,67 +61,31 @@ _OPS = torch.ops.torchao
 
 
 def _quant_rowwise(x: torch.Tensor):
-    """[M, K] -> (qdata [M, K] e4m3, uint8 e8m0 scales [M, K/32], unswizzled)."""
+    """[..., K] -> (qdata [..., K] e4m3, uint8 e8m0 scales [..., K/32], unswizzled)."""
     s, q = to_mx(x, _E4M3, _BLOCK, scaling_mode=_RCEIL)
-    return q, s.view(_E8M0).view(torch.uint8)
+    return q, s.view(torch.uint8)
 
 
-def _dequant_input(q: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
-    """[M, K] e4m3 + [M, K/32] rowwise scales -> FP64 (feeds the FP64 GEMM)."""
+def _dequant(q: torch.Tensor, sf: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """e4m3 codes + e8m0 scales (block-32 along ``dim``) -> FP64."""
     s = get_fp_scale(sf.view(_E8M0)).double()
-    return q.to(torch.float64) * s.repeat_interleave(_BLOCK, dim=1)
-
-
-def _dequant_rowwise(q: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
-    """[T, nh, 192] codes + [T, nh, 6] scales (block-32 along HEAD_DIM) -> f32."""
-    s = get_fp_scale(sf.view(_E8M0)).double()
-    return (q.to(torch.float64) * s.repeat_interleave(_BLOCK, dim=-1)).float()
-
-
-def _dequant_colwise(q: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
-    """[T, nh, 192] codes + [T/32, nh, 192] scales (block-32 along tokens) -> f32."""
-    s = get_fp_scale(sf.view(_E8M0)).double()
-    return (q.to(torch.float64) * s.repeat_interleave(_BLOCK, dim=0)).float()
-
-
-def _quant_out_rowwise(y: torch.Tensor):
-    """FP32 [T, nh, 192] -> rowwise 1x32 codes + scales in the op's layouts."""
-    tokens, nh, _ = y.shape
-    s, q = to_mx(y.reshape(tokens * nh, HEAD_DIM), _E4M3, _BLOCK, scaling_mode=_RCEIL)
-    return (
-        q.reshape(tokens, nh, HEAD_DIM),
-        s.view(_E8M0).view(torch.uint8).reshape(tokens, nh, HEAD_DIM // _BLOCK),
-    )
+    return q.to(torch.float64) * s.repeat_interleave(_BLOCK, dim=dim)
 
 
 def _quant_out_colwise(y: torch.Tensor):
     """FP32 [T, nh, 192] -> columnwise 32x1 codes (un-transposed) + scales."""
     tokens, nh, _ = y.shape
-    s_t, q_t = to_mx(
-        y.reshape(tokens, nh * HEAD_DIM).t().contiguous(),
-        _E4M3,
-        _BLOCK,
-        scaling_mode=_RCEIL,
-    )
+    q_t, sf_t = _quant_rowwise(y.reshape(tokens, nh * HEAD_DIM).t().contiguous())
     codes = q_t.t().contiguous().reshape(tokens, nh, HEAD_DIM)
-    scales = (
-        s_t.view(_E8M0)
-        .view(torch.uint8)
-        .t()
-        .contiguous()
-        .reshape(tokens // _BLOCK, nh, HEAD_DIM)
-    )
+    scales = sf_t.t().contiguous().reshape(tokens // _BLOCK, nh, HEAD_DIM)
     return codes, scales
 
 
 def _rope_tables(tokens: int, device):
-    """Random-angle BF16 tables in the kernel's duplicated-freq halves layout.
-
-    The kernel applies table column ``j`` to output half ``j`` and column
-    ``32 + j`` to half ``32 + j``; the rotation identity requires
-    ``cos[:, :32] == cos[:, 32:]``, so the tables MUST be built duplicated.
-    """
-    theta = torch.rand(tokens, 32, device=device) * (2 * math.pi)
+    """Random-angle BF16 tables in the kernel's duplicated-freq halves layout
+    (the rotation identity requires ``cos[:, :32] == cos[:, 32:]``; see the op
+    module docstring for the per-output-half semantics)."""
+    theta = torch.rand(tokens, 32, device=device) * (2 * torch.pi)
     cos32, sin32 = theta.cos(), theta.sin()
     return (
         torch.cat([cos32, cos32], dim=-1).bfloat16().contiguous(),
@@ -143,11 +100,9 @@ def _rope_tables(tokens: int, device):
 _CASES = {
     # name: (in_features K, num_heads, tokens)
     #
-    # num_heads floor: the kernel is numerically WRONG below 8 heads (probed
-    # 2026-08-30: nh in {2, 4, 6} lands at 2-11 dB with ~20% code mismatches
-    # on at least one dtype path; nh >= 8 is clean on everything tested), so
-    # the smallest case pins nh=8, the smallest verified-correct head count.
-    "minimal": (256, 8, 128),  # one TILE_M tile, smallest verified head count
+    # nh floor: head counts below 8 are numerically corrupt (MIN_NUM_HEADS;
+    # probe and measurements in the op module docstring).
+    "minimal": (256, 8, 128),  # one TILE_M tile
     "671b": (1536, 128, 256),  # DeepSeek-V3 671B wq_b dims (the kernel's design point)
     "16b": (2048, 16, 256),  # DeepSeek-V3 16B wq dims
     "16b_big": (2048, 16, 4096),  # multi-tile scale relay at a realistic token count
@@ -157,7 +112,7 @@ _CASES = {
 def _build_case(K, num_heads, tokens, device="cuda", seed=0):
     torch.manual_seed(seed)
     N = num_heads * HEAD_DIM
-    c = {"tokens": tokens, "num_heads": num_heads}
+    c = {}
     c["x"] = torch.randn(tokens, K, dtype=torch.bfloat16, device=device)
     c["w"] = torch.randn(N, K, dtype=torch.bfloat16, device=device) / (K**0.5)
     c["cos"], c["sin"] = _rope_tables(tokens, device)
@@ -167,8 +122,7 @@ def _build_case(K, num_heads, tokens, device="cuda", seed=0):
 
 
 # ---------------------------------------------------------------------------
-# PyTorch reference: dequantization, FP64 matmul, BF16 staging, halves RoPE,
-# to_mx requantization -- nothing else.
+# PyTorch reference and gates.
 # ---------------------------------------------------------------------------
 
 # Matched-requant agreement (both sides carry the identical to_mx/RCEIL output
@@ -199,7 +153,7 @@ def _ref_mla_q_proj_rope(x, w, cos, sin, x_scale=None, w_scale=None):
     if x_scale is None:
         x_f64, w_f64 = x.double(), w.double()
     else:
-        x_f64, w_f64 = _dequant_input(x, x_scale), _dequant_input(w, w_scale)
+        x_f64, w_f64 = _dequant(x, x_scale), _dequant(w, w_scale)
     y = (x_f64 @ w_f64.t()).float().bfloat16().float()
     y = y.view(tokens, num_heads, HEAD_DIM)
 
@@ -212,7 +166,7 @@ def _ref_mla_q_proj_rope(x, w, cos, sin, x_scale=None, w_scale=None):
         dim=-1,
     )
     y = torch.cat([y[..., :QK_NOPE_HEAD_DIM], rot], dim=-1)
-    return (*_quant_out_rowwise(y), *_quant_out_colwise(y))
+    return (*_quant_rowwise(y), *_quant_out_colwise(y))
 
 
 def _mismatch_fraction(actual: torch.Tensor, ref: torch.Tensor) -> float:
@@ -233,8 +187,13 @@ def _assert_outputs_match(outs, refs, label):
             f"{label} {name} byte mismatch fraction {frac} exceeds {budget}"
         )
     for name, actual, ref in (
-        ("row", _dequant_rowwise(q_row, row_sf), _dequant_rowwise(r_row, r_row_sf)),
-        ("col", _dequant_colwise(q_col, col_sf), _dequant_colwise(r_col, r_col_sf)),
+        # row scales sit along HEAD_DIM (dim=-1); col scales along tokens (dim=0).
+        ("row", _dequant(q_row, row_sf).float(), _dequant(r_row, r_row_sf).float()),
+        (
+            "col",
+            _dequant(q_col, col_sf, dim=0).float(),
+            _dequant(r_col, r_col_sf, dim=0).float(),
+        ),
     ):
         sqnr = compute_error(ref, actual).item()
         assert sqnr >= _MIN_SQNR_MATCHED_REQUANT, (
@@ -243,19 +202,14 @@ def _assert_outputs_match(outs, refs, label):
         )
 
 
+@pytest.mark.parametrize("path", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("case", list(_CASES))
-def test_mxfp8_mla_q_proj_rope_cudnn_bf16_matches_reference(case):
+def test_mxfp8_mla_q_proj_rope_cudnn_matches_reference(case, path):
     c = _build_case(*_CASES[case])
-    args = (c["x"], c["w"], c["cos"], c["sin"])
+    if path == "bf16":
+        args = (c["x"], c["w"], c["cos"], c["sin"])
+    else:
+        args = (c["x_q"], c["w_q"], c["cos"], c["sin"], c["x_sf"], c["w_sf"])
     outs = _OPS.mxfp8_mla_q_proj_rope_cudnn(*args)
     refs = _ref_mla_q_proj_rope(*args)
-    _assert_outputs_match(outs, refs, f"{case} bf16")
-
-
-@pytest.mark.parametrize("case", list(_CASES))
-def test_mxfp8_mla_q_proj_rope_cudnn_mxfp8_matches_reference(case):
-    c = _build_case(*_CASES[case])
-    args = (c["x_q"], c["w_q"], c["cos"], c["sin"], c["x_sf"], c["w_sf"])
-    outs = _OPS.mxfp8_mla_q_proj_rope_cudnn(*args)
-    refs = _ref_mla_q_proj_rope(*args)
-    _assert_outputs_match(outs, refs, f"{case} mxfp8")
+    _assert_outputs_match(outs, refs, f"{case} {path}")

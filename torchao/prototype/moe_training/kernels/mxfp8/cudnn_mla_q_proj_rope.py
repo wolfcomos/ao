@@ -8,15 +8,16 @@
 
 One custom op, one launch of the ``cudnn.gemm_proj_rope_mxfp8_wrapper_sm100``
 kernel from the standalone cudnn-frontend python package (>= 1.27, Blackwell
-SM100+; no TransformerEngine dependency), ported from the fusion TE PR #3303
-wires for DeepSeek-V3 MLA MXFP8 training; the matching public wrapper lives at
-the bottom of this module:
+SM 10.0 exactly -- the wrapper is sm100-specific; no TransformerEngine
+dependency), ported from the fusion TE PR #3303 wires for DeepSeek-V3 MLA
+MXFP8 training; the matching public wrapper lives at the bottom of this
+module:
 
 * :func:`mxfp8_mla_q_proj_rope_cudnn` -- Q-projection GEMM (BF16, or MXFP8 on
   prequantized operands) + per-head YARN RoPE on the trailing 64 features of
   each 192-feature head + rowwise 1x32 AND columnwise 32x1 MXFP8 RCEIL
-  quantization of the projected Q, with the GEMM accumulator staged through
-  BF16 before RoPE (matching the unfused BF16-output GEMM -> RoPE chain).
+  quantization of the projected Q (BF16-staged accumulator; see the op
+  docstring).
 
 CONTRACT: ``tokens`` (the flattened token count) must be a positive multiple
 of **128** -- the kernel tiles one head per CTA with ``TILE_M = 128`` and has
@@ -40,11 +41,6 @@ for BOTH product terms and output half ``32 + j`` uses column ``32 + j``, so
 the rotation identity holds ONLY for duplicated tables -- a non-duplicated
 table produces a silent non-rotation. YARN lives in the table values (and any
 mscale in the caller's softmax scale); the op applies no scaling of its own.
-
-All tensors must be CUDA, same device, C-contiguous. Scale tensors are uint8
-E8M0, unswizzled: rowwise ``[tokens, num_heads, 6]`` (block-32 along
-HEAD_DIM), columnwise ``[tokens // 32, num_heads, 192]`` (block-32 along
-tokens, codes NOT transposed).
 
 Importing this module registers the ``torchao::`` custom op; the ``cudnn``
 package itself is imported lazily inside the op body at first real launch.
@@ -94,13 +90,11 @@ def is_supported(
 ) -> bool:
     """True when the head geometry matches the kernel's fixed 128+64 epilogue,
     ``in_features`` is a positive multiple of 128, and ``num_heads`` is an
-    EVEN count of at least :data:`MIN_NUM_HEADS` (the MXFP8 path's SFB
-    scale-relay pairs heads -- an odd count reads out of bounds silently --
-    and head counts below 8 produce corrupt output despite passing the
-    kernel's own ``check_support``). Integration code must ALSO guarantee the
-    runtime contract (flattened tokens a positive multiple of 128,
-    C-contiguous CUDA tensors): token counts are runtime values and are not
-    checkable here."""
+    EVEN count of at least :data:`MIN_NUM_HEADS` (see the module docstring for
+    the scale-relay OOB and small-head-count corruption rationale).
+    Integration code must ALSO guarantee the runtime contract (flattened
+    tokens a positive multiple of 128, C-contiguous CUDA tensors): token
+    counts are runtime values and are not checkable here."""
     return (
         qk_nope_head_dim == QK_NOPE_HEAD_DIM
         and qk_rope_head_dim == QK_ROPE_HEAD_DIM
@@ -185,10 +179,10 @@ def _mxfp8_mla_q_proj_rope_cudnn(
 
     Returns ``(q_row_q, q_row_sf, q_col_q, q_col_sf)``:
       q_row_q  E4M3 ``[tokens, num_heads, 192]`` contiguous, rowwise 1x32
-               quantized; q_row_sf uint8 ``[tokens, num_heads, 6]``.
+               quantized; q_row_sf uint8 E8M0 ``[tokens, num_heads, 6]``.
       q_col_q  E4M3 ``[tokens, num_heads, 192]`` contiguous columnwise 32x1
                quantized bytes (un-transposed kernel layout); q_col_sf uint8
-               ``[tokens // 32, num_heads, 192]``. Scales unswizzled.
+               E8M0 ``[tokens // 32, num_heads, 192]``. Scales unswizzled.
 
     The GEMM accumulator is staged through BF16 before the fp32 RoPE and the
     quantize, so numerics match the unfused BF16-output GEMM -> RoPE ->
