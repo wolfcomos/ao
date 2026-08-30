@@ -26,7 +26,10 @@ feature count must equal ``num_heads * 192``. On the MXFP8 input path
 ``in_features`` must be a multiple of **128** (the kernel derives its
 compact-scale words as ``in_features // 128``) and ``num_heads`` must be
 EVEN -- the kernel's SFB scale-relay pairs heads, and an odd count reads past
-the weight-scale buffer SILENTLY.
+the weight-scale buffer SILENTLY. ``num_heads`` must also be at least **8**:
+the kernel's own ``check_support`` accepts 2/4/6 heads, but the outputs are
+numerically corrupt there (measured 1.7-10.8 dB with 12-31% code mismatches
+on at least one dtype path), so :func:`is_supported` refuses them.
 
 RoPE convention (Megatron YARN): the rotary tail is read INTERLEAVED
 (``x1 = q_pe[0::2]``, ``x2 = q_pe[1::2]``) and written HALF-CONCATENATED
@@ -56,6 +59,7 @@ import torch
 __all__ = [
     "DIM_ALIGNMENT",
     "HEAD_DIM",
+    "MIN_NUM_HEADS",
     "QK_NOPE_HEAD_DIM",
     "QK_ROPE_HEAD_DIM",
     "SCALE_BLOCK_SIZE",
@@ -74,6 +78,9 @@ HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 TOKEN_ALIGNMENT = 128
 # in_features granularity on the MXFP8 input path (compact-scale words).
 DIM_ALIGNMENT = 128
+# Smallest head count with correct kernel output: 2/4/6 pass the kernel's own
+# check_support but produce corrupt values (see the module docstring).
+MIN_NUM_HEADS = 8
 
 _E4M3 = torch.float8_e4m3fn
 _BLOCK = SCALE_BLOCK_SIZE
@@ -86,10 +93,12 @@ def is_supported(
     num_heads: int,
 ) -> bool:
     """True when the head geometry matches the kernel's fixed 128+64 epilogue,
-    ``in_features`` is a positive multiple of 128, and ``num_heads`` is a
-    positive EVEN count (the MXFP8 path's SFB scale-relay pairs heads; an odd
-    count reads out of bounds silently). Integration code must ALSO guarantee
-    the runtime contract (flattened tokens a positive multiple of 128,
+    ``in_features`` is a positive multiple of 128, and ``num_heads`` is an
+    EVEN count of at least :data:`MIN_NUM_HEADS` (the MXFP8 path's SFB
+    scale-relay pairs heads -- an odd count reads out of bounds silently --
+    and head counts below 8 produce corrupt output despite passing the
+    kernel's own ``check_support``). Integration code must ALSO guarantee the
+    runtime contract (flattened tokens a positive multiple of 128,
     C-contiguous CUDA tensors): token counts are runtime values and are not
     checkable here."""
     return (
@@ -97,7 +106,7 @@ def is_supported(
         and qk_rope_head_dim == QK_ROPE_HEAD_DIM
         and in_features > 0
         and in_features % DIM_ALIGNMENT == 0
-        and num_heads > 0
+        and num_heads >= MIN_NUM_HEADS
         and num_heads % 2 == 0
     )
 
