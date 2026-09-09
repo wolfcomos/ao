@@ -7,6 +7,9 @@ Two kernels, both built on the same single A load shared by two consumers (the M
 does the columnwise RHT, a row warp group reads the same tile):
   - _Tcgen05RowColFused: quantizes col=RHT(A.t()) and row=A to NVFP4.
   - _Tcgen05RhtAmax: reduces col=max|RHT(A.t())|, row=max|A|.
+
+A third kernel, ``_RowCastQuantize`` (end of file), is the rowwise 1x16 weight cast of a
+dense expert stack on plain CUDA cores -- no MMA/TMA -- reusing the rowwise helper chain.
 """
 
 import functools
@@ -841,6 +844,26 @@ def _quant16(
     )
 
 
+def _global_scale(amax):
+    """NVFP4 two-level scale scalars from a global amax (TE :779-785).
+
+    Returns ``(encode, decode, encode / fp4_max)``; a zero amax yields identity
+    scales so the block scales stay finite.
+    """
+    is_zero = amax == cutlass.Float32(0.0)
+    safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
+    c = _min_f32(
+        _div_rn_f32(cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe),
+        cutlass.Float32(FP32_MAX),
+    )
+    c = cutlass.Float32(
+        cutlass.select_(c == cutlass.Float32(0.0), cutlass.Float32(1.0), c)
+    )
+    enc = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), c))
+    dec = _div_rn_f32(cutlass.Float32(1.0), enc)
+    return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
+
+
 class _Tcgen05RowColFused:
     def __init__(
         self,
@@ -1325,20 +1348,6 @@ class _Tcgen05RowColFused:
 
         tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, M, col_groups, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
-
-        def _global_scale(amax):
-            is_zero = amax == cutlass.Float32(0.0)
-            safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
-            c = _min_f32(
-                _div_rn_f32(cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe),
-                cutlass.Float32(FP32_MAX),
-            )
-            c = cutlass.Float32(
-                cutlass.select_(c == cutlass.Float32(0.0), cutlass.Float32(1.0), c)
-            )
-            enc = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), c))
-            dec = _div_rn_f32(cutlass.Float32(1.0), enc)
-            return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
 
         # Ungrouped: one global scale pair for the whole launch. Grouped: the epilogues overwrite
         # these per work tile from that tile's expert; the hoisted pair still has to be computed
@@ -2735,3 +2744,216 @@ def _cutedsl_group_weight_quantize_2d_impl(
     )
     # uint32 -> uint8 quadruples the last extent: (E, M, N//8) -> (E, M, N//2).
     return row_fp4.view(torch.uint8), row_sf, col_fp4.view(torch.uint8), col_sf
+
+
+# ---------------------------------------------------------------------------
+# Rowwise 1x16 weight cast (no RHT, RTNE) -- plain CUDA-core streaming kernel
+# ---------------------------------------------------------------------------
+ROW_CAST_THREADS = 128  # 16 rows x 8 blocks of 16 columns per CTA step
+ROW_CAST_CTAS_PER_SM = 8  # resident CTAs per SM the y-grid is sized for
+
+
+class _RowCastQuantize:
+    """Per-expert rowwise 1x16 NVFP4 E2M1 cast of a dense ``(E, M, N)`` bf16 stack.
+
+    Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, by, e)`` walks the 128-row blocks
+    ``by, by + GRID_Y, ...`` of column tile ``cn`` of expert ``e``, so no CTA straddles
+    an expert and the expert's global scale is loop-invariant. Thread ``t`` owns the
+    16-column block ``b = t % 8`` of slab row ``t // 8``; eight unrolled 16-row steps
+    cover the block. Per 1x16 block the arithmetic is the fused kernel's rowwise path
+    verbatim (``_global_scale`` + ``_quant16``), so the output is the Triton op's byte
+    for byte; only the addressing is new. No MMA, TMA, SMEM or atomics.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,  # (E*M*N/2,) u32 = A.view(torch.uint32).view(-1)
+        mRowFP4: cute.Tensor,  # (E*M*N/8,) u32 = row_fp4.view(-1)
+        mRowSF: cute.Tensor,  # (E*M*N/16,) e4m3 = row_sf.view(-1)
+        row_amax_t: cute.Tensor,  # (E,) f32
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(mA, mRowFP4, mRowSF, row_amax_t, N, m_blocks, GRID_Y).launch(
+            grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
+            block=(ROW_CAST_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mA: cute.Tensor,
+        mRowFP4: cute.Tensor,
+        mRowSF: cute.Tensor,
+        row_amax_t: cute.Tensor,
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cn, by, e = cute.arch.block_idx()
+        b = tidx % cutlass.Int32(8)  # 16-column block within the 128-column tile
+        r_slab = tidx // cutlass.Int32(8)  # row within a 16-row step
+
+        # One expert per CTA: its two-level scale is hoisted out of the loop.
+        _, dec, enc_over_fp4max = _global_scale(row_amax_t[e])
+
+        row_bytes = cutlass.Int64(N) * cutlass.Int64(2)
+        code_pitch = cutlass.Int64(N // cutlass.Int32(2))
+        # SF bytes per 128-row block of one expert: (N // 64) atoms of 512 B.
+        sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
+        first_row = e * m_blocks * cutlass.Int32(M_TILE) + r_slab  # Int32: E*M < 2^31
+        # Byte offsets are Int64 (E*M*N*2 passes 2^31 at DeepSeek shapes). A: row pitch is a
+        # multiple of 256 B (N % 128), so every 32 B block is 16-B aligned; codes: pitch N/2 is
+        # a multiple of 64 B, so every 8 B word is 8-B aligned.
+        a_base = (
+            mA.iterator.toint()
+            + cutlass.Int64(first_row) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(2 * M_TILE) + b * cutlass.Int32(32))
+        )
+        q_base = (
+            mRowFP4.iterator.toint()
+            + cutlass.Int64(first_row) * code_pitch
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2) + b * cutlass.Int32(8))
+        )
+        # swizzled SF[r, c] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4] (the scale-factor
+        # layout above); here c = cn*8 + b, so the atom is 2*cn + b//4 and the byte
+        # within the row is b%4.
+        sf_base = (
+            e * m_blocks * sf_rb_bytes
+            + (cn * cutlass.Int32(2) + b // cutlass.Int32(4)) * cutlass.Int32(SF_BLK)
+            + r_slab * cutlass.Int32(16)
+            + b % cutlass.Int32(4)
+        )
+
+        blk = cute.make_rmem_tensor((16,), cutlass.Float32)
+        for rb in cutlass.range(by, m_blocks, GRID_Y):
+            a_blk = a_base + cutlass.Int64(rb) * (row_bytes * cutlass.Int64(M_TILE))
+            q_blk = q_base + cutlass.Int64(rb) * (code_pitch * cutlass.Int64(M_TILE))
+            sf_blk = sf_base + rb * sf_rb_bytes
+            for s in cutlass.range_constexpr(M_TILE // 16):  # r_loc = 16*s + r_slab
+                a_addr = a_blk + cutlass.Int64(16 * s) * row_bytes
+                # Two 16-B vector loads = the 16 bf16 of one 1x16 block, as packed u32 pairs.
+                v0 = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint32, a_addr, cute.AddressSpace.gmem, assumed_align=16
+                    ),
+                    cute.make_layout((4,)),
+                ).load()
+                v1 = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint32,
+                        a_addr + cutlass.Int64(16),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((4,)),
+                ).load()
+                for j in cutlass.range_constexpr(4):
+                    blk[2 * j] = _bf16lo_to_f32(v0[j])
+                    blk[2 * j + 1] = _bf16hi_to_f32(v0[j])
+                    blk[8 + 2 * j] = _bf16lo_to_f32(v1[j])
+                    blk[8 + 2 * j + 1] = _bf16hi_to_f32(v1[j])
+                w0, w1, sf = _quant16(blk, enc_over_fp4max, dec)
+                q_ptr = cute.make_ptr(
+                    cutlass.Uint64,
+                    q_blk + cutlass.Int64(16 * s) * code_pitch,
+                    cute.AddressSpace.gmem,
+                    assumed_align=8,
+                )
+                cute.make_tensor(q_ptr, cute.make_layout((1,)))[0] = cutlass.Uint64(
+                    w0
+                ) | (cutlass.Uint64(w1) << 32)
+                # r_loc % 32 = 16*(s % 2) + r_slab (in sf_base), r_loc // 32 = s // 2
+                mRowSF[sf_blk + cutlass.Int32((16 * (s % 2)) * 16 + (s // 2) * 4)] = sf
+
+
+# Every parameter is required and every caller passes it positionally: an lru_cache key is
+# the literal (args, kwargs) shape (see _compile_fused_kernel).
+@functools.lru_cache(maxsize=None)
+def _compile_row_cast_quantize_kernel(device_idx):
+    """Compile the rowwise 1x16 weight cast with symbolic extents (cached per device).
+
+    ``A`` and the codes are handed over as flat u32 views with ``assumed_align=16`` (the
+    row pitches are multiples of 256 B and 64 B, so every 32 B block and 8 B code word is
+    aligned); the scales as the flat e4m3 run of 512 B atoms. N, the per-expert 128-row
+    block count, the y-grid and E are runtime Int32 args.
+    """
+    free = cute.sym_int
+    fake_a = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16)
+    fake_rfp4 = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_rsf = make_fake_tensor(cutlass.Float8E4M3FN, (free(),), stride=(1,))
+    fake_row_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    return cute.compile(
+        _RowCastQuantize(),
+        fake_a,
+        fake_rfp4,
+        fake_rsf,
+        fake_row_amax,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_row_cast_quantize_impl(
+    A: torch.Tensor, global_amax: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dense-expert rowwise 1x16 NVFP4 E2M1 weight quantize, RTNE, no RHT.
+
+    One launch over the whole ``(E, M, N)`` stack; the expert is the grid's z coordinate
+    and ``global_amax[e]`` its only expert-dependent input. Per 1x16 block the arithmetic
+    is the fused kernel's rowwise path, so the output is bitwise the Triton op's.
+
+    Args:
+        A: (E, M, N) bfloat16, contiguous, 16-B aligned. M % 128 == 0, N % 128 == 0,
+            E*M*N < 2**32 (the flat u32 view's 32-bit extent).
+        global_amax: (E,) float32 per-expert ``A[e].float().abs().max()``.
+
+    Returns:
+        (E, M, N//2) u8 rowwise codes, (E, M//128, N//64, 32, 16) fp8 rowwise swizzled SF.
+    """
+    E, M, N = A.shape
+    # Non-differentiable op (autograd owned by the outer Function); detach so the input passed
+    # to the kernel never carries autograd state.
+    A = A.detach()
+    dev = A.device
+
+    row_fp4 = torch.empty((E, M, N // 8), dtype=torch.uint32, device=dev)
+    row_sf = torch.empty(
+        (E, M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    # An empty stack (E, M or N = 0) passes validation and has nothing to quantize: a zero
+    # grid dimension is a launch error here where the Triton launcher simply skips it.
+    if A.numel() == 0:
+        return row_fp4.view(torch.uint8), row_sf
+
+    m_blocks = M // M_TILE
+    NUM_SMS = _get_num_sms(dev.index)
+    GRID_Y = min(m_blocks, -(-ROW_CAST_CTAS_PER_SM * NUM_SMS // (E * (N // M_TILE))))
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    row_cast = _compile_row_cast_quantize_kernel(dev.index)
+    row_cast(
+        A.view(torch.uint32).view(-1),
+        row_fp4.view(-1),
+        row_sf.view(-1),
+        global_amax,
+        int(N),
+        int(m_blocks),
+        int(GRID_Y),
+        int(E),
+        stream,
+    )
+    # uint32 -> uint8 quadruples the last extent: (E, M, N//8) -> (E, M, N//2).
+    return row_fp4.view(torch.uint8), row_sf

@@ -102,6 +102,7 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     from ._cutedsl_kernels_impl import (
         _compile_amax_tc_kernel,
         _compile_fused_kernel,
+        _compile_row_cast_quantize_kernel,
         _get_identity_buffer,
         _get_rht_buffer,
         _get_sr_rng_buffer,
@@ -132,6 +133,8 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
                 _compile_fused_kernel(idx, True, sr, True, False, col_groups, fast_math)
         for grouped in (False, True):
             _compile_fused_kernel(idx, True, False, False, grouped, col_groups, False)
+    # The rowwise 1x16 weight cast has no flags: one compile.
+    _compile_row_cast_quantize_kernel(idx)
 
     # Same for the grouped (per-expert MoE) kernels, which tile at 128 rows already.
     from ._cutedsl_group_kernels_impl import (

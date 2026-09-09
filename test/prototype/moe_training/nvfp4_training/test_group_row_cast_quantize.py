@@ -10,12 +10,22 @@ Test order follows the doc's rule for grouped kernels: prove ``num_tensors = 1``
 against the linear reference first, then multi-expert, then group isolation. A kernel
 that is wrong only at ``E > 1`` has a group-index bug, not a numerics bug, and the
 ordering is what makes that distinction readable from the failure list.
+
+Both backends implement the same op and are selected by the ``kernel`` parametrization
+(see ``_KERNELS``); under RTNE they are bitwise interchangeable
+(``test_cutedsl_group_row_cast_quantize_matches_triton``).
 """
 
 import pytest
 import torch
 from torch.utils._triton import has_triton
 
+from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
+    cutedsl_group_row_cast_quantize,
+)
+from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+    cutedsl_nvfp4_kernels_available,
+)
 from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 from ._assertions import assert_codes_bitwise, assert_scales_bitwise
@@ -49,6 +59,19 @@ def _needs_kernel(fn):
     return _maybe_sm100(_requires_kernel(fn))
 
 
+_skip_no_cutedsl = pytest.mark.skipif(
+    not cutedsl_nvfp4_kernels_available(),
+    reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
+)
+
+# Both backends share one signature. Every test also needs the Triton amax producer, so
+# the triton param rides on the test's own SM100 gate and only cutedsl carries a mark.
+_KERNELS = [
+    pytest.param("triton", id="triton"),
+    pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
+]
+
+
 if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
     from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
         triton_group_row_cast_quantize,
@@ -63,14 +86,24 @@ def _weights(E, M, N, *, seed=0, scale=0.05):
     return (torch.randn(E, M, N, device="cuda") * scale).bfloat16()
 
 
+def _row_cast_quantize(kernel, W, amax, E):
+    op = (
+        triton_group_row_cast_quantize
+        if kernel == "triton"
+        else cutedsl_group_row_cast_quantize
+    )
+    return op(W, amax, E)
+
+
 # ---------------------------------------------------------------------------
 # 1. Degeneracy, 2. multi-expert, 3. per-expert isolation
 # ---------------------------------------------------------------------------
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_single_expert_matches_the_linear_reference():
+def test_single_expert_matches_the_linear_reference(kernel):
     """``num_tensors = 1`` is bitwise equal to the plain 1x16 reference.
 
     This is the case the V1_REQUANT and V2 dense linears actually run, so it is the
@@ -78,19 +111,20 @@ def test_single_expert_matches_the_linear_reference():
     """
     W = _weights(1, 256, 512)
     amax = triton_group_weight_amax(W, 1)
-    codes, scales = triton_group_row_cast_quantize(W, amax, 1)
+    codes, scales = _row_cast_quantize(kernel, W, amax, 1)
     ref = reference_row_cast_quantize(W[0], amax[0])
     assert_codes_bitwise(codes[0], ref.codes, "codes")
     assert_scales_bitwise(scales[0], ref.scales, "scales")
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("E", [2, 4, 8])
 @torch.no_grad()
-def test_multi_expert_matches_the_reference_per_expert(E):
+def test_multi_expert_matches_the_reference_per_expert(kernel, E):
     W = _weights(E, 256, 512)
     amax = triton_group_weight_amax(W, E)
-    codes, scales = triton_group_row_cast_quantize(W, amax, E)
+    codes, scales = _row_cast_quantize(kernel, W, amax, E)
     for e in range(E):
         ref = reference_row_cast_quantize(W[e], amax[e])
         assert_codes_bitwise(codes[e], ref.codes, f"codes[{e}]")
@@ -98,8 +132,9 @@ def test_multi_expert_matches_the_reference_per_expert(E):
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_per_expert_amax_is_not_a_global_reduction():
+def test_per_expert_amax_is_not_a_global_reduction(kernel):
     """Expert ``g`` must use ``global_amax[g]``.
 
     One expert is scaled up by 1000x. Under a global reduction every other expert's
@@ -108,12 +143,12 @@ def test_per_expert_amax_is_not_a_global_reduction():
     E = 4
     W = _weights(E, 256, 512)
     amax = triton_group_weight_amax(W, E)
-    baseline = triton_group_row_cast_quantize(W, amax, E)
+    baseline = _row_cast_quantize(kernel, W, amax, E)
 
     W_hot = W.clone()
     W_hot[1] *= 1000.0
     amax_hot = triton_group_weight_amax(W_hot, E)
-    hot = triton_group_row_cast_quantize(W_hot, amax_hot, E)
+    hot = _row_cast_quantize(kernel, W_hot, amax_hot, E)
 
     for e in range(E):
         if e == 1:
@@ -123,13 +158,14 @@ def test_per_expert_amax_is_not_a_global_reduction():
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_one_zero_expert_leaves_its_neighbours_alone():
+def test_one_zero_expert_leaves_its_neighbours_alone(kernel):
     E = 4
     W = _weights(E, 256, 512)
     W[2] = 0.0
     amax = triton_group_weight_amax(W, E)
-    codes, scales = triton_group_row_cast_quantize(W, amax, E)
+    codes, scales = _row_cast_quantize(kernel, W, amax, E)
     assert (codes[2] == 0).all(), "zero expert must produce zero codes"
     assert (scales[2].view(torch.uint8) == 0).all(), (
         "zero expert must produce zero scales"
@@ -145,8 +181,9 @@ def test_one_zero_expert_leaves_its_neighbours_alone():
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_scale_count_is_1x16_not_16x16():
+def test_scale_count_is_1x16_not_16x16(kernel):
     """``M * N / 16`` logical scales, not ``M * N / 256``.
 
     The whole point of replacing the 2D weight quantize: a row no longer shares its
@@ -155,13 +192,14 @@ def test_scale_count_is_1x16_not_16x16():
     E, M, N = 1, 256, 512
     W = _weights(E, M, N)
     amax = triton_group_weight_amax(W, E)
-    _, scales = triton_group_row_cast_quantize(W, amax, E)
+    _, scales = _row_cast_quantize(kernel, W, amax, E)
     assert scales[0].numel() == M * N // 16
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_rows_in_one_16x16_tile_get_independent_scales():
+def test_rows_in_one_16x16_tile_get_independent_scales(kernel):
     """Under the 2D scheme these two rows were forced to share a scale byte.
 
     Row 0 is tiny and row 1 is large within the same 16x16 tile; 1x16 scaling must
@@ -173,7 +211,7 @@ def test_rows_in_one_16x16_tile_get_independent_scales():
     W[0, 0, :] = 1e-4
     W[0, 1, :] = 1.0
     amax = triton_group_weight_amax(W, E)
-    _, scales = triton_group_row_cast_quantize(W, amax, E)
+    _, scales = _row_cast_quantize(kernel, W, amax, E)
     ref = reference_row_cast_quantize(W[0], amax[0])
     assert_scales_bitwise(scales[0], ref.scales, "scales")
     assert not torch.equal(
@@ -182,8 +220,9 @@ def test_rows_in_one_16x16_tile_get_independent_scales():
 
 
 @_needs_kernel
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_rowwise_error_is_no_worse_than_the_2d_scheme():
+def test_rowwise_error_is_no_worse_than_the_2d_scheme(kernel):
     """In aggregate, 1x16 error < 16x16 error -- the claim the recipe rests on.
 
     Aggregate and not per block, which is the tempting form and is false. A 1x16 scale
@@ -198,7 +237,7 @@ def test_rowwise_error_is_no_worse_than_the_2d_scheme():
     E, M, N = 1, 256, 512
     W = _weights(E, M, N)
     amax = triton_group_weight_amax(W, E)
-    codes, scales = triton_group_row_cast_quantize(W, amax, E)
+    codes, scales = _row_cast_quantize(kernel, W, amax, E)
     err_1d = (dequantize(codes[0], scales[0], amax[0]) - W[0].float()).abs()
 
     ref_2d, _ = reference_weight_quantize_2d(W[0], amax[0])
@@ -207,14 +246,41 @@ def test_rowwise_error_is_no_worse_than_the_2d_scheme():
     assert err_1d.sum() < 0.95 * err_2d.sum()
 
 
+# Shapes that differ from the reference tests' (E, 256, 512): one tile, an odd number of
+# 128-row blocks, many experts with three column tiles, and a DeepSeek-16B expert.
+_BITWISE_SHAPES = [
+    pytest.param((1, 128, 128), id="one-tile"),
+    pytest.param((3, 256, 512), id="multi-tile"),
+    pytest.param((2, 384, 256), id="odd-row-blocks"),
+    pytest.param((8, 128, 384), id="many-experts"),
+    pytest.param((2, 2048, 1408), id="deepseek-16B-down"),
+]
+
+
+@_needs_kernel
+@_skip_no_cutedsl
+@pytest.mark.parametrize("shape", _BITWISE_SHAPES)
+@torch.no_grad()
+def test_cutedsl_group_row_cast_quantize_matches_triton(shape):
+    """The two backends are byte-for-byte interchangeable, codes as well as scales."""
+    E, M, N = shape
+    W = _weights(E, M, N, seed=3)
+    amax = triton_group_weight_amax(W, E)
+    cutedsl = _row_cast_quantize("cutedsl", W, amax, E)
+    triton_out = _row_cast_quantize("triton", W, amax, E)
+    for name, c, t in zip(("codes", "scales"), cutedsl, triton_out):
+        assert torch.equal(c, t), f"{name} differs between backends"
+
+
 # ---------------------------------------------------------------------------
 # Wrapper-layer tests -- these run today, no kernel body required
 # ---------------------------------------------------------------------------
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_return_arity_is_two_with_no_columnwise_output():
+def test_return_arity_is_two_with_no_columnwise_output(kernel):
     """Asserted through ``register_fake`` so it holds without a kernel body.
 
     The columnwise operand is deliberately absent: it is rebuilt in backward by
@@ -227,7 +293,7 @@ def test_return_arity_is_two_with_no_columnwise_output():
     with FakeTensorMode():
         W = torch.empty(E, M, N, dtype=torch.bfloat16, device="cuda")
         amax = torch.empty(E, dtype=torch.float32, device="cuda")
-        out = triton_group_row_cast_quantize(W, amax, E)
+        out = _row_cast_quantize(kernel, W, amax, E)
     assert len(out) == 2
     codes, scales = out
     assert codes.shape == (E, M, N // 2) and codes.dtype == torch.uint8
@@ -236,6 +302,7 @@ def test_return_arity_is_two_with_no_columnwise_output():
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize(
     "mutate, message",
     [
@@ -251,9 +318,9 @@ def test_return_arity_is_two_with_no_columnwise_output():
     ],
 )
 @torch.no_grad()
-def test_validation_rejects_bad_inputs(mutate, message):
+def test_validation_rejects_bad_inputs(kernel, mutate, message):
     E, M, N = 2, 256, 512
     W = torch.empty(E, M, N, dtype=torch.bfloat16, device="cuda")
     amax = torch.ones(E, dtype=torch.float32, device="cuda")
     with pytest.raises(ValueError, match=message):
-        triton_group_row_cast_quantize(*mutate(W, amax, E))
+        _row_cast_quantize(kernel, *mutate(W, amax, E))

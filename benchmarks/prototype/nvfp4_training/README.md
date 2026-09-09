@@ -917,14 +917,16 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_weight_amax
 `nvfp4_linear` uses this same op at `E = 1` on `W.unsqueeze(0)` — nothing in the kernel
 is expert-specific beyond the `program_id(1)` base.
 
-### Grouped Row Cast Quantize
+### Grouped Row Cast Quantize (`cutedsl_group_row_cast_quantize` vs `triton_group_row_cast_quantize`)
 
-Benchmarks `triton_group_row_cast_quantize` — the rowwise 1x16 replacement for the
-grouped 2D weight quantize in the forward of the V1_REQUANT and V2 recipes. It consumes
-the `(E,)` amax from the section above and emits, per expert, rowwise FP4 codes and
-swizzled e4m3 scales only: every row of 16 gets its own scale instead of one per 16x16
-tile, and there is no columnwise output — the dgrad operand is rebuilt in backward from
-these codes by `group_col_cast_requantize` or `group_col_rht_requantize`. RTNE, no RHT.
+Benchmarks `cutedsl_group_row_cast_quantize` against `triton_group_row_cast_quantize` —
+the rowwise 1x16 replacement for the grouped 2D weight quantize in the forward of the
+V1_REQUANT and V2 recipes. Both consume the `(E,)` amax from the section above and emit,
+per expert, rowwise FP4 codes and swizzled e4m3 scales only: every row of 16 gets its own
+scale instead of one per 16x16 tile, and there is no columnwise output — the dgrad operand
+is rebuilt in backward from these codes by `group_col_cast_requantize` or
+`group_col_rht_requantize`. RTNE, no RHT; the two backends produce bitwise identical
+output, codes and scale factors.
 
 ```bash
 python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_quantize
@@ -937,22 +939,27 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_quantize
   scales — 2.5625 bytes per element against the 2D kernel's 3.125.
 - Runs at `E = 4`; see the note at the top of this section.
 - Unlike the rest of this section, measured on a GB200 with the SM application clock
-  capped at 1200 MHz, PyTorch 2.14.0a0, CUDA 13.x (pre-release), Triton 3.8.0; median of three full
-  script passes. Its absolute times and GB/s are not comparable with the other tables
-  here; the ratios between shapes are.
+  capped at 1200 MHz, PyTorch 2.14.0a0, CUDA 13.x (pre-release), Triton 3.8.0, nvidia-cutlass-dsl
+  4.8.0.dev0; median of three full script passes. Its absolute times and GB/s are not
+  comparable with the other tables here; the ratios between shapes and the speedup
+  column are.
 
-| model | projection | E | M | N | triton_us | triton_gbps |
-|---|---|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 3.933 | 170.8 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 3.926 | 171.1 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 11.775 | 2510.0 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 11.742 | 2517.2 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 52.265 | 2879.0 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 51.890 | 2899.8 |
+| model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 5.29 | 3.92 | 0.74x | 127.0 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 5.29 | 3.91 | 0.74x | 127.0 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 7.13 | 11.77 | 1.65x | 4146.0 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 6.94 | 11.73 | 1.69x | 4256.4 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 32.26 | 52.25 | 1.62x | 4663.9 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 32.15 | 51.91 | 1.61x | 4680.4 |
 
-At 671B the kernel sustains 2.9 TB/s, 36% of the 7936 GB/s device-properties peak on
-this node, up from 2.5 TB/s at 16B; the debug model's sixteen 128x128 tiles cannot fill
-the GPU and sit at a ~4 us floor regardless of projection.
+CuteDSL wins 1.6-1.7x at 16B and 671B and loses at the debug model (0.74x). At 671B
+it sustains 4.7 TB/s, 59% of the 7936 GB/s device-properties peak on this node, against
+Triton's 2.9 TB/s. Both kernels read `A` with 16-B loads and write codes with 8-B stores;
+the CuteDSL kernel holds 48 registers with no shared memory, barriers or shuffles (each
+thread stores its swizzled scale byte directly), where the Triton kernel at `num_warps = 8`
+holds 107 registers and reduces through shared memory, so it keeps roughly 2.5x the warps
+resident. The debug model launches 16 CTAs on either backend and is latency-bound.
 
 ### NVFP4 V2 grouped Triton kernels
 
