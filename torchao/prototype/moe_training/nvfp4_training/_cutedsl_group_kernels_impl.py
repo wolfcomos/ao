@@ -449,7 +449,11 @@ class _Tcgen05GroupRowColFused(_GroupRhtMainloop):
             ab_mbar: cute.struct.MemRange[cutlass.Int64, MAINLOOP_STAGES * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, ACC_STAGES * 2]
             clc_mbar: cute.struct.MemRange[cutlass.Int64, CLC_STAGES * 2]
-            clc_response: cute.struct.MemRange[cutlass.Int32, CLC_STAGES * 4]
+            # The scheduler reads each response as one 128-bit load, so the range
+            # must carry 16-byte alignment (the struct otherwise aligns to Int64).
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, CLC_STAGES * 4], 16
+            ]
             b_mbar: cutlass.Int64
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
@@ -1189,7 +1193,11 @@ class _Tcgen05GroupRhtAmax(_GroupRhtMainloop):
             ab_mbar: cute.struct.MemRange[cutlass.Int64, MAINLOOP_STAGES * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, ACC_STAGES * 2]
             clc_mbar: cute.struct.MemRange[cutlass.Int64, CLC_STAGES * 2]
-            clc_response: cute.struct.MemRange[cutlass.Int32, CLC_STAGES * 4]
+            # The scheduler reads each response as one 128-bit load, so the range
+            # must carry 16-byte alignment (the struct otherwise aligns to Int64).
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, CLC_STAGES * 4], 16
+            ]
             b_mbar: cutlass.Int64
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
