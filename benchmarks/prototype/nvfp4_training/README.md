@@ -917,6 +917,43 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_weight_amax
 `nvfp4_linear` uses this same op at `E = 1` on `W.unsqueeze(0)` — nothing in the kernel
 is expert-specific beyond the `program_id(1)` base.
 
+### Grouped Row Cast Quantize
+
+Benchmarks `triton_group_row_cast_quantize` — the rowwise 1x16 replacement for the
+grouped 2D weight quantize in the forward of the V1_REQUANT and V2 recipes. It consumes
+the `(E,)` amax from the section above and emits, per expert, rowwise FP4 codes and
+swizzled e4m3 scales only: every row of 16 gets its own scale instead of one per 16x16
+tile, and there is no columnwise output — the dgrad operand is rebuilt in backward from
+these codes by `group_col_cast_requantize` or `group_col_rht_requantize`. RTNE, no RHT.
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_quantize
+```
+
+- Reports **device kernel time** (`bench_utils.kernel_time_us`, CUDA self-time via
+  `torch.profiler`) rather than wall time, for the same reason as the other grouped
+  tables.
+- Bandwidth accounts for the bfloat16 read plus the rowwise FP4 codes and swizzled
+  scales — 2.5625 bytes per element against the 2D kernel's 3.125.
+- Runs at `E = 4`; see the note at the top of this section.
+- Unlike the rest of this section, measured on a GB200 with the SM application clock
+  capped at 1200 MHz, PyTorch 2.14.0a0, CUDA 13.x (pre-release), Triton 3.8.0; median of three full
+  script passes. Its absolute times and GB/s are not comparable with the other tables
+  here; the ratios between shapes are.
+
+| model | projection | E | M | N | triton_us | triton_gbps |
+|---|---|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 3.933 | 170.8 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 3.926 | 171.1 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 11.775 | 2510.0 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 11.742 | 2517.2 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 52.265 | 2879.0 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 51.890 | 2899.8 |
+
+At 671B the kernel sustains 2.9 TB/s, 36% of the 7936 GB/s device-properties peak on
+this node, up from 2.5 TB/s at 16B; the debug model's sixteen 128x128 tiles cannot fill
+the GPU and sit at a ~4 us floor regardless of projection.
+
 ### NVFP4 V2 grouped Triton kernels
 
 Baselines for the nine grouped Triton kernels behind `nvfp4_grouped_mm_v2`: the V2
