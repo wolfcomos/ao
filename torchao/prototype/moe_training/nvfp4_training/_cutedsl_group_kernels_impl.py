@@ -27,6 +27,13 @@ concatenated in one flat allocation. The group-local 64-token tile axis must
 therefore restart at every group boundary; treating the allocation as one
 globally swizzled ``[hidden, packed_tokens]`` buffer gives later groups the
 wrong layout.
+
+A third kernel, ``_Tcgen05GroupRowRhtColRhtAmax``, serves the V2 backward gradient
+amax: both axes are transformed by an RHT-128 with independent sign vectors. It is
+standalone (no CLC, a static persistent grid) and feeds two UMMA chains from one
+TMA'd 128x128 tile against two resident host-built ``R^T`` operands; its
+``RHT128_`` constants are its own, the unprefixed ones above belong to the RHT-16
+kernels.
 """
 
 import functools
@@ -56,6 +63,7 @@ from ._cutedsl_kernels_impl import (
     _bf16hi_to_f32,
     _bf16lo_to_f32,
     _div_rn_f32,
+    _get_num_sms,
     _get_rht_buffer,
     _get_sr_rng_buffer,
     _max_f32,
@@ -1729,3 +1737,584 @@ def _store_sf_byte(mSF, sf, r, c):
             + c % cutlass.Int32(4),
         )
     ] = sf
+
+
+# --- grouped rowwise-RHT + columnwise-RHT amax (RHT-128 on both axes) ---
+# The unprefixed constants above belong to the RHT-16 kernels; ``RHT128_`` names
+# the distinguishing property of this kernel family.
+RHT128_DIM = 128
+RHT128_K_BLOCKS = RHT128_DIM // K  # UMMA K steps per transform
+RHT128_MMA_TILER_COL = (
+    M_TILE,
+    RHT128_DIM,
+    K,
+)  # col chain: M = hidden, N = j, K = tokens
+RHT128_MMA_TILER_ROW = (
+    TOKEN_TILE,
+    RHT128_DIM,
+    K,
+)  # row chain: M = tokens, N = j, K = hidden
+RHT128_CTA_TILE_COL = (M_TILE, RHT128_DIM, TOKEN_TILE)
+RHT128_CTA_TILE_ROW = (TOKEN_TILE, RHT128_DIM, M_TILE)
+RHT128_EPI_TILE = (M_TILE, N_TILE)  # x16 TMEM load atom
+RHT128_B_BYTES = RHT128_DIM * RHT128_DIM * 2  # one resident signed R^T tile
+RHT128_MAINLOOP_STAGES = (
+    _SMEM_CAPACITY - _SMEM_RESERVE - 2 * RHT128_B_BYTES
+) // _A_TILE_BYTES  # 5
+RHT128_ACC_STAGES = 2  # per chain; 2 chains x 2 stages x 128 cols = 512 TMEM cols
+RHT128_ROW_WARP_END = 12  # warps 0 MMA, 1 TMA, 2-3 idle, 4-7 col, 8-11 row
+RHT128_N_WARPS = 12
+RHT128_TPB = 32 * RHT128_N_WARPS
+RHT128_ACC_CONSUMER_WARPS = (COL_WARP_END - COL_WARP_BEGIN) + (
+    RHT128_ROW_WARP_END - ROW_WARP_BEGIN
+)
+
+
+def _static_tile_range(total, cta, n_ctas):
+    """Contiguous balanced chunk ``[begin, end)`` of ``total`` tiles for CTA ``cta``.
+
+    ``begin <= max(total - 1, 0)`` for every ``cta < n_ctas``, so an empty chunk
+    still evaluates ``_group_idx`` on an in-range tile and its final zero flush is
+    a no-op against the pre-zeroed buffer -- no dynamic guard is needed.
+    """
+    return (total * cta) // n_ctas, (total * (cta + 1)) // n_ctas
+
+
+@cute.jit
+def _rht128_tile_amax(acc, tidx):
+    """max|acc| over one 128x128 f32 TMEM accumulator, per thread (= per lane)."""
+    copy_atom_t2r = sm100_utils.get_tmem_load_op(
+        RHT128_CTA_TILE_COL,
+        utils.LayoutEnum.ROW_MAJOR,
+        cutlass.Float32,
+        cutlass.Float32,
+        RHT128_EPI_TILE,
+        False,
+    )
+    tAcc = transform_partitioned_tensor_layout(acc)
+    tAcc_epi = cute.flat_divide(tAcc, RHT128_EPI_TILE)
+    tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
+    thr_copy = tiled_copy_t2r.get_slice(tidx)
+    tTR_tAcc = thr_copy.partition_S(tAcc_epi)
+    tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+    tile_max = cutlass.Float32(0.0)
+    for u in cutlass.range_constexpr(RHT128_DIM // RHT128_EPI_TILE[1]):
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
+        vals = tTR_rAcc.load().reshape((16,))
+        for i in cutlass.range_constexpr(16):
+            tile_max = _max_f32(tile_max, _abs_f32(vals[i]))
+    return tile_max
+
+
+@cute.jit
+def _rht128_amax_epilogue(
+    chain: cutlass.Constexpr,
+    amax_t,
+    tCtAcc,
+    acc_pipeline,
+    offsets_t,
+    num_tensors,
+    t_begin,
+    t_end,
+    tiles_in_m,
+    tidx,
+    lane,
+):
+    """One epilogue body for both chains: consume the acc ring over this CTA's chunk.
+
+    Tiles are enumerated hidden-fastest, so ``token`` is non-decreasing and the
+    group cache / crossing flush is ``_Tcgen05GroupRhtAmax``'s.
+    """
+    acc_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
+    )
+    g = _group_idx(
+        (t_begin // tiles_in_m) * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors
+    )
+    g_end = offsets_t[g]
+    run_max = cutlass.Float32(0.0)
+    for i in cutlass.range(t_end - t_begin, unroll=1):
+        token = ((t_begin + i) // tiles_in_m) * cutlass.Int32(TOKEN_TILE)
+        if token >= g_end:
+            _flush_group_max(run_max, amax_t, g, lane)
+            run_max = cutlass.Float32(0.0)
+            g = _group_idx(token, offsets_t, num_tensors)
+            g_end = offsets_t[g]
+        acc_pipeline.consumer_wait(acc_state)
+        tile_max = _rht128_tile_amax(
+            tCtAcc[(None, None, None, 2 * acc_state.index + chain)], tidx
+        )
+        cute.arch.fence_view_async_tmem_load()
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(acc_state)
+        acc_state.advance()
+        run_max = _max_f32(run_max, _round_rht_amax(tile_max))
+    _flush_group_max(run_max, amax_t, g, lane)
+
+
+class _Tcgen05GroupRowRhtColRhtAmax:
+    """Per-group ``max|dy @ R_n|`` and ``max|dy.t() @ R_m|`` in one pass over ``dy``.
+
+    Standalone (no ``_GroupRhtMainloop``): every 128x128 tile is TMA'd once and
+    feeds two UMMA chains against two resident host-built K-major ``R^T`` tiles --
+    the col chain reads the stage MN-major (as the RHT-16 kernels do) and the row
+    chain reads the same bytes through a K-major view. Static persistent grid:
+    CTA ``b`` owns the contiguous tile chunk ``_static_tile_range``, tiles below
+    ``logical_packed_length`` only, hidden-fastest.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,  # dy.t().unsqueeze(-1): (hidden, tokens, 1)
+        mBrow: cute.Tensor,  # R_n^T (128 j, 128 k, 1), row chain (dgrad signs)
+        mBcol: cute.Tensor,  # R_m^T (128 j, 128 k, 1), col chain (wgrad signs)
+        amax_rht_dy_t_: cute.Tensor,  # (num_tensors,) f32, pre-zeroed: row chain
+        amax_rht_dy_t_t: cute.Tensor,  # (num_tensors,) f32, pre-zeroed: col chain
+        offsets_t: cute.Tensor,
+        logical_len_t: cute.Tensor,
+        hidden: cutlass.Int32,
+        tokens: cutlass.Int32,
+        num_tensors: cutlass.Int32,
+        num_ctas: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        k_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        mn_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.MN_SW128, cutlass.BFloat16
+        )
+        g2s = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        mma_col = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            RHT128_MMA_TILER_COL,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
+        )
+        tiled_mma_col = cute.make_tiled_mma(cute.make_mma_atom(mma_col))
+        mma_row = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            RHT128_MMA_TILER_ROW,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+        )
+        tiled_mma_row = cute.make_tiled_mma(cute.make_mma_atom(mma_row))
+        a_shape = tiled_mma_col.partition_shape_A(
+            cute.dice(RHT128_CTA_TILE_COL, (1, None, 1))
+        )
+        a_smem_layout_staged = tcgen05.tile_to_mma_shape(
+            mn_atom, cute.append(a_shape, RHT128_MAINLOOP_STAGES), order=(1, 2, 3)
+        )
+        ar_shape = tiled_mma_row.partition_shape_A(
+            cute.dice(RHT128_CTA_TILE_ROW, (1, None, 1))
+        )
+        a_row_layout_staged = tcgen05.tile_to_mma_shape(
+            k_atom, cute.append(ar_shape, RHT128_MAINLOOP_STAGES), order=(2, 1, 3)
+        )
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            g2s,
+            mA,
+            cute.slice_(a_smem_layout_staged, (None, None, None, 0)),
+            RHT128_CTA_TILE_COL,
+            tiled_mma_col,
+            (1, 1, 1, 1),
+        )
+        b_shape = tiled_mma_col.partition_shape_B(
+            cute.dice(RHT128_CTA_TILE_COL, (None, 1, 1))
+        )
+        b_smem_layout = tcgen05.tile_to_mma_shape(
+            k_atom, cute.append(b_shape, 1), order=(1, 2, 3)
+        )
+        tma_atom_b_col, tma_tensor_b_col = cute.nvgpu.make_tiled_tma_atom_B(
+            g2s,
+            mBcol,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            RHT128_CTA_TILE_COL,
+            tiled_mma_col,
+            (1, 1, 1, 1),
+        )
+        tma_atom_b_row, tma_tensor_b_row = cute.nvgpu.make_tiled_tma_atom_B(
+            g2s,
+            mBrow,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            RHT128_CTA_TILE_ROW,
+            tiled_mma_row,
+            (1, 1, 1, 1),
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma_col.thr_id.shape,)
+        )
+        tCtAcc_fake = tiled_mma_row.make_fragment_C(
+            cute.append(
+                tiled_mma_row.partition_shape_C((TOKEN_TILE, RHT128_DIM)),
+                2 * RHT128_ACC_STAGES,
+            )
+        )
+        num_tmem_alloc_cols = sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.kernel(
+            tiled_mma_col,
+            tiled_mma_row,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b_col,
+            tma_tensor_b_col,
+            tma_atom_b_row,
+            tma_tensor_b_row,
+            amax_rht_dy_t_,
+            amax_rht_dy_t_t,
+            offsets_t,
+            logical_len_t,
+            cluster_layout_vmnk,
+            a_smem_layout_staged,
+            a_row_layout_staged,
+            b_smem_layout,
+            tCtAcc_fake.layout,
+            num_tmem_alloc_cols,
+            hidden,
+            num_tensors,
+        ).launch(grid=(num_ctas, 1, 1), block=(RHT128_TPB, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma_col: cute.TiledMma,
+        tiled_mma_row: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_b_col: cute.CopyAtom,
+        mBcol: cute.Tensor,
+        tma_atom_b_row: cute.CopyAtom,
+        mBrow: cute.Tensor,
+        row_amax_t: cute.Tensor,
+        col_amax_t: cute.Tensor,
+        offsets_t: cute.Tensor,
+        logical_len_t: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        a_row_layout_staged: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        acc_fake_layout: cute.Layout,
+        num_tmem_alloc_cols: cutlass.Constexpr,
+        hidden: cutlass.Int32,
+        num_tensors: cutlass.Int32,
+    ):
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % cutlass.Int32(32)
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        tiles_in_m = hidden // cutlass.Int32(M_TILE)
+        tiles_in_n_valid = logical_len_t[0] // cutlass.Int32(TOKEN_TILE)
+        t_begin, t_end = _static_tile_range(tiles_in_m * tiles_in_n_valid, bidx, gdim)
+        n_my = t_end - t_begin
+
+        if warp_idx == TMA_WARP:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b_col)
+            cpasync.prefetch_descriptor(tma_atom_b_row)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_MAINLOOP_STAGES * 2]
+            acc_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_ACC_STAGES * 2]
+            b_mbar: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+
+        ab_pipeline = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.ab_mbar.data_ptr(),
+            num_stages=RHT128_MAINLOOP_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=_A_TILE_BYTES,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        ab_producer, ab_consumer = ab_pipeline.make_participants()
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=storage.acc_mbar.data_ptr(),
+            num_stages=RHT128_ACC_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, RHT128_ACC_CONSUMER_WARPS
+            ),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        # MMA warp + both epilogue groups retrieve the TMEM pointer.
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_ALLOC_BAR, num_threads=32 + COL_THREADS + COL_THREADS
+        )
+        tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_DEALLOC_BAR, num_threads=COL_THREADS + COL_THREADS
+        )
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=COL_WARP_BEGIN,
+            is_two_cta=False,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+        )
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(storage.b_mbar.ptr, 1)
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+
+        raw_a = smem.allocate_array(
+            cutlass.BFloat16,
+            cute.cosize(a_smem_layout_staged.outer),
+            byte_alignment=128,
+        )
+        sA = cute.make_tensor(
+            cute.recast_ptr(raw_a, a_smem_layout_staged.inner, dtype=cutlass.BFloat16),
+            a_smem_layout_staged.outer,
+        )
+        sA_row = cute.make_tensor(
+            cute.recast_ptr(raw_a, a_row_layout_staged.inner, dtype=cutlass.BFloat16),
+            a_row_layout_staged.outer,
+        )
+        sBcol = smem.allocate_tensor(
+            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+        sBrow = smem.allocate_tensor(
+            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+
+        cta_layout = cute.make_layout((1,))
+        thr_col = tiled_mma_col.get_slice(0)
+        thr_row = tiled_mma_row.get_slice(0)
+        gA = cute.local_tile(
+            mA, cute.slice_(RHT128_CTA_TILE_COL, (None, 0, None)), (None, None, None)
+        )
+        gBcol = cute.local_tile(
+            mBcol, cute.slice_(RHT128_CTA_TILE_COL, (0, None, None)), (None, None, None)
+        )
+        gBrow = cute.local_tile(
+            mBrow, cute.slice_(RHT128_CTA_TILE_ROW, (0, None, None)), (None, None, None)
+        )
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cta_layout,
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(thr_col.partition_A(gA), 0, 3),
+        )
+        tBsBcol, tBgBcol = cpasync.tma_partition(
+            tma_atom_b_col,
+            0,
+            cta_layout,
+            cute.group_modes(sBcol, 0, 3),
+            cute.group_modes(thr_col.partition_B(gBcol), 0, 3),
+        )
+        tBsBrow, tBgBrow = cpasync.tma_partition(
+            tma_atom_b_row,
+            0,
+            cta_layout,
+            cute.group_modes(sBrow, 0, 3),
+            cute.group_modes(thr_row.partition_B(gBrow), 0, 3),
+        )
+        tCrA_col = tiled_mma_col.make_fragment_A(sA)
+        tCrB_col = tiled_mma_col.make_fragment_B(sBcol)
+        tCrA_row = tiled_mma_row.make_fragment_A(sA_row)
+        tCrB_row = tiled_mma_row.make_fragment_B(sBrow)
+
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        # ==================== TMA warp ====================
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    storage.b_mbar.ptr, 2 * RHT128_B_BYTES
+                )
+            cute.copy(
+                tma_atom_b_col,
+                tBgBcol[(None, 0, 0, 0)],
+                tBsBcol[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+            cute.copy(
+                tma_atom_b_row,
+                tBgBrow[(None, 0, 0, 0)],
+                tBsBrow[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+            for i in cutlass.range(n_my, unroll=1):
+                t = t_begin + i
+                tile_n = t // tiles_in_m
+                tile_m = t - tile_n * tiles_in_m
+                handle = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, tile_m, tile_n, 0)],
+                    tAsA[(None, handle.index)],
+                    tma_bar_ptr=handle.barrier,
+                )
+            ab_producer.tail()
+
+        # ==================== MMA warp ====================
+        if warp_idx == MMA_WARP:
+            tmem.wait_for_alloc()
+            tCtAcc = cute.make_tensor(
+                tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
+            )
+            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, RHT128_ACC_STAGES
+            )
+            for i in cutlass.range(n_my, unroll=1):
+                ab_handle = ab_consumer.wait_and_advance()
+                acc_pipeline.producer_acquire(acc_state)
+                acc_col = tCtAcc[(None, None, None, 2 * acc_state.index + 0)]
+                acc_row = tCtAcc[(None, None, None, 2 * acc_state.index + 1)]
+                for kb in cutlass.range_constexpr(RHT128_K_BLOCKS):
+                    tiled_mma_col.set(tcgen05.Field.ACCUMULATE, kb > 0)
+                    cute.gemm(
+                        tiled_mma_col,
+                        acc_col,
+                        tCrA_col[(None, None, kb, ab_handle.index)],
+                        tCrB_col[(None, None, kb, 0)],
+                        acc_col,
+                    )
+                    tiled_mma_row.set(tcgen05.Field.ACCUMULATE, kb > 0)
+                    cute.gemm(
+                        tiled_mma_row,
+                        acc_row,
+                        tCrA_row[(None, None, kb, ab_handle.index)],
+                        tCrB_row[(None, None, kb, 0)],
+                        acc_row,
+                    )
+                # One elected tcgen05.commit covers both chains' 16 UMMAs.
+                acc_pipeline.producer_commit(acc_state)
+                acc_state.advance()
+                ab_handle.release()
+            acc_pipeline.producer_tail(acc_state)
+
+        # ==================== col epilogue: max|dy.t() @ R_m| ====================
+        if warp_idx >= COL_WARP_BEGIN and warp_idx < COL_WARP_END:
+            tmem.allocate(num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
+            _rht128_amax_epilogue(
+                0,
+                col_amax_t,
+                tCtAcc,
+                acc_pipeline,
+                offsets_t,
+                num_tensors,
+                t_begin,
+                t_end,
+                tiles_in_m,
+                tidx,
+                lane,
+            )
+            tmem_dealloc_barrier.arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+        # ==================== row epilogue: max|dy @ R_n| ====================
+        if warp_idx >= ROW_WARP_BEGIN and warp_idx < RHT128_ROW_WARP_END:
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
+            _rht128_amax_epilogue(
+                1,
+                row_amax_t,
+                tCtAcc,
+                acc_pipeline,
+                offsets_t,
+                num_tensors,
+                t_begin,
+                t_end,
+                tiles_in_m,
+                tidx,
+                lane,
+            )
+            tmem_dealloc_barrier.arrive_and_wait()
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_group_row_rht_col_rht_amax_kernel(device_idx: int):
+    """Compile the grouped row-RHT + col-RHT amax kernel with symbolic shapes."""
+    free = cute.sym_int
+    h_sym = cute.sym_int(divisibility=M_TILE)
+    t_sym = cute.sym_int(divisibility=TOKEN_TILE)
+    k = _Tcgen05GroupRowRhtColRhtAmax()
+    return cute.compile(
+        k,
+        make_fake_tensor(cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1)),
+        make_fake_tensor(
+            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+        ),
+        make_fake_tensor(
+            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+        ),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (1,), stride=(1,)),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_row_rht_col_rht_amax_impl(
+    dy: torch.Tensor,
+    row_rht_nk: torch.Tensor,
+    col_rht_nk: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tensors: int,
+    logical_packed_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-group ``max|dy @ R_n|`` and ``max|dy.t() @ R_m|``.
+
+    ``dy`` is ``(tokens, hidden)`` bfloat16 row-major; ``row_rht_nk`` /
+    ``col_rht_nk`` are the ``(128, 128)`` bfloat16 K-major ``R_n^T`` / ``R_m^T``
+    tiles built by the caller from the live sign vectors. Returns
+    ``(amax_rht_dy, amax_rht_dy_t)``, each ``(num_tensors,)`` float32, rowwise
+    first like the Triton twin. The buffers start at zero because the epilogues
+    accumulate with atomic max.
+    """
+    tokens, hidden = dy.shape
+    dev = dy.device
+    dy = dy.detach()
+
+    amax_rht_dy = torch.zeros((num_tensors,), dtype=torch.float32, device=dev)
+    amax_rht_dy_t = torch.zeros((num_tensors,), dtype=torch.float32, device=dev)
+    if logical_packed_length is None:
+        logical_packed_length = offsets[-1:]
+    # See the fused kernel: the entry point requires byte_offset==0.
+    logical_packed_length = logical_packed_length.clone()
+    tiles = (hidden // M_TILE) * (tokens // TOKEN_TILE)
+    num_ctas = max(1, min(tiles, _get_num_sms(dev.index)))
+
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+    _compile_group_row_rht_col_rht_amax_kernel(dev.index)(
+        dy.t().unsqueeze(-1),
+        row_rht_nk.unsqueeze(-1),
+        col_rht_nk.unsqueeze(-1),
+        amax_rht_dy,
+        amax_rht_dy_t,
+        offsets,
+        logical_packed_length,
+        int(hidden),
+        int(tokens),
+        int(num_tensors),
+        int(num_ctas),
+        stream,
+    )
+    return amax_rht_dy, amax_rht_dy_t

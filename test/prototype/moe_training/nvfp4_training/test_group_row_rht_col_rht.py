@@ -10,12 +10,22 @@ V2's backward gradient path. What distinguishes it from §11.8/§11.9 is that **
 axes are transformed with **independent** sign vectors. A crossed pair produces no
 error, only a wrong gradient, so the tests that separate the two vectors are the
 important ones here.
+
+Both backends of the amax op are selected by the ``kernel`` parametrization
+(``_KERNELS``); the MS-EDEN tests consume the Triton amax only.
 """
 
 import math
 
 import pytest
 import torch
+
+from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_cutedsl import (
+    cutedsl_group_row_rht_col_rht_amax,
+)
+from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+    cutedsl_nvfp4_kernels_available,
+)
 
 from ._assertions import assert_codes_bitwise, assert_scales_adjacent
 from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
@@ -31,6 +41,14 @@ _needs_ms_eden = kernel_gate(
     _AMAX_IMPLEMENTED and _MS_EDEN_IMPLEMENTED,
     "group_row_rht_col_rht_quantize_ms_eden_triton.py",
 )
+_skip_no_cutedsl = pytest.mark.skipif(
+    not cutedsl_nvfp4_kernels_available(),
+    reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
+)
+_KERNELS = [
+    pytest.param("triton", id="triton"),
+    pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
+]
 
 if TRITON_AVAILABLE:
     from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
@@ -61,42 +79,48 @@ def _packed(group_sizes, hidden, *, seed=0):
     return dy, offs
 
 
-def _amax(dy, d, w, offs, E):
-    return triton_group_row_rht_col_rht_amax(
-        dy, d, w, offs, E, dy.shape[0], dy.shape[1], VARYING_FIRST_DIM, offs[-1:]
+def _amax(kernel, dy, d, w, offs, E):
+    op = (
+        triton_group_row_rht_col_rht_amax
+        if kernel == "triton"
+        else cutedsl_group_row_rht_col_rht_amax
     )
+    return op(dy, d, w, offs, E, dy.shape[0], dy.shape[1], VARYING_FIRST_DIM, offs[-1:])
 
 
 # --- §11.2 ------------------------------------------------------------------
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_amax_single_group_matches_the_linear_reference():
+def test_amax_single_group_matches_the_linear_reference(kernel):
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
-    got_row, got_col = _amax(dy, d, w, offs, 1)
+    got_row, got_col = _amax(kernel, dy, d, w, offs, 1)
     ref_row, ref_col = reference_row_rht_col_rht_amax(dy, d, w)
     torch.testing.assert_close(got_row[0], ref_row, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(got_col[0], ref_col, rtol=1e-3, atol=1e-3)
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("group_sizes", [[128, 128], [256, 128, 384, 128]])
 @torch.no_grad()
-def test_amax_multi_group_matches_the_reference(group_sizes):
+def test_amax_multi_group_matches_the_reference(kernel, group_sizes):
     dy, offs = _packed(group_sizes, 512)
     d, w = _signs(seed=0), _signs(seed=1)
     E = len(group_sizes)
-    got_row, got_col = _amax(dy, d, w, offs, E)
+    got_row, got_col = _amax(kernel, dy, d, w, offs, E)
     ref_row, ref_col = reference_group_row_rht_col_rht_amax(dy, d, w, offs, E)
     torch.testing.assert_close(got_row, ref_row, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(got_col, ref_col, rtol=1e-3, atol=1e-3)
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_each_sign_vector_drives_exactly_one_output():
+def test_each_sign_vector_drives_exactly_one_output(kernel):
     """Changing ``dgrad_rht`` may move only the rowwise amax, and vice versa.
 
     The cleanest statement that the two are not crossed: if the kernel wired them the
@@ -104,15 +128,15 @@ def test_each_sign_vector_drives_exactly_one_output():
     """
     dy, offs = _packed([256], 512)
     d0, w0 = _signs(seed=0), _signs(seed=1)
-    base_row, base_col = _amax(dy, d0, w0, offs, 1)
+    base_row, base_col = _amax(kernel, dy, d0, w0, offs, 1)
 
-    row_only, col_unchanged = _amax(dy, _signs(seed=2), w0, offs, 1)
+    row_only, col_unchanged = _amax(kernel, dy, _signs(seed=2), w0, offs, 1)
     assert row_only[0].item() != base_row[0].item(), "dgrad_rht must move amax_rht_dy"
     assert col_unchanged[0].item() == base_col[0].item(), (
         "dgrad_rht must not touch amax_rht_dy_t"
     )
 
-    row_unchanged, col_only = _amax(dy, d0, _signs(seed=3), offs, 1)
+    row_unchanged, col_only = _amax(kernel, dy, d0, _signs(seed=3), offs, 1)
     assert col_only[0].item() != base_col[0].item(), "wgrad_rht must move amax_rht_dy_t"
     assert row_unchanged[0].item() == base_row[0].item(), (
         "wgrad_rht must not touch amax_rht_dy"
@@ -120,55 +144,60 @@ def test_each_sign_vector_drives_exactly_one_output():
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_swapping_the_two_sign_vectors_changes_both_outputs():
+def test_swapping_the_two_sign_vectors_changes_both_outputs(kernel):
     """The discriminating test for a crossed-argument bug."""
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
-    a_row, a_col = _amax(dy, d, w, offs, 1)
-    b_row, b_col = _amax(dy, w, d, offs, 1)
+    a_row, a_col = _amax(kernel, dy, d, w, offs, 1)
+    b_row, b_col = _amax(kernel, dy, w, d, offs, 1)
     assert a_row[0].item() != b_row[0].item()
     assert a_col[0].item() != b_col[0].item()
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_identical_sign_vectors_are_not_assumed_equal():
+def test_identical_sign_vectors_are_not_assumed_equal(kernel):
     """``dgrad_rht == wgrad_rht`` must still compute each axis on its own data."""
     dy, offs = _packed([256], 384)
     d = _signs(seed=0)
-    got_row, got_col = _amax(dy, d, d, offs, 1)
+    got_row, got_col = _amax(kernel, dy, d, d, offs, 1)
     ref_row, ref_col = reference_row_rht_col_rht_amax(dy, d, d)
     torch.testing.assert_close(got_row[0], ref_row, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(got_col[0], ref_col, rtol=1e-3, atol=1e-3)
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_amax_per_group_isolation():
+def test_amax_per_group_isolation(kernel):
     group_sizes = [128, 128, 128, 128]
     dy, offs = _packed(group_sizes, 512)
     d, w = _signs(seed=0), _signs(seed=1)
-    base = _amax(dy, d, w, offs, 4)
+    base = _amax(kernel, dy, d, w, offs, 4)
     dy2 = dy.clone()
     dy2[256:384] *= 1000.0
-    hot = _amax(dy2, d, w, offs, 4)
+    hot = _amax(kernel, dy2, d, w, offs, 4)
     for g in (0, 1, 3):
         assert hot[0][g].item() == base[0][g].item(), f"group {g} row leaked"
         assert hot[1][g].item() == base[1][g].item(), f"group {g} col leaked"
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_zero_gradient_gives_zero_amaxes_without_nan():
+def test_zero_gradient_gives_zero_amaxes_without_nan(kernel):
     dy, offs = _packed([128, 128], 512)
-    got = _amax(torch.zeros_like(dy), _signs(seed=0), _signs(seed=1), offs, 2)
+    got = _amax(kernel, torch.zeros_like(dy), _signs(seed=0), _signs(seed=1), offs, 2)
     assert torch.equal(torch.stack(got), torch.zeros(2, 2, device="cuda"))
 
 
 @_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_resampled_signs_change_the_output_without_retracing():
+def test_resampled_signs_change_the_output_without_retracing(kernel):
     """V2 mutates its sign buffers in place, so they must stay runtime inputs.
 
     ``resample_nvfp4_rht_signs`` copies a fresh draw into the live buffer every
@@ -185,9 +214,15 @@ def test_resampled_signs_change_the_output_without_retracing():
         graphs.append(graph_module)
         return graph_module.forward
 
+    op = (
+        triton_group_row_rht_col_rht_amax
+        if kernel == "triton"
+        else cutedsl_group_row_rht_col_rht_amax
+    )
+
     @torch.compile(backend=counting_backend, fullgraph=True)
     def amax(dy, dgrad_rht, wgrad_rht, offs):
-        return triton_group_row_rht_col_rht_amax(
+        return op(
             dy,
             dgrad_rht,
             wgrad_rht,
@@ -211,6 +246,59 @@ def test_resampled_signs_change_the_output_without_retracing():
     assert not torch.equal(first_col, second_col), "colwise amax must follow wgrad_rht"
 
 
+_BITWISE_CASES = [
+    pytest.param([128, 256, 384, 128], 1024, id="ragged"),
+    pytest.param([128, 384], 256, id="jagged-two-tiles"),
+    pytest.param([256] * 8, 1408, id="eight-groups"),
+    pytest.param([1408] * 4, 1408, id="deepseek-16B-gate-up"),
+    pytest.param([128, 0, 256], 512, id="empty-middle-group"),
+    pytest.param([128] * 64, 128, id="max-groups"),
+]
+
+
+@_needs_amax
+@_skip_no_cutedsl
+@pytest.mark.parametrize("group_sizes,hidden", _BITWISE_CASES)
+@torch.no_grad()
+def test_cutedsl_amax_matches_triton(group_sizes, hidden):
+    """Bitwise by construction: both backends issue the same tcgen05 (128,128,16) bf16
+    UMMAs over K = 128 in the same order on the same operand bytes, then round once to
+    bf16. A mismatch is a bug or a Triton lowering change, never tolerance."""
+    dy, offs = _packed(group_sizes, hidden, seed=225)
+    d, w = _signs(seed=0), _signs(seed=1)
+    E = len(group_sizes)
+    t_row, t_col = _amax("triton", dy, d, w, offs, E)
+    c_row, c_col = _amax("cutedsl", dy, d, w, offs, E)
+    assert torch.equal(c_row, t_row) and torch.equal(c_col, t_col)
+
+
+@_needs_amax
+@pytest.mark.parametrize("kernel", _KERNELS)
+@torch.no_grad()
+def test_amax_excludes_rows_past_logical_packed_length(kernel):
+    dy, offs = _packed([128, 128], 512)
+    capacity = torch.full((512, 512), float("inf"), device="cuda", dtype=torch.bfloat16)
+    capacity[:256] = dy
+    d, w = _signs(seed=0), _signs(seed=1)
+    op = (
+        triton_group_row_rht_col_rht_amax
+        if kernel == "triton"
+        else cutedsl_group_row_rht_col_rht_amax
+    )
+    got = op(capacity, d, w, offs, 2, 512, 512, VARYING_FIRST_DIM, offs[-1:])
+    full = _amax(kernel, dy, d, w, offs, 2)
+    assert torch.equal(torch.stack(got), torch.stack(full))
+
+
+@maybe_sm100
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_amax_rejects_too_many_groups():
+    dy, offs = _packed([128] * 65, 128)
+    with pytest.raises(ValueError, match="num_tensors must be <= 64"):
+        _amax("cutedsl", dy, _signs(seed=0), _signs(seed=1), offs, 65)
+
+
 # --- §11.3 ------------------------------------------------------------------
 
 
@@ -226,7 +314,7 @@ def test_return_order_is_rowwise_first():
     """
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, 1)
+    ar, ac = _amax("triton", dy, d, w, offs, 1)
     row_codes, row_sf, col_codes, col_sf = (
         triton_group_row_rht_col_rht_quantize_ms_eden(
             dy,
@@ -253,7 +341,7 @@ def test_block_scales_never_exceed_the_eden_ceiling():
     """MS-EDEN caps block scales at 256, not 448 -- the reason its numerator is 1536."""
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, 1)
+    ar, ac = _amax("triton", dy, d, w, offs, 1)
     _, row_sf, _, col_sf = triton_group_row_rht_col_rht_quantize_ms_eden(
         dy,
         ar,
@@ -277,7 +365,7 @@ def test_block_scales_never_exceed_the_eden_ceiling():
 def test_fixed_rng_state_reproduces_bitwise():
     dy, offs = _packed([256], 512)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, 1)
+    ar, ac = _amax("triton", dy, d, w, offs, 1)
     rng = torch.tensor([5, 6, 7, 8], dtype=torch.int64, device="cuda")
     args = (dy, ar, ac, d, w, offs, 1, 256, 512, VARYING_FIRST_DIM, rng, offs[-1:])
     a = triton_group_row_rht_col_rht_quantize_ms_eden(*args)
@@ -313,7 +401,7 @@ def test_ms_eden_is_unbiased():
     M, N = 128, 256
     dy, offs = _packed([M], N)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, 1)
+    ar, ac = _amax("triton", dy, d, w, offs, 1)
     row_ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
     col_ref = reference_ms_eden(reference_dynamic_rht(dy, w, transpose=True), ac[0])
 
@@ -364,7 +452,7 @@ def test_codes_are_rtne_from_the_pre_correction_scale():
     M, N = 256, 512
     dy, offs = _packed([M], N, seed=2)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, 1)
+    ar, ac = _amax("triton", dy, d, w, offs, 1)
     row_ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
     col_ref = reference_ms_eden(reference_dynamic_rht(dy, w, transpose=True), ac[0])
 
@@ -390,7 +478,7 @@ def test_each_rng_slice_drives_exactly_one_output():
     M, N = 256, 512
     dy, offs = _packed([M], N)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, 1)
+    ar, ac = _amax("triton", dy, d, w, offs, 1)
 
     def run(rng):
         return triton_group_row_rht_col_rht_quantize_ms_eden(
@@ -453,7 +541,7 @@ def test_multi_group_matches_the_reference(group_sizes):
     M = sum(group_sizes)
     dy, offs = _packed(group_sizes, N, seed=3)
     d, w = _signs(seed=0), _signs(seed=1)
-    ar, ac = _amax(dy, d, w, offs, E)
+    ar, ac = _amax("triton", dy, d, w, offs, E)
     rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     row_codes, row_sf, col_codes, col_sf = (
         triton_group_row_rht_col_rht_quantize_ms_eden(
@@ -482,10 +570,16 @@ def test_multi_group_matches_the_reference(group_sizes):
 
 
 @maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_register_fake_shapes_and_return_order():
+def test_register_fake_shapes_and_return_order(kernel):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    op = (
+        triton_group_row_rht_col_rht_amax
+        if kernel == "triton"
+        else cutedsl_group_row_rht_col_rht_amax
+    )
     M, N, E = 512, 256, 2
     with FakeTensorMode():
         dy = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -493,9 +587,7 @@ def test_register_fake_shapes_and_return_order():
         offs = torch.empty(E, dtype=torch.int32, device="cuda")
         amax = torch.empty(E, dtype=torch.float32, device="cuda")
         rng = torch.empty(4, dtype=torch.int64, device="cuda")
-        row, col = triton_group_row_rht_col_rht_amax(
-            dy, sv, sv, offs, E, M, N, VARYING_FIRST_DIM, None
-        )
+        row, col = op(dy, sv, sv, offs, E, M, N, VARYING_FIRST_DIM, None)
         assert row.shape == (E,) and col.shape == (E,)
         out = triton_group_row_rht_col_rht_quantize_ms_eden(
             dy, amax, amax, sv, sv, offs, E, M, N, VARYING_FIRST_DIM, rng, None
@@ -510,9 +602,10 @@ def test_register_fake_shapes_and_return_order():
 
 
 @maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("which", ["dgrad_rht", "wgrad_rht"])
 @torch.no_grad()
-def test_rejects_a_non_128_sign_vector(which):
+def test_rejects_a_non_128_sign_vector(kernel, which):
     M, N, E = 512, 256, 2
     dy = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
     offs = torch.tensor([256, 512], dtype=torch.int32, device="cuda")
@@ -520,9 +613,7 @@ def test_rejects_a_non_128_sign_vector(which):
     bad = torch.ones(16, dtype=torch.int8, device="cuda")
     d, w = (bad, good) if which == "dgrad_rht" else (good, bad)
     with pytest.raises(ValueError, match=rf"{which} must be a \(128,\) tensor"):
-        triton_group_row_rht_col_rht_amax(
-            dy, d, w, offs, E, M, N, VARYING_FIRST_DIM, offs[-1:]
-        )
+        _amax(kernel, dy, d, w, offs, E)
 
 
 @maybe_sm100

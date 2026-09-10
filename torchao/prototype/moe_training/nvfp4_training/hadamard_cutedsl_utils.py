@@ -140,9 +140,15 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     from ._cutedsl_group_kernels_impl import (
         _compile_group_amax_kernel,
         _compile_group_fused_kernel,
+        _compile_group_row_rht_col_rht_amax_kernel,
     )
+    from .hadamard_utils import _device_key, get_hadamard_matrix
 
     _compile_group_amax_kernel(idx)
     for sr in (False, True):
         for fast_math in (False, True):
             _compile_group_fused_kernel(idx, sr, fast_math)
+    # The V2 gradient amax forms its two rotation operands per launch from the cached
+    # Hadamard; warm that cache too, so neither the compile nor H128 lands in the graph pool.
+    _compile_group_row_rht_col_rht_amax_kernel(idx)
+    get_hadamard_matrix(128, _device_key(dev), torch.bfloat16)
