@@ -1874,7 +1874,6 @@ class _Tcgen05GroupRowRhtColRhtAmax:
         offsets_t: cute.Tensor,
         logical_len_t: cute.Tensor,
         hidden: cutlass.Int32,
-        tokens: cutlass.Int32,
         num_tensors: cutlass.Int32,
         num_ctas: cutlass.Int32,
         stream: cuda.CUstream,
@@ -2266,7 +2265,6 @@ def _compile_group_row_rht_col_rht_amax_kernel(device_idx: int):
         cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
-        cutlass.Int32(0),
         make_fake_stream(),
         options="--enable-tvm-ffi",
     )
@@ -2312,7 +2310,6 @@ def _cutedsl_group_row_rht_col_rht_amax_impl(
         offsets,
         logical_packed_length,
         int(hidden),
-        int(tokens),
         int(num_tensors),
         int(num_ctas),
         stream,

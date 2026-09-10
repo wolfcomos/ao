@@ -55,6 +55,64 @@ the Triton kernel at `num_warps = 8` holds 107 registers and reduces through sha
 so it keeps roughly 2.5x the warps resident. The debug model launches 16 CTAs on either
 backend and is latency-bound.
 
+### group_row_rht_col_rht_amax (`cutedsl_group_row_rht_col_rht_amax` vs `triton_group_row_rht_col_rht_amax`)
+
+The V2 backward gradient amax: one pass over the packed gradient
+`dy = (E * tokens, hidden)` returns, per expert, the amax of `|dy_g @ R_n|` (rowwise, the
+dgrad signs) and of `|dy_g.t() @ R_m|` (columnwise, the wgrad signs) -- two RHT-128
+transforms with independent sign vectors. The CuteDSL kernel loads every 128x128 tile into
+shared memory once (TMA) and applies both transforms to that one copy through two tcgen05
+UMMA chains (8 + 8 UMMAs against two resident `R^T` operand tiles; the row chain reads the
+same bytes through a K-major view), reducing both per-group amaxes from TMEM in the same
+pass. The two backends produce bitwise identical amaxes (`torch.equal` at every shape
+below). Bandwidth counts the bfloat16 read of `dy`; the `2E` scalar outputs are not
+counted.
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_amax
+```
+
+| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 20.31 | 26.67 | 1.31x | 25.8 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 20.30 | 26.74 | 1.32x | 25.8 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 1408 | 23.17 | 37.07 | 1.60x | 684.4 |
+| 16B | down (w2) | 4 | 2048 | 2048 | 25.93 | 55.74 | 2.15x | 1293.9 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 2048 | 25.94 | 55.74 | 2.15x | 1293.7 |
+| 671B | down (w2) | 4 | 7168 | 7168 | 98.14 | 442.72 | 4.51x | 4188.3 |
+
+- Op time includes the same torch glue on both backends -- two sign-to-matrix builds and
+  two `torch.zeros` fills -- 14.10-15.60 us for CuteDSL and 15.78-19.28 us for Triton. At
+  671B gate/up, `dy (8192, 2048)`: CuteDSL two `torch.mul(h128, sign[None, :])` 10.23 us
+  (the int8 sign operand puts them on ATen's casting `gpu_kernel_impl`; with bfloat16
+  signs the pair takes 6.77 us) + two fills 3.94 us; Triton two `get_dynamic_rht_matrix`
+  7.01 us + their two int8->bfloat16 copies 4.93 us + two fills 3.98 us. Kernel-only
+  (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 8.78 vs 21.10 us at 16B
+  gate/up (2.40x), 11.55 vs 39.82 us at 16B down (3.45x), 11.55 vs 38.85 us at 671B
+  gate/up (3.36x), 82.48 vs 423.51 us at 671B down (5.13x). The metric excludes the
+  1.99-2.44 us `Memcpy DtoD` of the CuteDSL impl's `logical_packed_length.clone()`, which
+  the Triton op does not issue.
+- The 671B gate: gate/up `dy (8192, 2048)` 25.94 us against <= 22 us -- over by 3.94 us
+  (17.9%); down `dy (28672, 7168)` 98.14 us against <= 105 us -- under by 6.86 us (6.5%).
+  At gate/up the kernel is 11.55 us, under the gate on its own, and the glue 14.18 us,
+  55% of the op: the miss is the glue, the two int8-sign `torch.mul` at 5.1 us each; the
+  kernel's fixed floor is 6.04-6.08 us (the debug model: 16 CTAs, one tile each).
+- At 671B down the op reads 411 MB at 4188.3 GB/s, 52.8% of the 7936 GB/s peak; the kernel
+  alone runs at 4984 GB/s, 62.8%. At the 1200 MHz application clock the kernel is
+  tensor-bound: every 128x128 tile costs 16 `(128, 128, 16)` bfloat16 UMMAs, and the
+  steady state derived from the 671B rows after a 6.06 us fixed floor is 1099-1118 cycles
+  per tile, inside the 1024-1100 the UMMA rate predicts.
+- On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL column
+  is 0.97-1.00x of the values above (25.76 us at 671B gate/up, 95.42 us at 671B down); the
+  Triton twin does not compile there (`TritonNvidiaGPUOptimizeTMemLayoutsPass`, as in the
+  baseline table), so the Triton column is Triton 3.8.0 only.
+- `cuobjdump -res-usage` of the compiled kernel: REG 50, STACK 0, SHARED 1024 (static),
+  LOCAL 0, at 384 threads and no `setmaxnreg`. Its SASS holds 16 `UTCHMMA` (the 8 + 8
+  UMMAs of the two chains), 2 `UTCBAR` and no `HMMA`, `LDSM` or `STSM`: the dynamic shared
+  memory is the 5-stage TMA ring of 32 KB `dy` tiles plus the two resident 32 KB `R^T`
+  operands, and both epilogues reduce the accumulators from TMEM through registers (16
+  `LDTM`) with no shared-memory staging (the 5 `LDS` / 2 `STS` address the static struct).
+
 ## Triton baseline for the nine grouped kernels
 
 The targets for the remaining ports: the five V2 ops (`row_cast_quantize`,
