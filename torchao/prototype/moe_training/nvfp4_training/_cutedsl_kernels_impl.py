@@ -364,6 +364,23 @@ def _div_rn_f32(
 
 
 @dsl_user_op
+def _rcp_rn_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """RN(1/a): the value ``_div_rn_f32(1.0, a)`` yields (both are correctly rounded),
+    without the division's slow-path fixups."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip)],
+            "rcp.rn.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _bf16lo_to_f32(w: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
     """Widen the low bf16 of a packed pair to f32, in one instruction.
 
@@ -420,6 +437,24 @@ def _mulhi_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+    )
+
+
+@dsl_user_op
+def _mulwide_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
+    """(lo, hi) words of a 32x32 unsigned multiply, one instruction."""
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b64 w;\nmul.wide.u32 w, $2, $3;\nmov.b64 {$0, $1}, w;\n}",
+        "=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [0], loc=loc, ip=ip)),
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [1], loc=loc, ip=ip)),
     )
 
 
@@ -494,6 +529,27 @@ def philox4_all(state, chunk_counter):
     return c0, c1, c2, c3
 
 
+def philox_word0(state, chunk_counter):
+    """``philox4_all(state, chunk_counter)[0]``: the same generator with each (mul.hi, mul.lo)
+    pair drawn as one wide multiply (values identical)."""
+    sched, c0_r2, c1_r2, c3_r1 = state
+    A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
+    c0_r1 = chunk_counter ^ sched[0][0]
+    c0, c1 = c0_r2, c1_r2
+    lo, hi = _mulwide_u32(A, c0_r1)
+    c2 = hi ^ c3_r1 ^ sched[1][1]
+    c3 = lo
+    for r in range(2, PHILOX_ROUNDS):
+        _c0, _c2 = c0, c2
+        lo_b, hi_b = _mulwide_u32(B, _c2)
+        lo_a, hi_a = _mulwide_u32(A, _c0)
+        c0 = hi_b ^ c1 ^ sched[r][0]
+        c2 = hi_a ^ c3 ^ sched[r][1]
+        c1 = lo_b
+        c3 = lo_a
+    return c0
+
+
 @dsl_user_op
 def _min_f32(
     a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
@@ -560,6 +616,35 @@ def _atom_max_f32_nonneg(
 
 
 @dsl_user_op
+def _st_global_v4_u32(
+    addr: cutlass.Int64,
+    a: cutlass.Uint32,
+    b: cutlass.Uint32,
+    c: cutlass.Uint32,
+    d: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """One 16-byte global store of four u32 at byte address ``addr`` (16-byte aligned)."""
+    llvm.inline_asm(
+        None,
+        [
+            addr.ir_value(loc=loc, ip=ip),
+            a.ir_value(loc=loc, ip=ip),
+            b.ir_value(loc=loc, ip=ip),
+            c.ir_value(loc=loc, ip=ip),
+            d.ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
     """Absolute value of float32."""
     return cutlass.Float32(
@@ -568,6 +653,309 @@ def _abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
             [a.ir_value(loc=loc, ip=ip)],
             "abs.f32 $0, $1;",
             "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_rn_e2m1x8_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Pack eight already scaled and clamped values to FP4, RTNE (the second half of
+    ``_mul_cvt_rn_e2m1x8_acc_f32``): even element in the low nibble, odd in the high."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v0.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v3.ir_value(loc=loc, ip=ip),
+                v4.ir_value(loc=loc, ip=ip),
+                v5.ir_value(loc=loc, ip=ip),
+                v6.ir_value(loc=loc, ip=ip),
+                v7.ir_value(loc=loc, ip=ip),
+            ],
+            (
+                "{\n"
+                ".reg .b8 b0, b1, b2, b3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b0, $2, $1;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b1, $4, $3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b2, $6, $5;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b3, $8, $7;\n"
+                "mov.b32 $0, {b0, b1, b2, b3};\n"
+                "}"
+            ),
+            "=r,f,f,f,f,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e2m1x8_to_f32(word: cutlass.Uint32, *, loc=None, ip=None):
+    """Exact decode of one packed-FP4 word to eight f32, element k = nibble k.
+
+    The multi-output form the DSL itself uses (``cute.arch.cvt_f4e2m1x8_to_f16x8``): one
+    ``inline_asm`` returning a literal struct, one ``extractvalue`` per element.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [word.ir_value(loc=loc, ip=ip)],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            ".reg .b32 p0, p1, p2, p3;\n"
+            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
+            "mov.b32 {b0, b1, b2, b3}, $8;\n"
+            "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
+            "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
+            "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
+            "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "mov.b32 {l0, h0}, p0;\n"
+            "mov.b32 {l1, h1}, p1;\n"
+            "mov.b32 {l2, h2}, p2;\n"
+            "mov.b32 {l3, h3}, p3;\n"
+            "cvt.f32.f16 $0, l0;\n"
+            "cvt.f32.f16 $1, h0;\n"
+            "cvt.f32.f16 $2, l1;\n"
+            "cvt.f32.f16 $3, h1;\n"
+            "cvt.f32.f16 $4, l2;\n"
+            "cvt.f32.f16 $5, h2;\n"
+            "cvt.f32.f16 $6, l3;\n"
+            "cvt.f32.f16 $7, h3;\n"
+            "}"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
+        for k in range(8)
+    )
+
+
+@dsl_user_op
+def _bf16round_f32x8(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    zero: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Triton's ``f32(bf16(acc))`` for eight raw accumulators, one instruction each.
+
+    ``cvt.rn.bf16x2.f32 e, v, 0.0`` puts RTNE bf16(v) in the high half and bf16(+0) = 0 in
+    the low half, so the packed word already is the exact f32 widening: no shift or mask.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [
+            v0.ir_value(loc=loc, ip=ip),
+            v1.ir_value(loc=loc, ip=ip),
+            v2.ir_value(loc=loc, ip=ip),
+            v3.ir_value(loc=loc, ip=ip),
+            v4.ir_value(loc=loc, ip=ip),
+            v5.ir_value(loc=loc, ip=ip),
+            v6.ir_value(loc=loc, ip=ip),
+            v7.ir_value(loc=loc, ip=ip),
+            zero.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b32 e0, e1, e2, e3, e4, e5, e6, e7;\n"
+            "cvt.rn.bf16x2.f32 e0, $8, $16;\n"
+            "cvt.rn.bf16x2.f32 e1, $9, $16;\n"
+            "cvt.rn.bf16x2.f32 e2, $10, $16;\n"
+            "cvt.rn.bf16x2.f32 e3, $11, $16;\n"
+            "cvt.rn.bf16x2.f32 e4, $12, $16;\n"
+            "cvt.rn.bf16x2.f32 e5, $13, $16;\n"
+            "cvt.rn.bf16x2.f32 e6, $14, $16;\n"
+            "cvt.rn.bf16x2.f32 e7, $15, $16;\n"
+            "mov.b32 $0, e0;\n"
+            "mov.b32 $1, e1;\n"
+            "mov.b32 $2, e2;\n"
+            "mov.b32 $3, e3;\n"
+            "mov.b32 $4, e4;\n"
+            "mov.b32 $5, e5;\n"
+            "mov.b32 $6, e6;\n"
+            "mov.b32 $7, e7;\n"
+            "}"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
+        for k in range(8)
+    )
+
+
+@dsl_user_op
+def _mul_clamp_f32x8(
+    e0: cutlass.Float32,
+    e1: cutlass.Float32,
+    e2: cutlass.Float32,
+    e3: cutlass.Float32,
+    e4: cutlass.Float32,
+    e5: cutlass.Float32,
+    e6: cutlass.Float32,
+    e7: cutlass.Float32,
+    enc: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Triton's ``clamp(x * encode, -6, 6)`` for eight bf16-exact f32 values.
+
+    The multiply of ``_mul_cvt_rn_e2m1x8_acc_f32`` (its bf16 round-through is
+    ``_bf16round_f32x8``'s here) returning the scaled values instead of packing them, with
+    the clamp that helper leaves to ``cvt.rn.satfinite`` made explicit: ``mul.rn.f32x2``
+    (``.rn`` forbids any fusion), then ``min.xorsign.abs.f32`` -- min(|a|, 6) carrying a's
+    sign, the one instruction Triton's clamp lowers to.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [
+            e0.ir_value(loc=loc, ip=ip),
+            e1.ir_value(loc=loc, ip=ip),
+            e2.ir_value(loc=loc, ip=ip),
+            e3.ir_value(loc=loc, ip=ip),
+            e4.ir_value(loc=loc, ip=ip),
+            e5.ir_value(loc=loc, ip=ip),
+            e6.ir_value(loc=loc, ip=ip),
+            e7.ir_value(loc=loc, ip=ip),
+            enc.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b64 s2, p01, p23, p45, p67;\n"
+            ".reg .f32 a0, a1, a2, a3, a4, a5, a6, a7;\n"
+            "mov.b64 s2, {$16, $16};\n"
+            "mov.b64 p01, {$8, $9};\n"
+            "mov.b64 p23, {$10, $11};\n"
+            "mov.b64 p45, {$12, $13};\n"
+            "mov.b64 p67, {$14, $15};\n"
+            "mul.rn.f32x2 p01, p01, s2;\n"
+            "mul.rn.f32x2 p23, p23, s2;\n"
+            "mul.rn.f32x2 p45, p45, s2;\n"
+            "mul.rn.f32x2 p67, p67, s2;\n"
+            "mov.b64 {a0, a1}, p01;\n"
+            "mov.b64 {a2, a3}, p23;\n"
+            "mov.b64 {a4, a5}, p45;\n"
+            "mov.b64 {a6, a7}, p67;\n"
+            "min.xorsign.abs.f32 $0, a0, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $1, a1, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $2, a2, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $3, a3, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $4, a4, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $5, a5, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $6, a6, 0f40C00000;\n"
+            "min.xorsign.abs.f32 $7, a7, 0f40C00000;\n"
+            "}"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
+        for k in range(8)
+    )
+
+
+@dsl_user_op
+def _div_full_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """Triton's plain ``/``: the approximate (<= 2 ulp) ``div.full.f32``, not ``div.rn``."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "div.full.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _sr_e4m3_byte(
+    corrected: cutlass.Float32, rbits: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
+    """Stochastically round an f32 onto the E4M3 grid, Triton's bit trick op for op, and
+    return the E4M3 byte.
+
+    Shift by 2^-120 so the E4M3 grid (subnormals included) lands on multiples of 2^20 in
+    the f32 bit pattern, add 20 random bits, truncate. Bits 26:20 of the truncated word are
+    exactly the byte's (exp4 | mant3) -- subnormals included, exp field 0 -- and a second
+    shift puts the sign bit beside them (``lop3`` 0xE4 = bit-select: bits 6:0 from the
+    first shift, bit 7 from the second), so the shift back and the narrowing cvt are not
+    needed. ``mul.rn.f32`` without ``.ftz``: E4M3-subnormal scales pass through f32
+    subnormals here.
+
+    Exact while the rounded magnitude is at most 448, the largest finite E4M3; past it
+    Triton's saturating cvt returns 448 where these bits read as the NaN pattern (480) or
+    wrap (512 and up). Finite input guarantees it: the stored scale is at most 256, and
+    the correction ``<v, v> / <v, q>`` is the ``v * q``-weighted mean of the per-element
+    ratios ``v / q`` (an element that rounds to code 0 adds only its ``v^2 <= 1/16`` to
+    the numerator). With a normal stored scale the amax element lands in [5.64, 6] (E4M3
+    rounds within 2^-4 of the target 6), so it weighs at least 33 at a ratio of at most 1;
+    every element at or above 3/4 is at most 5/4 of its RTNE code, and the elements
+    between 1/4 and 3/4 (code 1/2, ratio below 3/2) weigh at most 3/8 each. The maximum
+    is 411/336 = 1.2232, fifteen elements at the 5.0 tie beside a 6: corrected at most
+    313.15, its stochastic round-up at most 320. With a subnormal stored scale (below
+    2^-6) the amax element still lands at 3 or above, so the same mean stays below 2 and
+    the corrected value far below 448.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [corrected.ir_value(loc=loc, ip=ip), rbits.ir_value(loc=loc, ip=ip)],
+            (
+                "{\n"
+                ".reg .b32 u, r, t;\n"
+                ".reg .f32 s;\n"
+                "mul.rn.f32 s, $1, 0f03800000;\n"
+                "mov.b32 u, s;\n"
+                "and.b32 r, $2, 0x000FFFFF;\n"
+                "add.u32 u, u, r;\n"
+                "shr.u32 u, u, 20;\n"
+                "shr.u32 t, u, 4;\n"
+                "lop3.b32 $0, u, t, 0x7F, 0xE4;\n"
+                "}"
+            ),
+            "=r,f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,

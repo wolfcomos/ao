@@ -34,6 +34,14 @@ standalone (no CLC, a static persistent grid) and feeds two UMMA chains from one
 TMA'd 128x128 tile against two resident host-built ``R^T`` operands; its
 ``RHT128_`` constants are its own, the unprefixed ones above belong to the RHT-16
 kernels.
+
+A fourth kernel, ``_Tcgen05GroupRowRhtColRhtQuantizeMsEden``, is the MS-EDEN quantize
+that consumes that amax kernel's two outputs: the same standalone two-chain mainloop,
+each accumulator quantized from TMEM to RTNE FP4 codes plus a corrected,
+stochastically rounded E4M3 block scale drawn from Triton's Philox stream. Its 256
+ceiling is ``EDEN_BLOCK_SCALE_MAX``, imported from the MS-EDEN Triton module (a
+module-level constant defined ahead of that module's Triton guard, so the import is
+Triton-free).
 """
 
 import functools
@@ -58,21 +66,32 @@ from ._cutedsl_kernels_impl import (
     FP32_MAX,
     HADAMARD_DIM,
     TILE_BLOCKS,
+    _abs_amax16,
     _abs_f32,
     _atom_max_f32_nonneg,
     _bf16hi_to_f32,
     _bf16lo_to_f32,
+    _bf16round_f32x8,
+    _cvt_e2m1x8_to_f32,
+    _cvt_rn_e2m1x8_f32,
+    _div_full_f32,
     _div_rn_f32,
     _get_num_sms,
     _get_rht_buffer,
     _get_sr_rng_buffer,
     _max_f32,
     _min_f32,
+    _mul_clamp_f32x8,
     _quant16,
+    _rcp_rn_f32,
     _round_rht_amax,
+    _sr_e4m3_byte,
+    _st_global_v4_u32,
     philox4_all,
     philox_prep,
+    philox_word0,
 )
+from .group_row_rht_col_rht_quantize_ms_eden_triton import EDEN_BLOCK_SCALE_MAX
 
 # --- tile shapes (TE :262-271). M = hidden, N = tokens, K = 16 (the RHT block) ---
 M_TILE = 128  # hidden rows per tile
@@ -204,7 +223,7 @@ def _group_at_work_item(tile_n_base, offsets_t, num_groups):
     return g, offsets_t[g]
 
 
-def _global_scale(amax):
+def _global_scale(amax, fp8_max=FP8_E4M3_MAX):
     """NVFP4 two-level scale scalars from a global amax (TE :779-785).
 
     Returns ``(encode, decode, encode / fp4_max)``; a zero amax yields identity
@@ -213,7 +232,7 @@ def _global_scale(amax):
     is_zero = amax == cutlass.Float32(0.0)
     safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
     c = _min_f32(
-        _div_rn_f32(cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe),
+        _div_rn_f32(cutlass.Float32(fp8_max * FP4_E2M1_MAX), safe),
         cutlass.Float32(FP32_MAX),
     )
     c = cutlass.Float32(
@@ -2315,3 +2334,824 @@ def _cutedsl_group_row_rht_col_rht_amax_impl(
         stream,
     )
     return amax_rht_dy, amax_rht_dy_t
+
+
+# --- grouped rowwise-RHT + columnwise-RHT MS-EDEN quantize (RHT-128 on both axes) ---
+# The mainloop is ``_Tcgen05GroupRowRhtColRhtAmax``'s; only the epilogues and their warp
+# layout differ. Warps: 0 MMA, 1 TMA, 2-3 idle, 4-11 col, 12-19 row -- eight epilogue warps
+# per chain, two per TMEM quadrant, splitting a lane's 8 blocks into 0-3 and 4-7. The
+# per-block chain is ~200 dependent instructions fed by an in-place tcgen05.ld, so four
+# epilogue warps per SM scheduler (not the amax twin's two) are what hides its latency, and
+# a 4-block body per warp is what keeps each scheduler's two bodies inside its instruction
+# cache.
+RHT128_MSEDEN_COL_WARP_BEGIN = 4
+RHT128_MSEDEN_COL_WARP_END = 12
+RHT128_MSEDEN_ROW_WARP_BEGIN = 12
+RHT128_MSEDEN_ROW_WARP_END = 20
+RHT128_MSEDEN_N_WARPS = 20
+RHT128_MSEDEN_TPB = 32 * RHT128_MSEDEN_N_WARPS
+RHT128_MSEDEN_EPI_THREADS = 32 * (
+    RHT128_MSEDEN_COL_WARP_END - RHT128_MSEDEN_COL_WARP_BEGIN
+)  # per chain
+RHT128_MSEDEN_ACC_CONSUMER_WARPS = (
+    RHT128_MSEDEN_COL_WARP_END - RHT128_MSEDEN_COL_WARP_BEGIN
+) + (RHT128_MSEDEN_ROW_WARP_END - RHT128_MSEDEN_ROW_WARP_BEGIN)
+RHT128_MSEDEN_BLOCKS_PER_WARP = (RHT128_DIM // 16) // 2  # 4 of a lane's 8 blocks
+
+
+def _dot16_tree_rn(a, b):
+    """sum a_i * b_i over 16 values in Triton's order (read off the op's PTX):
+    scalar RN products, pairs added lane-wise as ((p0+p2)+(p4+p6))+((p8+p10)+(p12+p14))
+    and its odd twin in the two f32x2 lanes, then even + odd. Every op rounds to
+    nearest and none is fused, so the bits equal Triton's tl.sum; a fused multiply-add
+    anywhere here would move the last ulp of the ratio and flip stochastic roundings."""
+    p = [
+        cute.arch.mul_packed_f32x2((a[2 * j], a[2 * j + 1]), (b[2 * j], b[2 * j + 1]))
+        for j in range(8)
+    ]
+    s = [cute.arch.add_packed_f32x2(p[2 * j], p[2 * j + 1]) for j in range(4)]
+    t0 = cute.arch.add_packed_f32x2(s[0], s[1])
+    t1 = cute.arch.add_packed_f32x2(s[2], s[3])
+    even, odd = cute.arch.add_packed_f32x2(t0, t1)
+    return even + odd
+
+
+def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec):
+    """``_enc_from_amax`` at the MS-EDEN ceiling, returning the stored E4M3 scale widened to
+    f32 (the correction multiplies that value, not the byte). ``rcp.rn`` is the same
+    correctly rounded reciprocal as ``div.rn`` without the division's slow-path fixups."""
+    pvscale = _min_f32(amax * enc_over_fp4max, cutlass.Float32(EDEN_BLOCK_SCALE_MAX))
+    pv_f32 = cute.make_rmem_tensor((4,), cutlass.Float32)
+    for i in range(4):
+        pv_f32[i] = pvscale
+    pv_f8 = cute.make_rmem_tensor((4,), cutlass.Float8E4M3FN)
+    pv_f8.store(pv_f32.load().to(cutlass.Float8E4M3FN))
+    pv_back = cute.make_rmem_tensor((4,), cutlass.Float32)
+    pv_back.store(pv_f8.load().to(cutlass.Float32))
+    sf8 = pv_back[0]
+    enc = _min_f32(_rcp_rn_f32(sf8 * dec), cutlass.Float32(FP32_MAX))
+    return enc, sf8
+
+
+def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
+    """One 1x16 MS-EDEN block from 16 raw f32 accumulator values -> (w0, w1, E4M3 byte).
+
+    RTNE codes against the pre-correction E4M3 scale (cap 256), then the stochastically
+    rounded ``sf8 * <v, v> / <v, q>`` with ``rbits`` the block's Triton Philox word. The
+    correction reads back the codes it just packed, so it measures that exact rounding.
+    """
+    # The bf16-exact values serve both consumers of the rounding: their max is the block
+    # amax (what ``_round_rht_amax`` of the raw amax gives: RTNE is monotonic in magnitude,
+    # so the max of the rounded values is the rounded max) and they are what the encode
+    # multiplier scales.
+    zero = cutlass.Float32(0.0)
+    e = _bf16round_f32x8(
+        vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], zero
+    ) + _bf16round_f32x8(
+        vals[8],
+        vals[9],
+        vals[10],
+        vals[11],
+        vals[12],
+        vals[13],
+        vals[14],
+        vals[15],
+        zero,
+    )
+    enc, sf8 = _ms_eden_enc_from_amax(_abs_amax16(e), enc_over_fp4max, dec)
+    v = _mul_clamp_f32x8(*e[0:8], enc) + _mul_clamp_f32x8(*e[8:16], enc)
+    w0 = _cvt_rn_e2m1x8_f32(*v[0:8])
+    w1 = _cvt_rn_e2m1x8_f32(*v[8:16])
+    q = _cvt_e2m1x8_to_f32(w0) + _cvt_e2m1x8_to_f32(w1)
+    dot_sq = _dot16_tree_rn(v, v)
+    dot_cross = _dot16_tree_rn(v, q)
+    ratio = _div_full_f32(dot_sq, dot_cross)
+    # False for inf and NaN, as Triton's ``< inf``; a zero ``dot_cross`` makes the ratio
+    # inf or NaN, so Triton's ``!= 0`` guard is implied.
+    finite = _abs_f32(ratio) <= cutlass.Float32(FP32_MAX)
+    corr = cutlass.Float32(cutlass.select_(finite, ratio, cutlass.Float32(1.0)))
+    # ONE RN multiply of the widened E4M3 scale (no clamp), as Triton's
+    # ``block_scale * correction``.
+    return w0, w1, _sr_e4m3_byte(sf8 * corr, rbits)
+
+
+@cute.jit
+def _rht128_tile_ms_eden(
+    acc, tidx, enc_over_fp4max, dec, state, idx_base, u_base, row_addr, rSF
+):
+    """MS-EDEN quantize this warp's eighth of one 128x128 f32 TMEM accumulator: this
+    thread's lane = one output row, blocks ``u_base .. u_base + 3`` of its 8.
+
+    The codes go straight to global as two 16-byte stores into the lane's 16 code words
+    at ``row_addr``; the four scale bytes land in ``rSF`` for the chain's own scatter.
+    ``u_base`` is warp-uniform but dynamic, so both warps of a quadrant run one body.
+    """
+    copy_atom_t2r = sm100_utils.get_tmem_load_op(
+        RHT128_CTA_TILE_COL,
+        utils.LayoutEnum.ROW_MAJOR,
+        cutlass.Float32,
+        cutlass.Float32,
+        RHT128_EPI_TILE,
+        False,
+    )
+    tAcc = transform_partitioned_tensor_layout(acc)
+    tAcc_epi = cute.flat_divide(tAcc, RHT128_EPI_TILE)
+    tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
+    thr_copy = tiled_copy_t2r.get_slice(tidx)
+    tTR_tAcc = thr_copy.partition_S(tAcc_epi)
+    tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+    rCodes = cute.make_rmem_tensor((2 * RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint32)
+    for j in cutlass.range_constexpr(RHT128_MSEDEN_BLOCKS_PER_WARP):
+        u = u_base + cutlass.Int32(j)
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
+        vals = tTR_rAcc.load().reshape((16,))
+        # Triton's tl.randint word for this block: Philox4x32-10 at counter
+        # (offset_base, linear_idx, 0, 0), word 0.
+        rbits = philox_word0(state, cutlass.Uint32(idx_base + u))
+        w0, w1, sf = _ms_eden_block16(vals, enc_over_fp4max, dec, rbits)
+        rCodes[2 * j] = w0
+        rCodes[2 * j + 1] = w1
+        rSF[j] = cutlass.Uint8(sf)
+    # 16-byte aligned by construction: the code row starts on a 64-byte boundary (the u32
+    # pitch and the tile column are multiples of 16 words, the buffer is torch.empty's) and
+    # ``u_base * 8`` is 0 or 32.
+    code_addr = row_addr + cutlass.Int64(u_base) * cutlass.Int64(8)
+    _st_global_v4_u32(code_addr, rCodes[0], rCodes[1], rCodes[2], rCodes[3])
+    _st_global_v4_u32(
+        code_addr + cutlass.Int64(16), rCodes[4], rCodes[5], rCodes[6], rCodes[7]
+    )
+
+
+def _store_grouped_col_sf_word(mSF_u32, rSF, r, c_base, g, offsets_t, hidden):
+    """``_store_grouped_col_sf_u32`` for the four scale bytes one MS-EDEN warp holds: the
+    u32 word of the group-local swizzled tile that holds columns ``c_base .. c_base + 3``
+    (``c_base % 4 == 0``)."""
+    prev = cutlass.select_(g > cutlass.Int32(0), g - cutlass.Int32(1), 0)
+    group_start = cutlass.select_(
+        g > cutlass.Int32(0), offsets_t[prev], cutlass.Int32(0)
+    )
+    group_len = offsets_t[g] - group_start
+    r_blk = r // cutlass.Int32(128)
+    r_lane = r % cutlass.Int32(32)
+    r_grp = (r % cutlass.Int32(128)) // cutlass.Int32(32)
+    prefix_words = cutlass.Int32(
+        cutlass.Int64(hidden) * cutlass.Int64(group_start) // cutlass.Int64(64)
+    )
+    words_per_hidden_block = group_len * cutlass.Int32(2)
+    c_local = c_base - group_start // cutlass.Int32(16)
+    mSF_u32[
+        prefix_words
+        + r_blk * words_per_hidden_block
+        + (c_local // cutlass.Int32(4)) * cutlass.Int32(128)
+        + r_lane * cutlass.Int32(4)
+        + r_grp
+    ] = cute.recast_tensor(rSF, cutlass.Uint32)[0]
+
+
+@cute.jit
+def _rht128_ms_eden_epilogue(
+    chain: cutlass.Constexpr,
+    mFP4,
+    mSF,
+    amax_t,
+    sr_rng_t,
+    tCtAcc,
+    acc_pipeline,
+    offsets_t,
+    num_tensors,
+    t_begin,
+    t_end,
+    tiles_in_m,
+    hidden,
+    tokens,
+    tidx,
+):
+    """One epilogue body for both chains: consume the acc ring over this CTA's chunk.
+
+    Tiles are enumerated hidden-fastest, so ``token`` is non-decreasing and the group
+    cache is ``_rht128_amax_epilogue``'s; a crossing reloads the group's two-level
+    scale instead of flushing. Chain 0 quantizes ``dy.t() @ R_m`` (lane = hidden row,
+    blocks along tokens, per-group swizzled scales); chain 1 quantizes ``dy @ R_n``
+    (lane = token, blocks along hidden). The chain's second warp group takes blocks
+    4-7 of every lane.
+    """
+    acc_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
+    )
+    r_local = tidx % cutlass.Int32(128)
+    # Warps 4-7 / 12-15 take blocks 0-3 of their quadrant's lanes, warps 8-11 / 16-19
+    # blocks 4-7.
+    half = (
+        (tidx - cutlass.Int32(32 * RHT128_MSEDEN_COL_WARP_BEGIN)) // cutlass.Int32(128)
+    ) % cutlass.Int32(2)
+    u_base = half * cutlass.Int32(RHT128_MSEDEN_BLOCKS_PER_WARP)
+    if cutlass.const_expr(chain == 0):
+        state = philox_prep(
+            cutlass.Uint32(sr_rng_t[0]),
+            cutlass.Uint32(sr_rng_t[1]),
+            cutlass.Uint32(sr_rng_t[2]),
+        )
+        # Triton's INNER // 16 with INNER = M, the packed capacity.
+        inner_blocks = tokens // cutlass.Int32(16)
+    else:
+        state = philox_prep(
+            cutlass.Uint32(sr_rng_t[4]),
+            cutlass.Uint32(sr_rng_t[5]),
+            cutlass.Uint32(sr_rng_t[6]),
+        )
+        inner_blocks = hidden // cutlass.Int32(16)
+    g = _group_idx(
+        (t_begin // tiles_in_m) * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors
+    )
+    g_end = offsets_t[g]
+    _, dec, enc_over_fp4max = _global_scale(amax_t[g], EDEN_BLOCK_SCALE_MAX)
+    rSF = cute.make_rmem_tensor((RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint8)
+    for i in cutlass.range(t_end - t_begin, unroll=1):
+        t = t_begin + i
+        tile_n = t // tiles_in_m
+        tile_m = t - tile_n * tiles_in_m
+        token = tile_n * cutlass.Int32(TOKEN_TILE)
+        if token >= g_end:
+            g = _group_idx(token, offsets_t, num_tensors)
+            g_end = offsets_t[g]
+            _, dec, enc_over_fp4max = _global_scale(amax_t[g], EDEN_BLOCK_SCALE_MAX)
+        if cutlass.const_expr(chain == 0):
+            outer = tile_m * cutlass.Int32(M_TILE) + r_local  # hidden row
+            inner_tile = tile_n
+            gOut = cute.local_tile(mFP4, (M_TILE, TOKEN_TILE // 8), (tile_m, tile_n))
+        else:
+            outer = token + r_local  # packed token row
+            inner_tile = tile_m
+            gOut = cute.local_tile(mFP4, (TOKEN_TILE, M_TILE // 8), (tile_n, tile_m))
+        # linear_idx of block 0: the flat index of the scale in the plain
+        # (outer, inner // 16) layout, Triton's counter.
+        idx_base = outer * inner_blocks + inner_tile * cutlass.Int32(RHT128_DIM // 16)
+        acc_pipeline.consumer_wait(acc_state)
+        _rht128_tile_ms_eden(
+            tCtAcc[(None, None, None, 2 * acc_state.index + chain)],
+            tidx,
+            enc_over_fp4max,
+            dec,
+            state,
+            idx_base,
+            u_base,
+            gOut[(r_local, None)].iterator.toint(),
+            rSF,
+        )
+        cute.arch.fence_view_async_tmem_load()
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(acc_state)
+        acc_state.advance()
+        c_base = inner_tile * cutlass.Int32(RHT128_DIM // 16) + u_base
+        if cutlass.const_expr(chain == 0):
+            _store_grouped_col_sf_word(mSF, rSF, outer, c_base, g, offsets_t, hidden)
+        else:
+            rSF_f8 = cute.recast_tensor(rSF, cutlass.Float8E4M3FN)
+            for j in cutlass.range_constexpr(RHT128_MSEDEN_BLOCKS_PER_WARP):
+                _store_sf_byte(mSF, rSF_f8[j], outer, c_base + cutlass.Int32(j))
+
+
+class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
+    """Per-group MS-EDEN quantize of ``dy @ R_n`` and ``dy.t() @ R_m`` in one pass over ``dy``.
+
+    Standalone (no ``_GroupRhtMainloop``): the mainloop is ``_Tcgen05GroupRowRhtColRhtAmax``'s
+    -- every 128x128 tile is TMA'd once and feeds two UMMA chains against two resident
+    host-built K-major ``R^T`` tiles; the col chain reads the stage MN-major and the row
+    chain reads the same bytes through a K-major view. Each accumulator is quantized from
+    TMEM: RTNE FP4 codes against the group's two-level scale (ceiling 256), then the
+    corrected, stochastically rounded E4M3 block scale from Triton's Philox stream. Static
+    persistent grid: CTA ``b`` owns the contiguous tile chunk ``_static_tile_range``, tiles
+    below ``logical_packed_length`` only, hidden-fastest. Twenty warps (``RHT128_MSEDEN_*``):
+    eight epilogue warps per chain, launch-bounded to one CTA per SM (at most 96 registers a
+    thread, 65536 / 640 at the 8-register granularity, no ``setmaxnreg``).
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,  # dy.t().unsqueeze(-1): (hidden, tokens, 1)
+        mBrow: cute.Tensor,  # R_n^T (128 j, 128 k, 1), row chain (dgrad signs)
+        mBcol: cute.Tensor,  # R_m^T (128 j, 128 k, 1), col chain (wgrad signs)
+        mRowFP4: cute.Tensor,  # (tokens, hidden // 8) u32 rowwise codes
+        mRowSF: cute.Tensor,  # (tokens // 128, hidden // 64, 32, 16) e4m3
+        mColFP4: cute.Tensor,  # (hidden, tokens // 8) u32 columnwise codes
+        mColSF: cute.Tensor,  # flat u32 view of the per-group swizzled e4m3 scales
+        row_amax_t: cute.Tensor,  # amax_rht_dy (num_tensors,) f32: row chain
+        col_amax_t: cute.Tensor,  # amax_rht_dy_t (num_tensors,) f32: col chain
+        sr_rng_t: cute.Tensor,  # (8,) i32: [col_seed lo/hi, col_off lo/hi, row_seed lo/hi, row_off lo/hi]
+        offsets_t: cute.Tensor,
+        logical_len_t: cute.Tensor,
+        hidden: cutlass.Int32,
+        tokens: cutlass.Int32,  # the col-chain Philox pitch is tokens // 16
+        num_tensors: cutlass.Int32,
+        num_ctas: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        k_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        mn_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.MN_SW128, cutlass.BFloat16
+        )
+        g2s = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        mma_col = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            RHT128_MMA_TILER_COL,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
+        )
+        tiled_mma_col = cute.make_tiled_mma(cute.make_mma_atom(mma_col))
+        mma_row = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            RHT128_MMA_TILER_ROW,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+        )
+        tiled_mma_row = cute.make_tiled_mma(cute.make_mma_atom(mma_row))
+        a_shape = tiled_mma_col.partition_shape_A(
+            cute.dice(RHT128_CTA_TILE_COL, (1, None, 1))
+        )
+        a_smem_layout_staged = tcgen05.tile_to_mma_shape(
+            mn_atom, cute.append(a_shape, RHT128_MAINLOOP_STAGES), order=(1, 2, 3)
+        )
+        ar_shape = tiled_mma_row.partition_shape_A(
+            cute.dice(RHT128_CTA_TILE_ROW, (1, None, 1))
+        )
+        a_row_layout_staged = tcgen05.tile_to_mma_shape(
+            k_atom, cute.append(ar_shape, RHT128_MAINLOOP_STAGES), order=(2, 1, 3)
+        )
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            g2s,
+            mA,
+            cute.slice_(a_smem_layout_staged, (None, None, None, 0)),
+            RHT128_CTA_TILE_COL,
+            tiled_mma_col,
+            (1, 1, 1, 1),
+        )
+        b_shape = tiled_mma_col.partition_shape_B(
+            cute.dice(RHT128_CTA_TILE_COL, (None, 1, 1))
+        )
+        b_smem_layout = tcgen05.tile_to_mma_shape(
+            k_atom, cute.append(b_shape, 1), order=(1, 2, 3)
+        )
+        tma_atom_b_col, tma_tensor_b_col = cute.nvgpu.make_tiled_tma_atom_B(
+            g2s,
+            mBcol,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            RHT128_CTA_TILE_COL,
+            tiled_mma_col,
+            (1, 1, 1, 1),
+        )
+        tma_atom_b_row, tma_tensor_b_row = cute.nvgpu.make_tiled_tma_atom_B(
+            g2s,
+            mBrow,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            RHT128_CTA_TILE_ROW,
+            tiled_mma_row,
+            (1, 1, 1, 1),
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma_col.thr_id.shape,)
+        )
+        tCtAcc_fake = tiled_mma_row.make_fragment_C(
+            cute.append(
+                tiled_mma_row.partition_shape_C((TOKEN_TILE, RHT128_DIM)),
+                2 * RHT128_ACC_STAGES,
+            )
+        )
+        num_tmem_alloc_cols = sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.kernel(
+            tiled_mma_col,
+            tiled_mma_row,
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b_col,
+            tma_tensor_b_col,
+            tma_atom_b_row,
+            tma_tensor_b_row,
+            mRowFP4,
+            mRowSF,
+            mColFP4,
+            mColSF,
+            row_amax_t,
+            col_amax_t,
+            sr_rng_t,
+            offsets_t,
+            logical_len_t,
+            cluster_layout_vmnk,
+            a_smem_layout_staged,
+            a_row_layout_staged,
+            b_smem_layout,
+            tCtAcc_fake.layout,
+            num_tmem_alloc_cols,
+            hidden,
+            tokens,
+            num_tensors,
+        ).launch(
+            grid=(num_ctas, 1, 1),
+            block=(RHT128_MSEDEN_TPB, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma_col: cute.TiledMma,
+        tiled_mma_row: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_b_col: cute.CopyAtom,
+        mBcol: cute.Tensor,
+        tma_atom_b_row: cute.CopyAtom,
+        mBrow: cute.Tensor,
+        mRowFP4: cute.Tensor,
+        mRowSF: cute.Tensor,
+        mColFP4: cute.Tensor,
+        mColSF: cute.Tensor,
+        row_amax_t: cute.Tensor,
+        col_amax_t: cute.Tensor,
+        sr_rng_t: cute.Tensor,
+        offsets_t: cute.Tensor,
+        logical_len_t: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        a_row_layout_staged: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        acc_fake_layout: cute.Layout,
+        num_tmem_alloc_cols: cutlass.Constexpr,
+        hidden: cutlass.Int32,
+        tokens: cutlass.Int32,
+        num_tensors: cutlass.Int32,
+    ):
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        tiles_in_m = hidden // cutlass.Int32(M_TILE)
+        tiles_in_n_valid = logical_len_t[0] // cutlass.Int32(TOKEN_TILE)
+        t_begin, t_end = _static_tile_range(tiles_in_m * tiles_in_n_valid, bidx, gdim)
+        n_my = t_end - t_begin
+
+        if warp_idx == TMA_WARP:
+            cpasync.prefetch_descriptor(tma_atom_a)
+            cpasync.prefetch_descriptor(tma_atom_b_col)
+            cpasync.prefetch_descriptor(tma_atom_b_row)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_MAINLOOP_STAGES * 2]
+            acc_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_ACC_STAGES * 2]
+            b_mbar: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+
+        ab_pipeline = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.ab_mbar.data_ptr(),
+            num_stages=RHT128_MAINLOOP_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            tx_count=_A_TILE_BYTES,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        ab_producer, ab_consumer = ab_pipeline.make_participants()
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=storage.acc_mbar.data_ptr(),
+            num_stages=RHT128_ACC_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, RHT128_MSEDEN_ACC_CONSUMER_WARPS
+            ),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        # MMA warp + both epilogue groups retrieve the TMEM pointer.
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_ALLOC_BAR, num_threads=32 + 2 * RHT128_MSEDEN_EPI_THREADS
+        )
+        tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_DEALLOC_BAR, num_threads=2 * RHT128_MSEDEN_EPI_THREADS
+        )
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=RHT128_MSEDEN_COL_WARP_BEGIN,
+            is_two_cta=False,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+        )
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(storage.b_mbar.ptr, 1)
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+
+        raw_a = smem.allocate_array(
+            cutlass.BFloat16,
+            cute.cosize(a_smem_layout_staged.outer),
+            byte_alignment=128,
+        )
+        sA = cute.make_tensor(
+            cute.recast_ptr(raw_a, a_smem_layout_staged.inner, dtype=cutlass.BFloat16),
+            a_smem_layout_staged.outer,
+        )
+        sA_row = cute.make_tensor(
+            cute.recast_ptr(raw_a, a_row_layout_staged.inner, dtype=cutlass.BFloat16),
+            a_row_layout_staged.outer,
+        )
+        sBcol = smem.allocate_tensor(
+            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+        sBrow = smem.allocate_tensor(
+            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+
+        cta_layout = cute.make_layout((1,))
+        thr_col = tiled_mma_col.get_slice(0)
+        thr_row = tiled_mma_row.get_slice(0)
+        gA = cute.local_tile(
+            mA, cute.slice_(RHT128_CTA_TILE_COL, (None, 0, None)), (None, None, None)
+        )
+        gBcol = cute.local_tile(
+            mBcol, cute.slice_(RHT128_CTA_TILE_COL, (0, None, None)), (None, None, None)
+        )
+        gBrow = cute.local_tile(
+            mBrow, cute.slice_(RHT128_CTA_TILE_ROW, (0, None, None)), (None, None, None)
+        )
+        tAsA, tAgA = cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cta_layout,
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(thr_col.partition_A(gA), 0, 3),
+        )
+        tBsBcol, tBgBcol = cpasync.tma_partition(
+            tma_atom_b_col,
+            0,
+            cta_layout,
+            cute.group_modes(sBcol, 0, 3),
+            cute.group_modes(thr_col.partition_B(gBcol), 0, 3),
+        )
+        tBsBrow, tBgBrow = cpasync.tma_partition(
+            tma_atom_b_row,
+            0,
+            cta_layout,
+            cute.group_modes(sBrow, 0, 3),
+            cute.group_modes(thr_row.partition_B(gBrow), 0, 3),
+        )
+        tCrA_col = tiled_mma_col.make_fragment_A(sA)
+        tCrB_col = tiled_mma_col.make_fragment_B(sBcol)
+        tCrA_row = tiled_mma_row.make_fragment_A(sA_row)
+        tCrB_row = tiled_mma_row.make_fragment_B(sBrow)
+
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        # ==================== TMA warp ====================
+        if warp_idx == TMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    storage.b_mbar.ptr, 2 * RHT128_B_BYTES
+                )
+            cute.copy(
+                tma_atom_b_col,
+                tBgBcol[(None, 0, 0, 0)],
+                tBsBcol[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+            cute.copy(
+                tma_atom_b_row,
+                tBgBrow[(None, 0, 0, 0)],
+                tBsBrow[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+            for i in cutlass.range(n_my, unroll=1):
+                t = t_begin + i
+                tile_n = t // tiles_in_m
+                tile_m = t - tile_n * tiles_in_m
+                handle = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, tile_m, tile_n, 0)],
+                    tAsA[(None, handle.index)],
+                    tma_bar_ptr=handle.barrier,
+                )
+            ab_producer.tail()
+
+        # ==================== MMA warp ====================
+        if warp_idx == MMA_WARP:
+            tmem.wait_for_alloc()
+            tCtAcc = cute.make_tensor(
+                tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
+            )
+            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, RHT128_ACC_STAGES
+            )
+            for i in cutlass.range(n_my, unroll=1):
+                ab_handle = ab_consumer.wait_and_advance()
+                acc_pipeline.producer_acquire(acc_state)
+                acc_col = tCtAcc[(None, None, None, 2 * acc_state.index + 0)]
+                acc_row = tCtAcc[(None, None, None, 2 * acc_state.index + 1)]
+                for kb in cutlass.range_constexpr(RHT128_K_BLOCKS):
+                    tiled_mma_col.set(tcgen05.Field.ACCUMULATE, kb > 0)
+                    cute.gemm(
+                        tiled_mma_col,
+                        acc_col,
+                        tCrA_col[(None, None, kb, ab_handle.index)],
+                        tCrB_col[(None, None, kb, 0)],
+                        acc_col,
+                    )
+                    tiled_mma_row.set(tcgen05.Field.ACCUMULATE, kb > 0)
+                    cute.gemm(
+                        tiled_mma_row,
+                        acc_row,
+                        tCrA_row[(None, None, kb, ab_handle.index)],
+                        tCrB_row[(None, None, kb, 0)],
+                        acc_row,
+                    )
+                # One elected tcgen05.commit covers both chains' 16 UMMAs.
+                acc_pipeline.producer_commit(acc_state)
+                acc_state.advance()
+                ab_handle.release()
+            acc_pipeline.producer_tail(acc_state)
+
+        # ==================== col epilogue: ms_eden(dy.t() @ R_m) -> (col_fp4, col_sf) ====================
+        if (
+            warp_idx >= RHT128_MSEDEN_COL_WARP_BEGIN
+            and warp_idx < RHT128_MSEDEN_COL_WARP_END
+        ):
+            tmem.allocate(num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
+            _rht128_ms_eden_epilogue(
+                0,
+                mColFP4,
+                mColSF,
+                col_amax_t,
+                sr_rng_t,
+                tCtAcc,
+                acc_pipeline,
+                offsets_t,
+                num_tensors,
+                t_begin,
+                t_end,
+                tiles_in_m,
+                hidden,
+                tokens,
+                tidx,
+            )
+            tmem_dealloc_barrier.arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+        # ==================== row epilogue: ms_eden(dy @ R_n) -> (row_fp4, row_sf) ====================
+        if (
+            warp_idx >= RHT128_MSEDEN_ROW_WARP_BEGIN
+            and warp_idx < RHT128_MSEDEN_ROW_WARP_END
+        ):
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
+            _rht128_ms_eden_epilogue(
+                1,
+                mRowFP4,
+                mRowSF,
+                row_amax_t,
+                sr_rng_t,
+                tCtAcc,
+                acc_pipeline,
+                offsets_t,
+                num_tensors,
+                t_begin,
+                t_end,
+                tiles_in_m,
+                hidden,
+                tokens,
+                tidx,
+            )
+            tmem_dealloc_barrier.arrive_and_wait()
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(device_idx: int):
+    """Compile the grouped row-RHT + col-RHT MS-EDEN quantize kernel with symbolic shapes."""
+    free = cute.sym_int
+    h_sym = cute.sym_int(divisibility=M_TILE)
+    t_sym = cute.sym_int(divisibility=TOKEN_TILE)
+    k = _Tcgen05GroupRowRhtColRhtQuantizeMsEden()
+    return cute.compile(
+        k,
+        make_fake_tensor(cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1)),
+        make_fake_tensor(
+            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+        ),
+        make_fake_tensor(
+            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+        ),
+        # Each epilogue thread stores its warp's four blocks of a lane's 16 code words as
+        # two 16-byte ``st.global.v4`` (``_rht128_tile_ms_eden``); assumed_align=16 and the
+        # divisibilities record why that is aligned: hidden % 128 makes the rowwise u32
+        # pitch hidden // 8 a multiple of 16, tokens % 128 the columnwise one, so every
+        # lane's 64-byte code row and its 16-byte quarters start 16-byte aligned.
+        make_fake_tensor(
+            cutlass.Uint32,
+            (t_sym, cute.sym_int(divisibility=M_TILE // 8)),
+            stride=(cute.sym_int(divisibility=M_TILE // 8), 1),
+            assumed_align=16,
+        ),
+        make_fake_tensor(
+            cutlass.Float8E4M3FN, (free(), free(), 32, 16), stride=(free(), 512, 16, 1)
+        ),
+        make_fake_tensor(
+            cutlass.Uint32,
+            (h_sym, cute.sym_int(divisibility=TOKEN_TILE // 8)),
+            stride=(cute.sym_int(divisibility=TOKEN_TILE // 8), 1),
+            assumed_align=16,
+        ),
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (8,), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (1,), stride=(1,)),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
+    dy: torch.Tensor,
+    row_rht_nk: torch.Tensor,
+    col_rht_nk: torch.Tensor,
+    amax_rht_dy: torch.Tensor,
+    amax_rht_dy_t: torch.Tensor,
+    offsets: torch.Tensor,
+    num_tensors: int,
+    rng_state: torch.Tensor,
+    logical_packed_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MS-EDEN quantize of ``dy @ R_n`` (rowwise) and ``dy.t() @ R_m`` (columnwise), per group.
+
+    Returns ``(row_fp4, row_sf, col_fp4, col_sf)`` rowwise first: uint8 code views of the
+    u32 buffers and the 4-D swizzled e4m3 scale storage the wrapper returns as 2-D views.
+    Rows at or after ``logical_packed_length`` are never read and their outputs are left
+    as allocated.
+    """
+    tokens, hidden = dy.shape
+    dev = dy.device
+    dy = dy.detach()
+
+    row_fp4 = torch.empty((tokens, hidden // 8), dtype=torch.uint32, device=dev)
+    col_fp4 = torch.empty((hidden, tokens // 8), dtype=torch.uint32, device=dev)
+    row_sf = torch.empty(
+        (tokens // 128, hidden // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    col_sf = torch.empty(
+        (hidden // 128, tokens // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+
+    sr_rng_t = _get_sr_rng_buffer(dev.index)
+    # [col_seed, col_offset, row_seed, row_offset] int64 -> the eight little-endian
+    # 32-bit halves (see the fused kernel).
+    sr_rng_t.copy_(rng_state[:4].view(torch.int32))
+    if logical_packed_length is None:
+        logical_packed_length = offsets[-1:]
+    # See the fused kernel: the entry point requires byte_offset==0.
+    logical_packed_length = logical_packed_length.clone()
+    tiles = (hidden // M_TILE) * (tokens // TOKEN_TILE)
+    num_ctas = max(1, min(tiles, _get_num_sms(dev.index)))
+
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+    _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(dev.index)(
+        dy.t().unsqueeze(-1),
+        row_rht_nk.unsqueeze(-1),
+        col_rht_nk.unsqueeze(-1),
+        row_fp4,
+        row_sf,
+        col_fp4,
+        col_sf.view(torch.uint32).flatten(),
+        amax_rht_dy,
+        amax_rht_dy_t,
+        sr_rng_t,
+        offsets,
+        logical_packed_length,
+        int(hidden),
+        int(tokens),
+        int(num_tensors),
+        int(num_ctas),
+        stream,
+    )
+    return row_fp4.view(torch.uint8), row_sf, col_fp4.view(torch.uint8), col_sf
