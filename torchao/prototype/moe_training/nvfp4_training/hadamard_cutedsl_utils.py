@@ -139,6 +139,8 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     # Same for the grouped (per-expert MoE) kernels, which tile at 128 rows already.
     from ._cutedsl_group_kernels_impl import (
         _compile_group_amax_kernel,
+        _compile_group_col_rht_requant_amax_kernel,
+        _compile_group_col_rht_requantize_kernel,
         _compile_group_fused_kernel,
         _compile_group_row_rht_col_rht_amax_kernel,
         _compile_group_row_rht_col_rht_quantize_ms_eden_kernel,
@@ -153,4 +155,6 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     # Hadamard; warm that cache too, so neither the compile nor H128 lands in the graph pool.
     _compile_group_row_rht_col_rht_amax_kernel(idx)
     _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx)
+    _compile_group_col_rht_requant_amax_kernel(idx)
+    _compile_group_col_rht_requantize_kernel(idx)
     get_hadamard_matrix(128, _device_key(dev), torch.bfloat16)

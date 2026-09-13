@@ -42,6 +42,15 @@ stochastically rounded E4M3 block scale drawn from Triton's Philox stream. Its 2
 ceiling is ``EDEN_BLOCK_SCALE_MAX``, imported from the MS-EDEN Triton module (a
 module-level constant defined ahead of that module's Triton guard, so the import is
 Triton-free).
+
+Two more kernels, ``_Tcgen05GroupColRhtRequantAmax`` and ``_Tcgen05GroupColRhtRequantize``,
+serve the V2 backward weight path: the dequantized weight tile is rebuilt on chip from
+the rowwise NVFP4 codes and swizzled scales by eight producer warps, rotated by the
+resident constant ``H128`` through one UMMA chain with the sign vector folded into the
+per-row decode scale, and either amax-reduced per expert or requantized to columnwise
+NVFP4. They take an expert-uniform ``(E, M, N)`` stack (expert = tile-derived, no
+offsets, no group cap) and share the producer as the Triton file shares
+``_load_rht_requant_weight_tile``.
 """
 
 import functools
@@ -74,8 +83,12 @@ from ._cutedsl_kernels_impl import (
     _bf16round_f32x8,
     _cvt_e2m1x8_to_f32,
     _cvt_rn_e2m1x8_f32,
+    _dequant_e2m1x8_bf16x2x4,
     _div_full_f32,
     _div_rn_f32,
+    _e4m3x2_to_f16x2,
+    _f16hi_to_f32,
+    _f16lo_to_f32,
     _get_num_sms,
     _get_rht_buffer,
     _get_sr_rng_buffer,
@@ -3155,3 +3168,1227 @@ def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
         stream,
     )
     return row_fp4.view(torch.uint8), row_sf, col_fp4.view(torch.uint8), col_sf
+
+
+# --- grouped columnwise-RHT weight requantization (RHT-128 on the transposed weight) ---
+# Flavor-B siblings of the two kernels above: an expert-uniform ``(E, M, N)`` weight
+# stack, the expert derived from the tile index (no offsets, no group cap). Warps of the
+# amax kernel: 0 MMA (+ the one-shot TMA of the resident ``H128``), 1-4 epilogue (lane =
+# TMEM lane = output row n, quadrant-aligned via ``tidx % 128``), 5-12 one 256-thread
+# producer group that dequantizes the codes into the MN-major SW128 A stage; the
+# requantize kernel has eight epilogue warps (1-8) and the producers at 9-16
+# (``RHT128_COLRHT_REQ_*``). Four A stages: the RHT-16 reserve-based
+# ``RHT128_MAINLOOP_STAGES`` (5) is the TMA kernels' budget, not this one's.
+RHT128_COLRHT_STAGES = 4
+RHT128_COLRHT_EPI_WARP_BEGIN = 1
+RHT128_COLRHT_EPI_WARP_END = 5
+RHT128_COLRHT_PROD_WARP_BEGIN = 5
+RHT128_COLRHT_N_WARPS = 13
+RHT128_COLRHT_TPB = 32 * RHT128_COLRHT_N_WARPS
+RHT128_COLRHT_PROD_THREADS = 32 * (
+    RHT128_COLRHT_N_WARPS - RHT128_COLRHT_PROD_WARP_BEGIN
+)
+RHT128_COLRHT_EPI_WARPS = RHT128_COLRHT_EPI_WARP_END - RHT128_COLRHT_EPI_WARP_BEGIN
+RHT128_COLRHT_A_STAGE_BYTES = RHT128_DIM * RHT128_DIM * 2
+RHT128_COLRHT_ACC_ZERO_BAR = 3
+# The requantize class runs eight epilogue warps (1-8), two per TMEM quadrant, each
+# taking four of its lanes' eight blocks -- the MS-EDEN class's layout, for the same
+# reason: a lane's RTNE block chain is latency-bound with one warp per scheduler.
+RHT128_COLRHT_REQ_EPI_WARP_END = 9
+RHT128_COLRHT_REQ_PROD_WARP_BEGIN = 9
+RHT128_COLRHT_REQ_N_WARPS = 17
+RHT128_COLRHT_REQ_TPB = 32 * RHT128_COLRHT_REQ_N_WARPS
+RHT128_COLRHT_REQ_EPI_WARPS = (
+    RHT128_COLRHT_REQ_EPI_WARP_END - RHT128_COLRHT_EPI_WARP_BEGIN
+)
+RHT128_COLRHT_REQ_EPI_THREADS = 32 * RHT128_COLRHT_REQ_EPI_WARPS
+RHT128_COLRHT_REQ_BLOCKS_PER_WARP = (RHT128_DIM // 16) // 2
+
+
+def _rht128_colrht_tile(t, tiles_per_expert, tiles_n):
+    """Expert-major tile ``t`` -> ``(e, pid_m, pid_n)``; ``pid_n`` fastest."""
+    e = t // tiles_per_expert
+    r = t - e * tiles_per_expert
+    pid_m = r // tiles_n
+    pid_n = r - pid_m * tiles_n
+    return e, pid_m, pid_n
+
+
+def _rht128_colrht_prefetch(
+    mCodes, mSF, pre_lo, pre_hi, pre_sf, e, pid_m, pid_n, M, N, m, h
+):
+    """Load producer thread ``(m, h)``'s 32 B of codes and its scale word of tile
+    ``(e, pid_m, pid_n)`` into the prefetch registers: two 16 B loads from the code row
+    and one u32 of the swizzled scale atom ``2 * pid_n + h`` (row ``m``'s word is
+    ``(m % 32) * 4 + m // 32``). Plain function: traced inline by the producer, with
+    64-bit expert bases for the codes."""
+    word = (
+        cutlass.Int64(e) * cutlass.Int64(M)
+        + cutlass.Int64(pid_m * cutlass.Int32(RHT128_DIM) + m)
+    ) * cutlass.Int64(N // cutlass.Int32(8)) + cutlass.Int64(
+        pid_n * cutlass.Int32(16) + h * cutlass.Int32(8)
+    )
+    addr = mCodes.iterator.toint() + word * cutlass.Int64(4)
+    g_lo = cute.make_tensor(
+        cute.make_ptr(cutlass.Uint32, addr, cute.AddressSpace.gmem, assumed_align=16),
+        cute.make_layout((4,)),
+    )
+    g_hi = cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Uint32,
+            addr + cutlass.Int64(16),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        cute.make_layout((4,)),
+    )
+    pre_lo.store(g_lo.load())
+    pre_hi.store(g_hi.load())
+    atom = (
+        cutlass.Int64(e) * cutlass.Int64(M // cutlass.Int32(RHT128_DIM))
+        + cutlass.Int64(pid_m)
+    ) * cutlass.Int64(N // cutlass.Int32(64)) + cutlass.Int64(
+        pid_n * cutlass.Int32(2) + h
+    )
+    # Scale words are indexed in 32 bits as in ``_store_grouped_col_sf_u32``: the flat
+    # buffer holds E * M * N / 64 words, Int32 for any stack under 2^37 elements.
+    pre_sf[0] = mSF[
+        cutlass.Int32(atom * cutlass.Int64(128))
+        + (m % cutlass.Int32(32)) * cutlass.Int32(4)
+        + m // cutlass.Int32(32)
+    ]
+
+
+def _rht128_colrht_put_word(word, sf, gds_m, valid, zero_m, st4, off):
+    """Dequantize one code word (eight columns of the tile row) and store its four
+    bf16x2 words as one 16 B chunk at swizzled stage byte offset ``off``; an invalid
+    expert amax stores the sign-folded zero instead. Plain function, traced inline."""
+    v0, v1, v2, v3 = _dequant_e2m1x8_bf16x2x4(word, sf, gds_m)
+    st4[0] = cutlass.Uint32(cutlass.select_(valid, v0, zero_m))
+    st4[1] = cutlass.Uint32(cutlass.select_(valid, v1, zero_m))
+    st4[2] = cutlass.Uint32(cutlass.select_(valid, v2, zero_m))
+    st4[3] = cutlass.Uint32(cutlass.select_(valid, v3, zero_m))
+    cute.make_tensor(
+        cute.make_ptr(cutlass.Uint32, off, cute.AddressSpace.smem, assumed_align=16),
+        cute.make_layout((4,)),
+    ).store(st4.load())
+
+
+@cute.jit
+def _rht128_dequant_a_producer(
+    mCodes,
+    mSF,
+    amax_t,
+    sign_t,
+    a_base,
+    ab_pipeline,
+    t_begin,
+    n_my,
+    tiles_per_expert,
+    tiles_n,
+    M,
+    N,
+    p,
+):
+    """Producer thread ``p`` of 256: rebuild its 128 B of ``W_qdq`` per tile straight into
+    the MN-major SW128 A stage, for this CTA's whole tile chunk.
+
+    Thread ``p`` owns weight row ``m = p % 128`` (the contracted index) and half
+    ``h = p // 128`` of its columns: code words ``8h .. 8h + 7`` (16 B each in the tile
+    row) and the one u32 of scale atom ``2 * pid_n + h`` that holds their four E4M3
+    scales. The codes and scale word of the NEXT tile are loaded into registers one tile
+    ahead, so the DRAM round trip overlaps the current tile's decode.
+
+    Numerics are the Triton reconstruction's, op for op (``_dequant_e2m1x8_bf16x2x4``),
+    with the sign vector folded into the per-row decode scale ``gds_m = s_m * gds`` (an
+    exact sign flip) and an invalid (NaN/inf) expert amax filling the row with the
+    sign-folded zero ``s_m * (+0)``: every A element is Triton's times ``s_m``, so every
+    UMMA product -- including the sign of each zero product -- equals Triton's product of
+    the unsigned element with the signed ``R_n`` row.
+
+    Each code word becomes one 16 B store at the closed-form swizzled offset
+    ``2048 * (m // 8) + 128 * (m % 8) + 1024 * h + 16 * (k ^ (m % 8))`` of a 1 KB-aligned
+    stage. The word loop is rolled two ways (four words per pass) to keep the body inside
+    the instruction cache; tile coordinates advance incrementally and the per-expert row
+    constants are refreshed only when the expert changes.
+    """
+    m = p % cutlass.Int32(RHT128_DIM)
+    h = p // cutlass.Int32(RHT128_DIM)
+    row_off = (
+        a_base
+        + cutlass.Int32(2048) * (m // cutlass.Int32(8))
+        + cutlass.Int32(128) * (m % cutlass.Int32(8))
+        + cutlass.Int32(1024) * h
+    )
+    x = m % cutlass.Int32(8)
+    inf = cutlass.Float32(float("inf"))
+
+    pre_lo = cute.make_rmem_tensor((4,), cutlass.Uint32)
+    pre_hi = cute.make_rmem_tensor((4,), cutlass.Uint32)
+    pre_sf = cute.make_rmem_tensor((1,), cutlass.Uint32)
+    st4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
+
+    ab_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Producer, RHT128_COLRHT_STAGES
+    )
+    tiles_m = tiles_per_expert // tiles_n
+    # Tile coordinates advance incrementally (pid_n fastest, expert-major): the only
+    # integer divisions are the chunk's first tile's.
+    e, pid_m, pid_n = _rht128_colrht_tile(t_begin, tiles_per_expert, tiles_n)
+    _rht128_colrht_prefetch(
+        mCodes, mSF, pre_lo, pre_hi, pre_sf, e, pid_m, pid_n, M, N, m, h
+    )
+    neg = sign_t[m] < cutlass.Int8(0)
+    # Per-expert row constants, refreshed on an expert change only.
+    e_cur = cutlass.Int32(-1)
+    valid = cutlass.Int32(0)
+    gds_m = cutlass.Float32(0.0)
+    zero_m = cutlass.Uint32(0)
+    for i in cutlass.range(n_my, unroll=1):
+        c0 = pre_lo[0]
+        c1 = pre_lo[1]
+        c2 = pre_lo[2]
+        c3 = pre_lo[3]
+        c4 = pre_hi[0]
+        c5 = pre_hi[1]
+        c6 = pre_hi[2]
+        c7 = pre_hi[3]
+        sfw = pre_sf[0]
+        # One tile ahead; the last tile re-loads itself rather than branching.
+        pn = pid_n + cutlass.Int32(1)
+        wrap_n = pn == tiles_n
+        pn = cutlass.Int32(cutlass.select_(wrap_n, cutlass.Int32(0), pn))
+        pm = pid_m + cutlass.Int32(
+            cutlass.select_(wrap_n, cutlass.Int32(1), cutlass.Int32(0))
+        )
+        wrap_m = pm == tiles_m
+        pm = cutlass.Int32(cutlass.select_(wrap_m, cutlass.Int32(0), pm))
+        en = e + cutlass.Int32(
+            cutlass.select_(wrap_m, cutlass.Int32(1), cutlass.Int32(0))
+        )
+        more = i + cutlass.Int32(1) < n_my
+        pn = cutlass.Int32(cutlass.select_(more, pn, pid_n))
+        pm = cutlass.Int32(cutlass.select_(more, pm, pid_m))
+        en = cutlass.Int32(cutlass.select_(more, en, e))
+        _rht128_colrht_prefetch(
+            mCodes, mSF, pre_lo, pre_hi, pre_sf, en, pm, pn, M, N, m, h
+        )
+
+        if e != e_cur:
+            amax_e = amax_t[e]
+            _, gds, _ = _global_scale(amax_e)
+            valid = cutlass.Int32(
+                cutlass.select_(
+                    _abs_f32(amax_e) < inf, cutlass.Int32(1), cutlass.Int32(0)
+                )
+            )
+            gds_m = cutlass.Float32(cutlass.select_(neg, -gds, gds))
+            zero_m = cutlass.Uint32(
+                cutlass.select_(neg, cutlass.Uint32(0x80008000), cutlass.Uint32(0))
+            )
+            e_cur = e
+        valid_b = valid != cutlass.Int32(0)
+
+        ab_pipeline.producer_acquire(ab_state)
+        stage_off = row_off + ab_state.index * cutlass.Int32(
+            RHT128_COLRHT_A_STAGE_BYTES
+        )
+        for j in cutlass.range(2, unroll=1):
+            first = j == cutlass.Int32(0)
+            sfp = _e4m3x2_to_f16x2(
+                cutlass.Uint32(cutlass.select_(first, sfw, sfw >> cutlass.Uint32(16)))
+            )
+            sf_ab = _f16lo_to_f32(sfp)
+            sf_cd = _f16hi_to_f32(sfp)
+            k0 = j * cutlass.Int32(4)
+            _rht128_colrht_put_word(
+                cutlass.Uint32(cutlass.select_(first, c0, c4)),
+                sf_ab,
+                gds_m,
+                valid_b,
+                zero_m,
+                st4,
+                stage_off + cutlass.Int32(16) * (k0 ^ x),
+            )
+            _rht128_colrht_put_word(
+                cutlass.Uint32(cutlass.select_(first, c1, c5)),
+                sf_ab,
+                gds_m,
+                valid_b,
+                zero_m,
+                st4,
+                stage_off + cutlass.Int32(16) * ((k0 + cutlass.Int32(1)) ^ x),
+            )
+            _rht128_colrht_put_word(
+                cutlass.Uint32(cutlass.select_(first, c2, c6)),
+                sf_cd,
+                gds_m,
+                valid_b,
+                zero_m,
+                st4,
+                stage_off + cutlass.Int32(16) * ((k0 + cutlass.Int32(2)) ^ x),
+            )
+            _rht128_colrht_put_word(
+                cutlass.Uint32(cutlass.select_(first, c3, c7)),
+                sf_cd,
+                gds_m,
+                valid_b,
+                zero_m,
+                st4,
+                stage_off + cutlass.Int32(16) * ((k0 + cutlass.Int32(3)) ^ x),
+            )
+        # Generic-proxy stores -> visible to the UMMA (async proxy) before the arrive.
+        cute.arch.fence_proxy("async.shared", space="cta")
+        ab_pipeline.producer_commit(ab_state)
+        ab_state.advance()
+        e = en
+        pid_m = pm
+        pid_n = pn
+    ab_pipeline.producer_tail(ab_state)
+
+
+def _store_expert_col_sf_word(mSF_u32, rSF, expert_words, r, c_base, m_blocks64):
+    """``_store_grouped_col_sf_word`` for an expert-uniform stack: the u32 word of expert
+    ``e``'s swizzled ``(N//128, M//64, 32, 16)`` scale tile that holds row ``r``'s scale
+    bytes for columns ``c_base .. c_base + 3`` (``c_base % 4 == 0``); the expert's tile
+    starts ``expert_words`` into the flat buffer."""
+    r_blk = r // cutlass.Int32(128)
+    r_lane = r % cutlass.Int32(32)
+    r_grp = (r % cutlass.Int32(128)) // cutlass.Int32(32)
+    mSF_u32[
+        expert_words
+        + r_blk * (m_blocks64 * cutlass.Int32(128))
+        + (c_base // cutlass.Int32(4)) * cutlass.Int32(128)
+        + r_lane * cutlass.Int32(4)
+        + r_grp
+    ] = cute.recast_tensor(rSF, cutlass.Uint32)[0]
+
+
+@cute.jit
+def _rht128_colrht_amax_epilogue(
+    amax_t, tCtAcc, acc_pipeline, t_begin, t_end, tiles_per_expert, tidx, lane
+):
+    """Consume the acc ring over this CTA's chunk: ``max|bf16(acc)|`` per expert.
+
+    Tiles are expert-major, so the running max flushes on an expert change and once at
+    the end, as ``_rht128_amax_epilogue`` does per group.
+    """
+    acc_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
+    )
+    g = t_begin // tiles_per_expert
+    run_max = cutlass.Float32(0.0)
+    for i in cutlass.range(t_end - t_begin, unroll=1):
+        e = (t_begin + i) // tiles_per_expert
+        if e != g:
+            _flush_group_max(run_max, amax_t, g, lane)
+            run_max = cutlass.Float32(0.0)
+            g = e
+        acc_pipeline.consumer_wait(acc_state)
+        tile_max = _rht128_tile_amax(tCtAcc[(None, None, None, acc_state.index)], tidx)
+        cute.arch.fence_view_async_tmem_load()
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(acc_state)
+        acc_state.advance()
+        run_max = _max_f32(run_max, _round_rht_amax(tile_max))
+    _flush_group_max(run_max, amax_t, g, lane)
+
+
+@cute.jit
+def _rht128_zero_acc(acc, tidx, u_base):
+    """``tcgen05.st`` zeros over this warp's four 16-column chunks (``u_base .. u_base + 3``)
+    of one 128x128 f32 TMEM accumulator, per thread (= per lane): the next chain
+    accumulates onto ``+0`` exactly as Triton's zero-filled ``tl.dot``."""
+    st_atom = cute.make_copy_atom(
+        tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition.x16), cutlass.Float32
+    )
+    tAcc = transform_partitioned_tensor_layout(acc)
+    tAcc_epi = cute.flat_divide(tAcc, RHT128_EPI_TILE)
+    tiled_copy_r2t = tcgen05.make_tmem_copy(st_atom, tAcc_epi[(None, None, 0, 0)])
+    thr_copy = tiled_copy_r2t.get_slice(tidx)
+    tRT_tAcc = thr_copy.partition_D(tAcc_epi)
+    zeros = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+    for i in cutlass.range_constexpr(16):
+        zeros[i] = cutlass.Float32(0.0)
+    for j in cutlass.range_constexpr(RHT128_COLRHT_REQ_BLOCKS_PER_WARP):
+        u = u_base + cutlass.Int32(j)
+        cute.copy(tiled_copy_r2t, zeros, tRT_tAcc[(None, None, None, 0, u)])
+
+
+@cute.jit
+def _rht128_tile_requantize(acc, tidx, u_base, enc_over_fp4max, dec, row_addr, rSF):
+    """RTNE-quantize this warp's half of one 128x128 f32 TMEM accumulator: this thread's
+    lane = one output row, blocks ``u_base .. u_base + 3`` of its eight along the
+    transformed index.
+
+    The codes go straight to global as two 16-byte stores into the lane's code words
+    ``8 * (u_base // 4) ..`` at ``row_addr``; the four scale bytes land in ``rSF`` for the
+    swizzled store. After its loads the thread zero-fills its chunks of the stage
+    (``_rht128_zero_acc``) so the next tile's chain accumulates onto ``+0``.
+    """
+    copy_atom_t2r = sm100_utils.get_tmem_load_op(
+        RHT128_CTA_TILE_COL,
+        utils.LayoutEnum.ROW_MAJOR,
+        cutlass.Float32,
+        cutlass.Float32,
+        RHT128_EPI_TILE,
+        False,
+    )
+    tAcc = transform_partitioned_tensor_layout(acc)
+    tAcc_epi = cute.flat_divide(tAcc, RHT128_EPI_TILE)
+    tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
+    thr_copy = tiled_copy_t2r.get_slice(tidx)
+    tTR_tAcc = thr_copy.partition_S(tAcc_epi)
+    tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+    rCodes = cute.make_rmem_tensor(
+        (2 * RHT128_COLRHT_REQ_BLOCKS_PER_WARP,), cutlass.Uint32
+    )
+    for j in cutlass.range_constexpr(RHT128_COLRHT_REQ_BLOCKS_PER_WARP):
+        u = u_base + cutlass.Int32(j)
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
+        vals = tTR_rAcc.load().reshape((16,))
+        w0, w1, pvscale_fp8 = _quant16(vals, enc_over_fp4max, dec, rht_acc=True)
+        rCodes[2 * j] = w0
+        rCodes[2 * j + 1] = w1
+        rSF[j] = pvscale_fp8
+    cute.arch.fence_view_async_tmem_load()
+    _rht128_zero_acc(acc, tidx, u_base)
+    cute.arch.fence_view_async_tmem_store()
+    # 16-byte aligned by construction (64-byte code rows; ``u_base * 8`` is 0 or 32).
+    code_addr = row_addr + cutlass.Int64(u_base) * cutlass.Int64(8)
+    _st_global_v4_u32(code_addr, rCodes[0], rCodes[1], rCodes[2], rCodes[3])
+    _st_global_v4_u32(
+        code_addr + cutlass.Int64(16), rCodes[4], rCodes[5], rCodes[6], rCodes[7]
+    )
+
+
+@cute.jit
+def _rht128_colrht_requantize_epilogue(
+    mOutCodes,
+    mOutSF,
+    amax_t,
+    tCtAcc,
+    acc_pipeline,
+    t_begin,
+    t_end,
+    tiles_per_expert,
+    tiles_n,
+    M,
+    N,
+    tidx,
+    u_base,
+):
+    """Consume the acc ring over this CTA's chunk: quantize every tile into the expert's
+    ``(N, M//8)`` u32 code rows and its swizzled ``(N//128, M//64, 32, 16)`` scales; this
+    warp takes blocks ``u_base .. u_base + 3`` of its lanes."""
+    acc_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
+    )
+    codes_base = mOutCodes.iterator.toint()
+    words_per_row = M // cutlass.Int32(8)
+    m_blocks64 = M // cutlass.Int32(64)
+    # Int32 like the read side: E * M * N / 64 words in the flat scale buffer.
+    sf_words_per_expert = (N // cutlass.Int32(128)) * m_blocks64 * cutlass.Int32(128)
+    rSF = cute.make_rmem_tensor(
+        (RHT128_COLRHT_REQ_BLOCKS_PER_WARP,), cutlass.Float8E4M3FN
+    )
+    for i in cutlass.range(t_end - t_begin, unroll=1):
+        e, pid_m, pid_n = _rht128_colrht_tile(t_begin + i, tiles_per_expert, tiles_n)
+        _, dec, enc_over_fp4max = _global_scale(amax_t[e])
+        n_glob = pid_n * cutlass.Int32(RHT128_DIM) + tidx
+        row_addr = (
+            codes_base
+            + (cutlass.Int64(e) * cutlass.Int64(N) + cutlass.Int64(n_glob))
+            * cutlass.Int64(words_per_row)
+            * cutlass.Int64(4)
+            + cutlass.Int64(pid_m) * cutlass.Int64(64)
+        )
+        acc_pipeline.consumer_wait(acc_state)
+        _rht128_tile_requantize(
+            tCtAcc[(None, None, None, acc_state.index)],
+            tidx,
+            u_base,
+            enc_over_fp4max,
+            dec,
+            row_addr,
+            rSF,
+        )
+        with cute.arch.elect_one():
+            acc_pipeline.consumer_release(acc_state)
+        acc_state.advance()
+        _store_expert_col_sf_word(
+            mOutSF,
+            rSF,
+            e * sf_words_per_expert,
+            n_glob,
+            pid_m * cutlass.Int32(RHT128_DIM // 16) + u_base,
+            m_blocks64,
+        )
+
+
+class _Tcgen05GroupColRhtRequantAmax:
+    """Per-expert ``max|W_qdq.bf16().t() @ R_n|`` from the rowwise NVFP4 weight.
+
+    Expert-uniform ``(E, M, N)`` stack, expert = tile-derived, no group cap. Standalone:
+    the producer warps rebuild each 128x128 ``W_qdq`` tile into the MN-major A stage
+    with the signs folded in (``_rht128_dequant_a_producer``), the MMA warp runs one
+    UMMA chain against the resident TMA'd ``H128``, the epilogue warps reduce
+    ``max|bf16(acc)|`` and atomic-max it into the pre-zeroed per-expert slot. Static
+    persistent grid: CTA ``b`` owns the contiguous tile chunk ``_static_tile_range``,
+    tiles expert-major.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mCodes: cute.Tensor,  # row_fp4_w as flat u32 (E*M*N//8,)
+        mSF: cute.Tensor,  # row_sf_w as flat u32 (E*M*N//64,)
+        mAmax: cute.Tensor,  # global_amax (E,) f32
+        mSign: cute.Tensor,  # dgrad_rht (128,) int8
+        mB: cute.Tensor,  # H128 (128 j, 128 k, 1), K-major (symmetric)
+        amax_out: cute.Tensor,  # (E,) f32, pre-zeroed
+        M: cutlass.Int32,
+        N: cutlass.Int32,
+        E: cutlass.Int32,
+        num_ctas: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        k_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        mn_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.MN_SW128, cutlass.BFloat16
+        )
+        g2s = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        mma_col = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            RHT128_MMA_TILER_COL,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
+        )
+        tiled_mma_col = cute.make_tiled_mma(cute.make_mma_atom(mma_col))
+        a_shape = tiled_mma_col.partition_shape_A(
+            cute.dice(RHT128_CTA_TILE_COL, (1, None, 1))
+        )
+        a_smem_layout_staged = tcgen05.tile_to_mma_shape(
+            mn_atom, cute.append(a_shape, RHT128_COLRHT_STAGES), order=(1, 2, 3)
+        )
+        b_shape = tiled_mma_col.partition_shape_B(
+            cute.dice(RHT128_CTA_TILE_COL, (None, 1, 1))
+        )
+        b_smem_layout = tcgen05.tile_to_mma_shape(
+            k_atom, cute.append(b_shape, 1), order=(1, 2, 3)
+        )
+        tma_atom_b_col, tma_tensor_b_col = cute.nvgpu.make_tiled_tma_atom_B(
+            g2s,
+            mB,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            RHT128_CTA_TILE_COL,
+            tiled_mma_col,
+            (1, 1, 1, 1),
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma_col.thr_id.shape,)
+        )
+        tCtAcc_fake = tiled_mma_col.make_fragment_C(
+            cute.append(
+                tiled_mma_col.partition_shape_C((M_TILE, RHT128_DIM)),
+                RHT128_ACC_STAGES,
+            )
+        )
+        num_tmem_alloc_cols = sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.kernel(
+            tiled_mma_col,
+            tma_atom_b_col,
+            tma_tensor_b_col,
+            mCodes,
+            mSF,
+            mAmax,
+            mSign,
+            amax_out,
+            cluster_layout_vmnk,
+            a_smem_layout_staged,
+            b_smem_layout,
+            tCtAcc_fake.layout,
+            num_tmem_alloc_cols,
+            M,
+            N,
+            E,
+        ).launch(grid=(num_ctas, 1, 1), block=(RHT128_COLRHT_TPB, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma_col: cute.TiledMma,
+        tma_atom_b_col: cute.CopyAtom,
+        mBcol: cute.Tensor,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        mAmax: cute.Tensor,
+        mSign: cute.Tensor,
+        amax_out: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        acc_fake_layout: cute.Layout,
+        num_tmem_alloc_cols: cutlass.Constexpr,
+        M: cutlass.Int32,
+        N: cutlass.Int32,
+        E: cutlass.Int32,
+    ):
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx % cutlass.Int32(32)
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        tiles_n = N // cutlass.Int32(RHT128_DIM)
+        tiles_per_expert = (M // cutlass.Int32(RHT128_DIM)) * tiles_n
+        t_begin, t_end = _static_tile_range(E * tiles_per_expert, bidx, gdim)
+        n_my = t_end - t_begin
+
+        if warp_idx == MMA_WARP:
+            cpasync.prefetch_descriptor(tma_atom_b_col)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_COLRHT_STAGES * 2]
+            acc_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_ACC_STAGES * 2]
+            b_mbar: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+
+        ab_pipeline = pipeline.PipelineAsyncUmma.create(
+            barrier_storage=storage.ab_mbar.data_ptr(),
+            num_stages=RHT128_COLRHT_STAGES,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, RHT128_COLRHT_PROD_THREADS
+            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=storage.acc_mbar.data_ptr(),
+            num_stages=RHT128_ACC_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, RHT128_COLRHT_EPI_WARPS
+            ),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        # MMA warp + the epilogue group retrieve the TMEM pointer.
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_ALLOC_BAR, num_threads=32 + COL_THREADS
+        )
+        tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_DEALLOC_BAR, num_threads=COL_THREADS
+        )
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=RHT128_COLRHT_EPI_WARP_BEGIN,
+            is_two_cta=False,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+        )
+        if warp_idx == MMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(storage.b_mbar.ptr, 1)
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+
+        # 1 KB alignment: the producer's closed-form swizzle assumes it of the stage base.
+        raw_a = smem.allocate_array(
+            cutlass.BFloat16,
+            cute.cosize(a_smem_layout_staged.outer),
+            byte_alignment=1024,
+        )
+        sA = cute.make_tensor(
+            cute.recast_ptr(raw_a, a_smem_layout_staged.inner, dtype=cutlass.BFloat16),
+            a_smem_layout_staged.outer,
+        )
+        sBcol = smem.allocate_tensor(
+            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+
+        cta_layout = cute.make_layout((1,))
+        thr_col = tiled_mma_col.get_slice(0)
+        gBcol = cute.local_tile(
+            mBcol, cute.slice_(RHT128_CTA_TILE_COL, (0, None, None)), (None, None, None)
+        )
+        tBsBcol, tBgBcol = cpasync.tma_partition(
+            tma_atom_b_col,
+            0,
+            cta_layout,
+            cute.group_modes(sBcol, 0, 3),
+            cute.group_modes(thr_col.partition_B(gBcol), 0, 3),
+        )
+        tCrA_col = tiled_mma_col.make_fragment_A(sA)
+        tCrB_col = tiled_mma_col.make_fragment_B(sBcol)
+
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        # ==================== MMA warp (+ one-shot B TMA) ====================
+        if warp_idx == MMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    storage.b_mbar.ptr, RHT128_B_BYTES
+                )
+            cute.copy(
+                tma_atom_b_col,
+                tBgBcol[(None, 0, 0, 0)],
+                tBsBcol[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+            tmem.wait_for_alloc()
+            tCtAcc = cute.make_tensor(
+                tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
+            )
+            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            ab_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, RHT128_COLRHT_STAGES
+            )
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, RHT128_ACC_STAGES
+            )
+            for i in cutlass.range(n_my, unroll=1):
+                ab_pipeline.consumer_wait(ab_state)
+                acc_pipeline.producer_acquire(acc_state)
+                acc_col = tCtAcc[(None, None, None, acc_state.index)]
+                for kb in cutlass.range_constexpr(RHT128_K_BLOCKS):
+                    tiled_mma_col.set(tcgen05.Field.ACCUMULATE, kb > 0)
+                    cute.gemm(
+                        tiled_mma_col,
+                        acc_col,
+                        tCrA_col[(None, None, kb, ab_state.index)],
+                        tCrB_col[(None, None, kb, 0)],
+                        acc_col,
+                    )
+                acc_pipeline.producer_commit(acc_state)
+                acc_state.advance()
+                ab_pipeline.consumer_release(ab_state)
+                ab_state.advance()
+            acc_pipeline.producer_tail(acc_state)
+
+        # ==================== epilogue: max|W_qdq.t() @ R_n| per expert ====================
+        if (
+            warp_idx >= RHT128_COLRHT_EPI_WARP_BEGIN
+            and warp_idx < RHT128_COLRHT_EPI_WARP_END
+        ):
+            tmem.allocate(num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
+            _rht128_colrht_amax_epilogue(
+                amax_out,
+                tCtAcc,
+                acc_pipeline,
+                t_begin,
+                t_end,
+                tiles_per_expert,
+                tidx % cutlass.Int32(RHT128_DIM),
+                lane,
+            )
+            tmem_dealloc_barrier.arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+        # ==================== producers: W_qdq tiles into the A ring ====================
+        if warp_idx >= RHT128_COLRHT_PROD_WARP_BEGIN:
+            _rht128_dequant_a_producer(
+                mCodes,
+                mSF,
+                mAmax,
+                mSign,
+                raw_a.toint(),
+                ab_pipeline,
+                t_begin,
+                n_my,
+                tiles_per_expert,
+                tiles_n,
+                M,
+                N,
+                tidx - cutlass.Int32(32 * RHT128_COLRHT_PROD_WARP_BEGIN),
+            )
+
+
+class _Tcgen05GroupColRhtRequantize:
+    """Per-expert columnwise NVFP4 requantization of ``W_qdq.bf16().t() @ R_n``.
+
+    Expert-uniform ``(E, M, N)`` stack, expert = tile-derived, no group cap. The mainloop
+    is ``_Tcgen05GroupColRhtRequantAmax``'s; eight epilogue warps (two per TMEM quadrant,
+    four of a lane's eight blocks each) RTNE-quantize each tile from TMEM into the
+    expert's ``(N, M//2)`` codes and swizzled scales. The accumulator
+    discipline is Triton's: the epilogue zero-fills a TMEM stage after reading it (and
+    both stages once before the first chain), and every UMMA accumulates, so an
+    exact-zero sum keeps the sign Triton's zero-initialised ``tl.dot`` gives it.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mCodes: cute.Tensor,  # row_fp4_w as flat u32 (E*M*N//8,)
+        mSF: cute.Tensor,  # row_sf_w as flat u32 (E*M*N//64,)
+        mAmax: cute.Tensor,  # global_amax (E,) f32
+        mSign: cute.Tensor,  # dgrad_rht (128,) int8
+        mB: cute.Tensor,  # H128 (128 j, 128 k, 1), K-major (symmetric)
+        mAmaxT: cute.Tensor,  # amax_rht_w_qdq_t (E,) f32
+        mOutCodes: cute.Tensor,  # (E*N*M//8,) u32 columnwise codes
+        mOutSF: cute.Tensor,  # flat u32 view of the (E, N//128, M//64, 32, 16) e4m3 scales
+        M: cutlass.Int32,
+        N: cutlass.Int32,
+        E: cutlass.Int32,
+        num_ctas: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        k_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+        )
+        mn_atom = tcgen05.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.MN_SW128, cutlass.BFloat16
+        )
+        g2s = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        mma_col = tcgen05.MmaF16BF16Op(
+            cutlass.BFloat16,
+            cutlass.Float32,
+            RHT128_MMA_TILER_COL,
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            OperandMajorMode.MN,
+            OperandMajorMode.K,
+        )
+        tiled_mma_col = cute.make_tiled_mma(cute.make_mma_atom(mma_col))
+        a_shape = tiled_mma_col.partition_shape_A(
+            cute.dice(RHT128_CTA_TILE_COL, (1, None, 1))
+        )
+        a_smem_layout_staged = tcgen05.tile_to_mma_shape(
+            mn_atom, cute.append(a_shape, RHT128_COLRHT_STAGES), order=(1, 2, 3)
+        )
+        b_shape = tiled_mma_col.partition_shape_B(
+            cute.dice(RHT128_CTA_TILE_COL, (None, 1, 1))
+        )
+        b_smem_layout = tcgen05.tile_to_mma_shape(
+            k_atom, cute.append(b_shape, 1), order=(1, 2, 3)
+        )
+        tma_atom_b_col, tma_tensor_b_col = cute.nvgpu.make_tiled_tma_atom_B(
+            g2s,
+            mB,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            RHT128_CTA_TILE_COL,
+            tiled_mma_col,
+            (1, 1, 1, 1),
+        )
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((1, 1, 1)), (tiled_mma_col.thr_id.shape,)
+        )
+        tCtAcc_fake = tiled_mma_col.make_fragment_C(
+            cute.append(
+                tiled_mma_col.partition_shape_C((M_TILE, RHT128_DIM)),
+                RHT128_ACC_STAGES,
+            )
+        )
+        num_tmem_alloc_cols = sm100_utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.kernel(
+            tiled_mma_col,
+            tma_atom_b_col,
+            tma_tensor_b_col,
+            mCodes,
+            mSF,
+            mAmax,
+            mSign,
+            mAmaxT,
+            mOutCodes,
+            mOutSF,
+            cluster_layout_vmnk,
+            a_smem_layout_staged,
+            b_smem_layout,
+            tCtAcc_fake.layout,
+            num_tmem_alloc_cols,
+            M,
+            N,
+            E,
+        ).launch(
+            grid=(num_ctas, 1, 1), block=(RHT128_COLRHT_REQ_TPB, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        tiled_mma_col: cute.TiledMma,
+        tma_atom_b_col: cute.CopyAtom,
+        mBcol: cute.Tensor,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        mAmax: cute.Tensor,
+        mSign: cute.Tensor,
+        mAmaxT: cute.Tensor,
+        mOutCodes: cute.Tensor,
+        mOutSF: cute.Tensor,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+        acc_fake_layout: cute.Layout,
+        num_tmem_alloc_cols: cutlass.Constexpr,
+        M: cutlass.Int32,
+        N: cutlass.Int32,
+        E: cutlass.Int32,
+    ):
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        tiles_n = N // cutlass.Int32(RHT128_DIM)
+        tiles_per_expert = (M // cutlass.Int32(RHT128_DIM)) * tiles_n
+        t_begin, t_end = _static_tile_range(E * tiles_per_expert, bidx, gdim)
+        n_my = t_end - t_begin
+
+        if warp_idx == MMA_WARP:
+            cpasync.prefetch_descriptor(tma_atom_b_col)
+
+        @cute.struct
+        class SharedStorage:
+            ab_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_COLRHT_STAGES * 2]
+            acc_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_ACC_STAGES * 2]
+            b_mbar: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
+            tmem_holding_buf: cutlass.Int32
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+
+        ab_pipeline = pipeline.PipelineAsyncUmma.create(
+            barrier_storage=storage.ab_mbar.data_ptr(),
+            num_stages=RHT128_COLRHT_STAGES,
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, RHT128_COLRHT_PROD_THREADS
+            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
+            barrier_storage=storage.acc_mbar.data_ptr(),
+            num_stages=RHT128_ACC_STAGES,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, RHT128_COLRHT_REQ_EPI_WARPS
+            ),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+        # MMA warp + the epilogue group retrieve the TMEM pointer; the same 160 threads
+        # meet again once the epilogue has zero-filled both accumulator stages.
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_ALLOC_BAR, num_threads=32 + RHT128_COLRHT_REQ_EPI_THREADS
+        )
+        tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=TMEM_DEALLOC_BAR, num_threads=RHT128_COLRHT_REQ_EPI_THREADS
+        )
+        acc_zero_barrier = pipeline.NamedBarrier(
+            barrier_id=RHT128_COLRHT_ACC_ZERO_BAR,
+            num_threads=32 + RHT128_COLRHT_REQ_EPI_THREADS,
+        )
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=RHT128_COLRHT_EPI_WARP_BEGIN,
+            is_two_cta=False,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+        )
+        if warp_idx == MMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(storage.b_mbar.ptr, 1)
+        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+
+        # 1 KB alignment: the producer's closed-form swizzle assumes it of the stage base.
+        raw_a = smem.allocate_array(
+            cutlass.BFloat16,
+            cute.cosize(a_smem_layout_staged.outer),
+            byte_alignment=1024,
+        )
+        sA = cute.make_tensor(
+            cute.recast_ptr(raw_a, a_smem_layout_staged.inner, dtype=cutlass.BFloat16),
+            a_smem_layout_staged.outer,
+        )
+        sBcol = smem.allocate_tensor(
+            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+
+        cta_layout = cute.make_layout((1,))
+        thr_col = tiled_mma_col.get_slice(0)
+        gBcol = cute.local_tile(
+            mBcol, cute.slice_(RHT128_CTA_TILE_COL, (0, None, None)), (None, None, None)
+        )
+        tBsBcol, tBgBcol = cpasync.tma_partition(
+            tma_atom_b_col,
+            0,
+            cta_layout,
+            cute.group_modes(sBcol, 0, 3),
+            cute.group_modes(thr_col.partition_B(gBcol), 0, 3),
+        )
+        tCrA_col = tiled_mma_col.make_fragment_A(sA)
+        tCrB_col = tiled_mma_col.make_fragment_B(sBcol)
+
+        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        # ==================== MMA warp (+ one-shot B TMA) ====================
+        if warp_idx == MMA_WARP:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    storage.b_mbar.ptr, RHT128_B_BYTES
+                )
+            cute.copy(
+                tma_atom_b_col,
+                tBgBcol[(None, 0, 0, 0)],
+                tBsBcol[(None, 0)],
+                tma_bar_ptr=storage.b_mbar.ptr,
+            )
+            tmem.wait_for_alloc()
+            tCtAcc = cute.make_tensor(
+                tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
+            )
+            acc_zero_barrier.arrive_and_wait()
+            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            ab_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, RHT128_COLRHT_STAGES
+            )
+            acc_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, RHT128_ACC_STAGES
+            )
+            for i in cutlass.range(n_my, unroll=1):
+                ab_pipeline.consumer_wait(ab_state)
+                acc_pipeline.producer_acquire(acc_state)
+                acc_col = tCtAcc[(None, None, None, acc_state.index)]
+                for kb in cutlass.range_constexpr(RHT128_K_BLOCKS):
+                    # Every step accumulates onto the epilogue's zero fill (Triton's
+                    # ``tl.dot`` discipline); never ``kb > 0`` without that fill.
+                    tiled_mma_col.set(tcgen05.Field.ACCUMULATE, True)
+                    cute.gemm(
+                        tiled_mma_col,
+                        acc_col,
+                        tCrA_col[(None, None, kb, ab_state.index)],
+                        tCrB_col[(None, None, kb, 0)],
+                        acc_col,
+                    )
+                acc_pipeline.producer_commit(acc_state)
+                acc_state.advance()
+                ab_pipeline.consumer_release(ab_state)
+                ab_state.advance()
+            acc_pipeline.producer_tail(acc_state)
+
+        # ==================== epilogue: quantize W_qdq.t() @ R_n per expert ====================
+        if (
+            warp_idx >= RHT128_COLRHT_EPI_WARP_BEGIN
+            and warp_idx < RHT128_COLRHT_REQ_EPI_WARP_END
+        ):
+            tmem.allocate(num_tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+            tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
+            # Warps 1-4 take blocks 0-3 of their quadrant's lanes, warps 5-8 blocks 4-7.
+            u_base = (
+                (warp_idx - cutlass.Int32(RHT128_COLRHT_EPI_WARP_BEGIN))
+                // cutlass.Int32(4)
+            ) * cutlass.Int32(RHT128_COLRHT_REQ_BLOCKS_PER_WARP)
+            for s in cutlass.range_constexpr(RHT128_ACC_STAGES):
+                _rht128_zero_acc(
+                    tCtAcc[(None, None, None, s)],
+                    tidx % cutlass.Int32(RHT128_DIM),
+                    u_base,
+                )
+            cute.arch.fence_view_async_tmem_store()
+            acc_zero_barrier.arrive_and_wait()
+            _rht128_colrht_requantize_epilogue(
+                mOutCodes,
+                mOutSF,
+                mAmaxT,
+                tCtAcc,
+                acc_pipeline,
+                t_begin,
+                t_end,
+                tiles_per_expert,
+                tiles_n,
+                M,
+                N,
+                tidx % cutlass.Int32(RHT128_DIM),
+                u_base,
+            )
+            tmem_dealloc_barrier.arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+        # ==================== producers: W_qdq tiles into the A ring ====================
+        if warp_idx >= RHT128_COLRHT_REQ_PROD_WARP_BEGIN:
+            _rht128_dequant_a_producer(
+                mCodes,
+                mSF,
+                mAmax,
+                mSign,
+                raw_a.toint(),
+                ab_pipeline,
+                t_begin,
+                n_my,
+                tiles_per_expert,
+                tiles_n,
+                M,
+                N,
+                tidx - cutlass.Int32(32 * RHT128_COLRHT_REQ_PROD_WARP_BEGIN),
+            )
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_group_col_rht_requant_amax_kernel(device_idx: int):
+    """Compile the grouped columnwise-RHT weight requantization amax kernel.
+
+    The codes and scales arrive as flat u32 views with ``assumed_align=16`` (every code
+    row is a multiple of 64 B, so a thread's two 16 B code loads are aligned); ``H128``
+    as the ``(128, 128, 1)`` K-major operand the amax kernel above takes.
+    """
+    free = cute.sym_int
+    k = _Tcgen05GroupColRhtRequantAmax()
+    return cute.compile(
+        k,
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16),
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
+        make_fake_tensor(
+            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+        ),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_col_rht_requant_amax_impl(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    h128: torch.Tensor,
+    num_tensors: int,
+) -> torch.Tensor:
+    """Per-expert ``max|W_qdq.bf16().t() @ R_n|`` from the rowwise NVFP4 weight.
+
+    ``row_fp4_w`` is ``(E, M, N//2)`` uint8, ``row_sf_w`` the ``(E, M//128, N//64, 32, 16)``
+    swizzled e4m3 scales, ``global_amax`` the ``(E,)`` decode amax, ``dgrad_rht`` the
+    ``(128,)`` int8 sign vector and ``h128`` the cached ``(128, 128)`` bfloat16 Hadamard
+    (symmetric, so it is the K-major ``(N, K)`` UMMA operand as is; the signs reach the
+    kernel through the decode scale). Returns ``(E,)`` float32, zero-initialised because
+    the epilogue accumulates with atomic max.
+    """
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    dev = row_fp4_w.device
+
+    amax_rht_w_qdq_t = torch.zeros((E,), dtype=torch.float32, device=dev)
+    # An empty stack passes validation and has nothing to reduce: a zero grid is a
+    # launch error here.
+    if row_fp4_w.numel() == 0:
+        return amax_rht_w_qdq_t
+    tiles = E * (M // RHT128_DIM) * (N // RHT128_DIM)
+    num_ctas = max(1, min(tiles, _get_num_sms(dev.index)))
+
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+    _compile_group_col_rht_requant_amax_kernel(dev.index)(
+        row_fp4_w.view(torch.uint32).view(-1),
+        row_sf_w.view(torch.uint32).view(-1),
+        global_amax,
+        dgrad_rht,
+        h128.unsqueeze(-1),
+        amax_rht_w_qdq_t,
+        int(M),
+        int(N),
+        int(E),
+        int(num_ctas),
+        stream,
+    )
+    return amax_rht_w_qdq_t
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_group_col_rht_requantize_kernel(device_idx: int):
+    """Compile the grouped columnwise-RHT weight requantize kernel (see the amax
+    compile above for the operand forms; the codes out are the same flat u32 view)."""
+    free = cute.sym_int
+    k = _Tcgen05GroupColRhtRequantize()
+    return cute.compile(
+        k,
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16),
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
+        make_fake_tensor(
+            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+        ),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16),
+        make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_col_rht_requantize_impl(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_rht_w_qdq_t: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    h128: torch.Tensor,
+    num_tensors: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert columnwise NVFP4 requantization of ``W_qdq.bf16().t() @ R_n``.
+
+    Operands as ``_cutedsl_group_col_rht_requant_amax_impl`` plus ``amax_rht_w_qdq_t``,
+    that op's ``(E,)`` output. Returns ``(E, N, M//2)`` uint8 codes (a view of the u32
+    buffer the kernel writes) and ``(E, N//128, M//64, 32, 16)`` float8_e4m3fn swizzled
+    scales.
+    """
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    dev = row_fp4_w.device
+
+    col_fp4 = torch.empty((E, N, M // 8), dtype=torch.uint32, device=dev)
+    col_sf = torch.empty(
+        (E, N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    # An empty stack passes validation and has nothing to quantize: a zero grid is a
+    # launch error here.
+    if row_fp4_w.numel() == 0:
+        return col_fp4.view(torch.uint8), col_sf
+    tiles = E * (M // RHT128_DIM) * (N // RHT128_DIM)
+    num_ctas = max(1, min(tiles, _get_num_sms(dev.index)))
+
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+    _compile_group_col_rht_requantize_kernel(dev.index)(
+        row_fp4_w.view(torch.uint32).view(-1),
+        row_sf_w.view(torch.uint32).view(-1),
+        global_amax,
+        dgrad_rht,
+        h128.unsqueeze(-1),
+        amax_rht_w_qdq_t,
+        col_fp4.view(-1),
+        col_sf.view(torch.uint32).view(-1),
+        int(M),
+        int(N),
+        int(E),
+        int(num_ctas),
+        stream,
+    )
+    # uint32 -> uint8 quadruples the last extent: (E, N, M//8) -> (E, N, M//2).
+    return col_fp4.view(torch.uint8), col_sf

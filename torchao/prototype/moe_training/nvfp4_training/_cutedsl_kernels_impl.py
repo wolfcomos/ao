@@ -753,6 +753,137 @@ def _cvt_e2m1x8_to_f32(word: cutlass.Uint32, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _e4m3x2_to_f16x2(h: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Two E4M3 bytes in the low 16 bits of ``h`` -> packed f16x2, low byte in the
+    low half. Widening, so exact for every E4M3 value (subnormals included) and
+    NaN-preserving -- the route the Triton ``convert_4xfp4_packed_to_8xfp32``
+    takes for the codes."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [h.ir_value(loc=loc, ip=ip)],
+            ("{\n.reg .b16 h;\ncvt.u16.u32 h, $1;\ncvt.rn.f16x2.e4m3x2 $0, h;\n}"),
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16lo_to_f32(p: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """f32 of the low f16 half of ``p`` (exact widening)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [p.ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\ncvt.f32.f16 $0, lo;\n}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16hi_to_f32(p: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """f32 of the high f16 half of ``p`` (exact widening)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [p.ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\ncvt.f32.f16 $0, hi;\n}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _dequant_e2m1x8_bf16x2x4(
+    word: cutlass.Uint32,
+    sf: cutlass.Float32,
+    gds: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Dequantize one packed-FP4 word to four packed bf16x2 words: ``bf16((q_k * sf) * gds)``.
+
+    Triton's ``_reconstruct_qdq_weight_tile`` order, instruction for instruction: exact
+    e2m1 decode, ``mul.rn.f32`` by the block scale (an exact product), ``mul.rn.f32`` by
+    the per-tensor decode scale (the one rounding), ``cvt.rn.bf16x2.f32``. Word k holds
+    elements ``2k`` (low half) and ``2k + 1`` (high half). Multi-output form as
+    ``_cvt_e2m1x8_to_f32``.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [
+            word.ir_value(loc=loc, ip=ip),
+            sf.ir_value(loc=loc, ip=ip),
+            gds.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            ".reg .b32 p0, p1, p2, p3;\n"
+            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
+            ".reg .f32 q0, q1, q2, q3, q4, q5, q6, q7;\n"
+            "mov.b32 {b0, b1, b2, b3}, $4;\n"
+            "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
+            "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
+            "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
+            "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "mov.b32 {l0, h0}, p0;\n"
+            "mov.b32 {l1, h1}, p1;\n"
+            "mov.b32 {l2, h2}, p2;\n"
+            "mov.b32 {l3, h3}, p3;\n"
+            "cvt.f32.f16 q0, l0;\n"
+            "cvt.f32.f16 q1, h0;\n"
+            "cvt.f32.f16 q2, l1;\n"
+            "cvt.f32.f16 q3, h1;\n"
+            "cvt.f32.f16 q4, l2;\n"
+            "cvt.f32.f16 q5, h2;\n"
+            "cvt.f32.f16 q6, l3;\n"
+            "cvt.f32.f16 q7, h3;\n"
+            "mul.rn.f32 q0, q0, $5;\n"
+            "mul.rn.f32 q1, q1, $5;\n"
+            "mul.rn.f32 q2, q2, $5;\n"
+            "mul.rn.f32 q3, q3, $5;\n"
+            "mul.rn.f32 q4, q4, $5;\n"
+            "mul.rn.f32 q5, q5, $5;\n"
+            "mul.rn.f32 q6, q6, $5;\n"
+            "mul.rn.f32 q7, q7, $5;\n"
+            "mul.rn.f32 q0, q0, $6;\n"
+            "mul.rn.f32 q1, q1, $6;\n"
+            "mul.rn.f32 q2, q2, $6;\n"
+            "mul.rn.f32 q3, q3, $6;\n"
+            "mul.rn.f32 q4, q4, $6;\n"
+            "mul.rn.f32 q5, q5, $6;\n"
+            "mul.rn.f32 q6, q6, $6;\n"
+            "mul.rn.f32 q7, q7, $6;\n"
+            "cvt.rn.bf16x2.f32 $0, q1, q0;\n"
+            "cvt.rn.bf16x2.f32 $1, q3, q2;\n"
+            "cvt.rn.bf16x2.f32 $2, q5, q4;\n"
+            "cvt.rn.bf16x2.f32 $3, q7, q6;\n"
+            "}"
+        ),
+        "=r,=r,=r,=r,r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [k], loc=loc, ip=ip))
+        for k in range(4)
+    )
+
+
+@dsl_user_op
 def _bf16round_f32x8(
     v0: cutlass.Float32,
     v1: cutlass.Float32,
