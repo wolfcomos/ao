@@ -218,6 +218,147 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   the instruction cache. The times above were measured before `_sr_e4m3_byte` gained its
   sign select (one `shr.u32` more per block), a form byte-identical on every valid input.
 
+### group_col_rht_requant_amax (`cutedsl_group_col_rht_requant_amax` vs `triton_group_col_rht_requant_amax`)
+
+The V2 backward weight amax: one pass over the packed forward weight of the `(E, M, N)`
+stack -- the rowwise FP4 codes and swizzled e4m3 scales `group_row_cast_quantize` emitted
+-- returns, per expert, the amax of `|W_qdq.t() @ R_n|`, the RHT-128 transform (dgrad
+signs) of the dequantized weight's transpose. The CuteDSL kernel rebuilds `W_qdq` on chip:
+256 producer threads decode each 128x128 tile's codes and scales in the Triton kernel's
+order (2688 numerator, rounded to bfloat16, the +-1 sign folded into the per-row decode
+scale) into an MN-major SW128 A stage of a four-deep ring, one MMA warp runs the stage
+through eight `(128, 128, 16)` bfloat16 UMMAs against the resident sign-free `H128`, and
+four epilogue warps atomic-max the bfloat16-rounded accumulator into the zeroed `(E,)`.
+The requantize op below shares this producer, as the Triton twins share
+`_load_rht_requant_weight_tile`. The two backends produce bitwise identical amaxes
+(`torch.equal` at every shape below). Bandwidth counts the packed FP4 codes and swizzled
+scales read, 0.5625 bytes per weight element, plus the `(E,)` amax written.
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_col_rht_requant_amax
+```
+
+| model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.90 | 15.00 | 1.69x | 16.6 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 8.89 | 15.17 | 1.71x | 16.6 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 15.45 | 25.73 | 1.67x | 420.0 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 15.03 | 25.68 | 1.71x | 431.8 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 43.77 | 79.29 | 1.81x | 754.5 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 43.51 | 79.28 | 1.82x | 759.1 |
+
+- Op time includes the torch glue each backend issues per call: CuteDSL the one
+  `torch.zeros((E,))` fill, 1.73-1.76 us (the signs enter as the int8 vector and the
+  sign-free `H128` is the cached constant); Triton `get_dynamic_rht_matrix` -- an
+  int8->bfloat16 copy at 2.2-2.3 us and the sign product at 3.4-3.5 us -- plus the same
+  fill, 7.42-7.45 us. Kernel-only (profiler self CUDA time of the main kernel), CuteDSL vs
+  Triton: 7.15 vs 8.01 us at the debug model (1.12x), 13.67 vs 18.31 us at 16B gate/up
+  (1.34x), 13.28 vs 18.34 us at 16B down (1.38x), 42.06 vs 71.54 us at 671B gate/up
+  (1.70x), 41.75 vs 71.53 us at 671B down (1.71x). Neither op issues a memcpy.
+- The 671B gate, op time <= 30 us: gate/up `w (4, 2048, 7168)` 43.77 us -- FAIL, 13.77 us
+  (1.46x) over; down `w (4, 7168, 2048)` 43.51 us -- FAIL, 13.51 us (1.45x) over. The
+  kernel alone is 42.06 / 41.75 us, over the gate on its own, and the glue 1.76 us (4% of
+  the op): the miss is the kernel's. The kernel is producer-bound: the producer threads'
+  register-prefetched code and scale loads are latency-exposed (ncu of the producer probe
+  on a 2062 MHz node: 1.79 long-scoreboard stalls per issued instruction), so a tile costs
+  ~1.8k cycles against the 512-cycle floor of its eight UMMAs and the 660-720-cycle
+  producer issue budget the design assumed. A bitwise `cp.async` staging ring for the
+  producer's codes and scale words, measured on that 2062 MHz node, takes the kernel from
+  1.67x to 2.02x Triton kernel-only at 671B (22.6 vs 27.3 us there) and is not shipped in
+  this commit.
+- At 671B the op reads 33.0 MB at 754.5-759.1 GB/s, 9.5-9.6% of the 7936 GB/s peak (the
+  kernel alone 785-791 GB/s, 9.9-10.0%): neither memory- nor tensor-bound. The steady
+  state from the 671B and 16B rows of each projection (24 and 5 tiles on the busiest of
+  the 152 persistent CTAs, kernel-only 42.06 / 13.67 and 41.75 / 13.28 us) is 1.49-1.50 us
+  = 1.79-1.80k cycles per 128x128 tile at the 1200 MHz application clock against the
+  512-cycle UMMA floor -- the tensor pipe is 29% active. The debug model (16 CTAs, one
+  tile each) is the kernel's fixed floor, 7.1 us; the same two-point figure for Triton's
+  kernel is 3.36k cycles per tile.
+- On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL column
+  is 0.97-1.00x of the values above (8.87 / 8.85 / 15.28 / 14.87 / 42.66 / 42.48 us, one
+  pass; REG 53) and the Triton column 0.97-1.01x (15.11 / 14.89 / 25.13 / 25.02 / 77.12 /
+  77.30 us: Triton 3.6.0 compiles this op, as the baseline table records). The twin's
+  amaxes are bitwise equal to Triton 3.6.0's as well (`torch.equal` at every shape above).
+- `cuobjdump -res-usage` of the compiled kernel: REG 54, STACK 0, SHARED 1024 (static),
+  LOCAL 0 at 416 threads (13 warps: the MMA warp, four epilogue, eight producer) with no
+  `setmaxnreg`. Its 1232 SASS hold 8 `UTCHMMA` (the tile's eight UMMAs, one tile body in
+  the persistent loop), 2 `UTMALDG` (the one-shot `H128` load), 8 `LDTM` and no `HMMA`,
+  `LDSM`, `STSM`, `LDL` or `STL`; the producer's rolled word loop is 171 instructions
+  (2736 bytes) per pass with 64 `FMUL` and no `FFMA` or `.FTZ` -- the dequantize
+  multiplies round as Triton's do (the kernel's 22 `FFMA` and 12 `.FTZ` are the `div.rn`
+  expansions of the per-expert scales, as Triton's `tl.div_rn`). The dynamic shared memory
+  is the four 32 KB MN-major SW128 A stages plus the resident 32 KB `H128`.
+
+### group_col_rht_requantize (`cutedsl_group_col_rht_requantize` vs `triton_group_col_rht_requantize`)
+
+The V2 backward dgrad weight operand: one pass over the same packed forward weight
+requantizes, per expert, `W_qdq.t() @ R_n` rowwise along the transposed axis against the
+group amaxes of `group_col_rht_requant_amax` -- RTNE FP4 codes `(E, N, M//2)` and swizzled
+e4m3 block scales `(E, N//128, M//64, 32, 16)`, decoded with the 2688 cast numerator. The
+CuteDSL kernel is the amax kernel's producer and tcgen05 chain (the same on-chip
+dequantize into the SW128 A ring, eight UMMAs per tile against the resident `H128`) with
+the accumulator zero-filled in TMEM before each tile's chain, as Triton's kernel
+accumulates all eight K steps into a zeroed accumulator, and the amax epilogue replaced by
+eight epilogue warps running the landed RTNE 1x16 quantize helpers on four blocks per warp
+per tile read from TMEM, writing 64-byte code rows and 4-byte swizzled scale words. Codes
+and scales are bitwise identical across backends at every shape below (`torch.equal` on
+both outputs, the two ops fed the same amax). Bandwidth counts the packed FP4 codes and
+swizzled scales read plus the same written on the transposed axis, 1.125 bytes per weight
+element.
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_col_rht_requantize
+```
+
+| model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 7.90 | 13.10 | 1.66x | 37.3 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 7.89 | 13.19 | 1.67x | 37.4 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 18.04 | 28.19 | 1.56x | 719.3 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 17.49 | 28.21 | 1.61x | 742.0 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 61.64 | 104.91 | 1.70x | 1071.8 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 65.31 | 105.14 | 1.61x | 1011.5 |
+
+- Op time: the CuteDSL op is its one kernel launch -- no fill, no sign matrix, no memcpy;
+  the Triton op adds `get_dynamic_rht_matrix` (the int8->bfloat16 copy at 2.3 us and the
+  sign product at 3.3-3.9 us), 5.64-6.16 us per call. Kernel-only (profiler self CUDA time
+  of the main kernel), CuteDSL vs Triton: 7.92 vs 7.50 us at the debug model (0.95x -- the
+  one cell Triton's kernel wins; the op still wins on the glue), 18.02 vs 22.44 us at 16B
+  gate/up (1.24x), 17.49 vs 22.48 us at 16B down (1.28x), 61.86 vs 99.26 us at 671B
+  gate/up (1.60x), 65.61 vs 99.50 us at 671B down (1.52x).
+- The 671B gate, op time <= 52 us (2x the Triton 3.8.0 baseline): gate/up `w (4, 2048,
+  7168)` 61.64 us -- FAIL, 9.64 us (1.19x) over; down `w (4, 7168, 2048)` 65.31 us --
+  FAIL, 13.31 us (1.26x) over; against the port plan's <= 30 us -- FAIL, 2.05x and 2.18x
+  over. The op is its kernel, so both verdicts are the kernel's; it is 1.70x / 1.61x
+  Triton 3.8's 104.91 / 105.14 us. The kernel is bound by the producer the amax kernel is
+  bound by, with the eight epilogue warps' RTNE chain on top: 2.77-3.04k cycles per tile
+  against the amax kernel's 1.79-1.80k, so the epilogue does not overlap the producer
+  fully. The two 671B shapes differ by 6% on this kernel (61.86 vs 65.61 us) and by 0.2%
+  on Triton's.
+- At 671B the op moves 66.1 MB at 1071.8 / 1011.5 GB/s, 13.5% / 12.7% of the 7936 GB/s
+  peak. The steady state from the 671B and 16B rows of each projection (24 and 5 tiles on
+  the busiest of the 152 persistent CTAs, kernel-only 61.86 / 18.02 and 65.61 / 17.49 us)
+  is 2.31-2.53 us = 2.77-3.04k cycles per 128x128 tile at the 1200 MHz application clock
+  against the 512-cycle UMMA floor -- the tensor pipe is 17-19% active. The debug model
+  (16 CTAs, one tile each) is the kernel's fixed floor, 7.9 us; the same two-point figure
+  for Triton's kernel is 4.85-4.87k cycles per tile. Both kernels are SM-bound, so the
+  ratio, not the absolute time, is the clock-portable number.
+- On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL column
+  is 1.02-1.11x of the values above (8.13 / 8.11 / 18.49 / 17.93 / 66.60 / 72.66 us, one
+  pass; REG 71, 8-11% slower at 671B) and Triton 3.6.0 is faster than 3.8.0 on this op
+  (13.12 / 13.12 / 26.51 / 26.44 / 89.72 / 89.85 us, 0.85x at 671B, as in the baseline
+  table), so the twin is 1.24-1.62x there. Codes and scales are bitwise equal to Triton
+  3.6.0's as well (`torch.equal` at every shape above).
+- `cuobjdump -res-usage` of the compiled kernel: REG 80, STACK 0, SHARED 1024 (static),
+  LOCAL 0 at 544 threads (17 warps: the MMA warp, eight epilogue, eight producer) with no
+  `setmaxnreg` -- 80 x 544 = 43520 of the SM's 65536 registers. Its 1568 SASS hold 8
+  `UTCHMMA`, 2 `UTMALDG`, 12 `STTM` (the TMEM zero fill), 4 `LDTM`, 2 `STG.128` + 1 `STG`
+  (the code row and the scale words) and no `HMMA`, `LDSM`, `STSM`, `LDL` or `STL`; the
+  producer loop is the amax kernel's (171 instructions per pass, 64 `FMUL`, no `FFMA` or
+  `.FTZ`), and the whole kernel holds 105 `FMUL`, 105 `F2FP` and 14 `MUFU.RCP` + 8 `FCHK`
+  (the `div.rn` expansions) against the amax kernel's 64 / 33 / 7 + 2 -- the difference is
+  the RTNE epilogue.
+
 ## Triton baseline for the nine grouped kernels
 
 The targets for the remaining ports: the five V2 ops (`row_cast_quantize`,
