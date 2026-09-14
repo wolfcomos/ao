@@ -507,6 +507,141 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_col_cast_requantize
   `.FTZ` are the `div.rn` expansions of the per-expert and per-block scales, as Triton's
   `tl.div_rn`.
 
+### group_row_cast_col_rht_amax (`cutedsl_group_rht_amax` vs `triton_group_rht_amax`, `dynamic_rht=True`)
+
+The V2 forward activation amax: one pass over the packed activation `x = (E * tokens, hidden)`
+returns, per expert, the raw rowwise amax `max|x_g|` and the columnwise amax of
+`|x_g.t() @ R|`, a 128-point randomized Hadamard transform along the tokens with the live
+wgrad sign buffer (`sign_tensor`, `dynamic_rht=True`; the static RHT-16 path of the same op
+is unchanged). The CuteDSL kernel loads every 128x128 tile into shared memory once (TMA) and
+feeds it to two consumer groups: one tcgen05 UMMA chain (8 UMMAs against the resident
+`R^T` operand, the col chain of `group_row_rht_col_rht_amax`) whose accumulator four warps
+reduce from TMEM, and eight row warps that read the same bytes through a plain
+`(hidden, token, stage)` view and reduce the raw amax -- the RHT-16 kernels' two-consumer
+stage. The two backends produce bitwise identical amaxes (`torch.equal` on both outputs at
+every shape below, 64 groups, empty groups, spare capacity rows and int8 / bfloat16 / float32
+sign buffers). Bandwidth counts the bfloat16 read of `x`; the `2E` scalar outputs are not
+counted.
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_amax
+```
+
+| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 14.63 | 18.92 | 1.29x | 35.8 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 14.63 | 18.88 | 1.29x | 35.8 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 18.59 | 36.20 | 1.95x | 1240.9 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 18.59 | 36.21 | 1.95x | 1241.1 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 38.75 | 118.33 | 3.05x | 3030.4 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 38.65 | 118.57 | 3.07x | 3038.3 |
+
+- Op time includes the same torch glue on both backends -- one sign-to-matrix build and two
+  `torch.zeros` fills -- 8.9-10.4 us for CuteDSL and 9.9-11.8 us for Triton. At 671B gate/up,
+  `x (8192, 7168)`: CuteDSL `torch.mul(h128, sign[None, :])` 6.40 us (the int8 sign operand
+  puts it on ATen's casting `gpu_kernel_impl`) + two fills 3.95 us; Triton
+  `get_dynamic_rht_matrix` 4.94 us + its int8->bfloat16 copy 2.88 us + two fills 3.93 us.
+  Kernel-only (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 9.51 vs
+  26.53 us at 16B gate/up (2.79x), 28.26 vs 109.54 us at 671B gate/up (3.88x), 28.19 vs
+  107.15 us at 671B down (3.80x). The metric excludes the 2.01-2.43 us `Memcpy DtoD` of the
+  CuteDSL impl's `logical_packed_length.clone()`, which the Triton op does not issue.
+- The op gates of the port plan: 16B `x (5632, 2048)` 18.59 us against <= 16 us -- over by
+  2.59 us (16.2%); 671B `x (8192, 7168)` 38.75 us against <= 32 us -- over by 6.75 us (21.1%).
+  At both shapes the kernel alone is under the gate (9.51 and 28.26 us) and the glue is
+  8.9-10.4 us, 27-48% of the op: the miss is the glue, the int8-sign `torch.mul` at
+  5.2-6.4 us plus the two fills at 3.7-4.0 us. Flipping the sign bits of the cached unsigned
+  `H128` in shared memory by the two idle warps would remove the `torch.mul`; the fills are
+  the Triton op's contract (zero-initialised outputs, atomic max).
+- At 671B gate/up the op reads 117 MB at 3030 GB/s, 38.2% of the 7936 GB/s peak; the kernel
+  alone runs at 4155 GB/s, 52.4% (16B gate/up: 2426 GB/s kernel-only). Per tile, derived
+  from the 671B kernel-only times over 3584 tiles on 152 CTAs after a ~5.7 us fixed floor
+  (the debug-model row less its glue): ~0.95 us, ~1150 cycles at 1200 MHz -- above both the
+  753-cycle HBM share of a 32 KB tile and the ~550 cycles of the 8-UMMA chain, so the row
+  warps' shared-memory pass (4 x 16-wide reads per thread) and the two-consumer stage
+  recycle are what to profile next; the design's 750-900-cycle forecast was not reached.
+- On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL kernel
+  compiles and passes every single-backend test (oracle, in-place resample, padded rows); the
+  Triton op does not compile there (`TritonNvidiaGPUOptimizeTMemLayoutsPass`, as in the
+  baseline table), so the cross-backend `torch.equal` items and the Triton column are
+  Triton 3.8.0 only.
+- `cuobjdump -res-usage` of the compiled kernel: REG 34, STACK 0, SHARED 1024 (static),
+  LOCAL 0, at 512 threads and no `setmaxnreg`. Its SASS (1632 lines) holds 8 `UTCHMMA` (the
+  single chain), 2 `UTCBAR`, 8 `LDTM` (the col epilogue's TMEM reads), 4 `REDG.E.MAX` (the
+  per-group bit-pattern max flushes), 118 `FMNMX`, 12 `LDS` / 2 `STS` (the static struct
+  and the row warps' 16-byte stage reads) and no `HMMA`, `LDSM`, `STSM`, `STTM`, `LDL` or
+  `STL`. The landed kernels' cubins are byte-identical before and after this change or
+  differ only by ptxas's recorded two-outcome uniform-register assignment (the MS-EDEN cubin
+  in every compile session, the RHT-128 gradient amax cubin in one: 12 `UIADD3` / `UTCHMMA`
+  operand pairs with `UR52` and `UR54` swapped, no instruction change; the flip reproduces
+  between two compiles of the unchanged tree).
+
+### group_row_cast_col_rht_quantize (`cutedsl_group_rht_quantize_row_col` vs `triton_group_rht_quantize_row_col`, `dynamic_rht=True`)
+
+The V2 forward activation quantize: one pass over the packed activation
+`x = (E * tokens, hidden)` emits both NVFP4 operands -- the raw rows of `x_g` and the columns
+of `x_g.t() @ R` (the 128-point randomized Hadamard transform along the tokens, live wgrad
+signs) -- as RTNE FP4 codes with E4M3 block scales against the group's two amaxes from
+`group_rht_amax`. The CuteDSL kernel is the amax kernel's mainloop (one TMA load per 128x128
+tile, 8 UMMAs against the resident `R^T` operand, the row warps on the same shared-memory
+stage) with the two amax epilogues replaced by the quantize epilogues: eight col warps, two
+per TMEM quadrant, quantize the accumulator from TMEM under the requantize kernel's zero-fill
+discipline (the epilogue zero-fills its TMEM chunks and every UMMA accumulates, so an
+exact-zero column sum keeps Triton's `+0` nibble), and eight row warps run the RHT-16 fused
+kernel's rowwise epilogue on the raw bfloat16 tile. Codes and scales are bitwise identical
+across backends at every shape below, exact and fast math (`torch.equal` on all four outputs,
+including 64 groups, an empty group, spare capacity rows, an all-zero group under all `-1`
+signs and 671B down). Stochastic rounding is refused on this path (`ValueError`); the
+baseline table's `rs` rows for this op are synthetic. Bandwidth counts the bfloat16 read plus
+the FP4 codes and swizzled scales on both axes, 3.125 bytes per element; `use_fast_math=True`,
+the recipe default and the baseline table's rows.
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_quantize
+```
+
+| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 12.69 | 14.89 | 1.17x | 64.6 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 12.56 | 15.00 | 1.19x | 65.2 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 21.17 | 31.07 | 1.47x | 1703.1 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 20.68 | 30.93 | 1.50x | 1742.7 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 64.10 | 113.33 | 1.77x | 2862.6 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 65.31 | 113.21 | 1.73x | 2809.6 |
+
+- Op time includes the same torch glue on both backends -- the sign-to-matrix build, no
+  fills -- 5.2-6.4 us for CuteDSL (`torch.mul(h128, sign[None, :])`, the int8 sign operand on
+  ATen's casting `gpu_kernel_impl`) and 6.1-8.1 us for Triton (`get_dynamic_rht_matrix`
+  3.5-5.1 us plus its int8->bfloat16 copy 2.6-3.0 us). Kernel-only (profiler self CUDA time
+  of the main kernel), CuteDSL vs Triton: 15.98 vs 24.93 us at 16B gate/up (1.56x), 57.20 vs
+  105.53 us at 671B gate/up (1.84x), 58.86 vs 105.05 us at 671B down (1.78x). The metric
+  excludes the 2.01-2.05 us `Memcpy DtoD` of the CuteDSL impl's
+  `logical_packed_length.clone()`, which the Triton op does not issue.
+- The op gates of the port plan: 16B gate/up `x (5632, 2048)` 21.17 us against <= 21 us --
+  over by 0.17 us (0.8%); 16B down `x (8192, 1408)` 20.68 us -- under by 0.32 us; 671B
+  gate/up `x (8192, 7168)` 64.10 us against <= 55 us -- over by 9.10 us (16.5%); 671B down
+  `x (28672, 2048)` 65.31 us -- over by 10.31 us (18.7%). At 16B the kernel alone (15.98 us)
+  is under the gate and the 5.2 us `torch.mul` is the miss; at 671B the kernel alone
+  (57.2-58.9 us) misses the gate by 4-7% on its own. Per tile, derived from the 671B
+  kernel-only times over 3584 tiles on 152 CTAs after a ~7.4 us floor (the debug-model row
+  less its glue): ~2.1 us, ~2500 cycles at 1200 MHz against the design's 1.2-1.5k forecast --
+  the epilogues bound the kernel (eight col warps quantizing four blocks per lane from
+  TMEM, eight row warps quantizing 4 x 16 elements per thread from shared memory), not the
+  8-UMMA chain or HBM; that is the next lever.
+- At 671B gate/up the op moves 183 MB (the bfloat16 read plus 1.125 bytes per element of
+  codes and scales) at 2863 GB/s, 36.1% of the 7936 GB/s peak; the kernel alone runs at
+  3208 GB/s, 40.4%.
+- On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL kernel
+  compiles and all four outputs stay bitwise equal to Triton 3.6.0's at the eleven smoke
+  shapes, exact and fast, with both backends fed the CuteDSL amaxes (Triton 3.6.0 does not
+  compile the RHT-128 amax, as in the baseline table); the checked-in cross-backend tests
+  compute their amaxes with the Triton op and therefore run on Triton 3.8.0 only.
+- `cuobjdump -res-usage` of the compiled kernel: REG 62, STACK 0, SHARED 1024 (static),
+  LOCAL 0, at 640 threads and no `setmaxnreg`. Its SASS (2280 lines) holds 8 `UTCHMMA`, 2
+  `UTCBAR`, 4 `LDTM` + 12 `STTM` (a warp's four-block TMEM read and its zero fills: two
+  stages up front, four chunks per tile), 2 `STG.E.128` (the col code quarters), 4
+  `STG.E.64` (the row code pairs), 80 `F2FP`, 23 `MUFU.RCP` and no `HMMA`, `LDSM`, `STSM`,
+  `LDL` or `STL`.
+
 ## Triton baseline for the nine grouped kernels
 
 The targets for the remaining ports: the five V2 ops (`row_cast_quantize`,
