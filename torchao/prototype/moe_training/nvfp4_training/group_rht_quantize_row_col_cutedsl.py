@@ -28,7 +28,9 @@ from .group_hadamard_utils import (
     _validate_rng_state,
 )
 from .hadamard_cutedsl_utils import raise_if_cutedsl_nvfp4_unavailable
-from .hadamard_utils import _device_key, get_rht_matrix
+from .hadamard_utils import _device_key, get_hadamard_matrix, get_rht_matrix
+
+RHT_SIZE = 128
 
 
 @torch.library.custom_op("torchao::cutedsl_group_rht_quantize_row_col", mutates_args=())
@@ -46,6 +48,8 @@ def cutedsl_group_rht_quantize_row_col(
     enable_stochastic_rounding: bool,
     logical_packed_length: Optional[torch.Tensor] = None,
     use_fast_math: bool = False,
+    sign_tensor: Optional[torch.Tensor] = None,
+    dynamic_rht: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Grouped fused RHT columnwise + direct rowwise NVFP4 E2M1 quantization.
 
@@ -60,6 +64,12 @@ def cutedsl_group_rht_quantize_row_col(
     is read from ``offsets`` alone, which is correct for both SAME_BOTH_DIMS and
     VARYING_FIRST_DIM.
 
+    ``dynamic_rht=True`` selects the V2 RHT-128 path: ``sign_tensor`` is the live
+    ``(128,)`` sign buffer, ``sign_vector`` is ignored (pass ``[]``), and
+    ``R^T = H128 * signs[None, :]`` is formed per launch, never memoized. Only the
+    ``(128,)`` buffer is served; the Triton op also accepts a ``(16,)`` one.
+    Stochastic rounding is not supported on this path.
+
     Returns ``(qa_base, sfa, qd, sfd)``; both scale tensors carry swizzled bytes
     reinterpreted to their logical 2D shapes.
 
@@ -70,15 +80,37 @@ def cutedsl_group_rht_quantize_row_col(
         NotImplementedError: pre-SM100 or a missing CuteDSL runtime.
         ValueError: bad shapes/dtypes, ``num_tensors`` above the kernel's group
             cap, or stochastic rounding without a valid ``rng_state``.
+            Stochastic rounding together with ``dynamic_rht=True`` is refused too.
     """
     raise_if_cutedsl_nvfp4_unavailable("cutedsl_group_rht_quantize_row_col")
 
     from ._cutedsl_group_kernels_impl import (
         MAX_GROUPS,
         _cutedsl_group_rht_quantize_row_col_impl,
+        _cutedsl_group_row_cast_col_rht_quantize_impl,
     )
 
-    B = get_rht_matrix(tuple(sign_vector), _device_key(A.device), torch.bfloat16, 16)
+    if dynamic_rht:
+        if sign_tensor is None:
+            raise ValueError("dynamic_rht=True requires a sign_tensor")
+        if sign_tensor.ndim != 1 or sign_tensor.numel() != RHT_SIZE:
+            raise ValueError(
+                f"sign_tensor must be a ({RHT_SIZE},) tensor, got shape {tuple(sign_tensor.shape)}"
+            )
+        if not sign_tensor.is_cuda or sign_tensor.device != A.device:
+            raise ValueError("sign_tensor must be on the same device as A")
+        # H128 is symmetric, so ``H128 * signs[None, :]`` is ``get_dynamic_rht_matrix(signs).t()``
+        # -- the (N, K) UMMA operand -- without the transpose copy; ``.to`` is a no-op for the
+        # int8 / bfloat16 buffers the recipe passes and only converts other dtypes. Formed per
+        # launch: the sign buffer is a live tensor resampled in place, never a cache key.
+        h128 = get_hadamard_matrix(RHT_SIZE, _device_key(A.device), torch.bfloat16)
+        B = torch.mul(h128, sign_tensor[None, :]).to(torch.bfloat16)
+    elif sign_tensor is not None:
+        raise ValueError("sign_tensor is only used when dynamic_rht=True")
+    else:
+        B = get_rht_matrix(
+            tuple(sign_vector), _device_key(A.device), torch.bfloat16, 16
+        )
     _validate_grouped_hadamard_inputs(
         A,
         B,
@@ -88,6 +120,7 @@ def cutedsl_group_rht_quantize_row_col(
         hidden_size,
         shape_rep,
         logical_packed_length,
+        rht_size=B.shape[0],
     )
     if num_tensors > MAX_GROUPS:
         raise ValueError(
@@ -101,7 +134,30 @@ def cutedsl_group_rht_quantize_row_col(
         d_global_amax, "d_global_amax", num_tensors, A.device
     )
     rng_state = _validate_rng_state(rng_state, A.device, enable_stochastic_rounding)
+    if dynamic_rht and enable_stochastic_rounding:
+        raise ValueError(
+            "stochastic rounding is not supported with dynamic_rht by the CuteDSL grouped kernel"
+        )
 
+    if dynamic_rht:
+        col_fp4, col_sf, row_fp4, row_sf = (
+            _cutedsl_group_row_cast_col_rht_quantize_impl(
+                A,
+                offsets,
+                row_amax,
+                col_amax,
+                num_tensors,
+                B,
+                logical_packed_length=logical_packed_length,
+                use_fast_math=use_fast_math,
+            )
+        )
+        return (
+            row_fp4,
+            row_sf.view(packed_sequence_length, hidden_size // 16),
+            col_fp4,
+            col_sf.view(hidden_size, packed_sequence_length // 16),
+        )
     col_fp4, col_sf, row_fp4, row_sf = _cutedsl_group_rht_quantize_row_col_impl(
         A,
         offsets,
@@ -137,6 +193,8 @@ def _(
     enable_stochastic_rounding,
     logical_packed_length=None,
     use_fast_math=False,
+    sign_tensor=None,
+    dynamic_rht=False,
 ):
     qa_base = A.new_empty((packed_sequence_length, hidden_size // 2), dtype=torch.uint8)
     sfa = A.new_empty(

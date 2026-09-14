@@ -148,6 +148,8 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
         _compile_group_col_rht_requant_amax_kernel,
         _compile_group_col_rht_requantize_kernel,
         _compile_group_fused_kernel,
+        _compile_group_row_cast_col_rht_amax_kernel,
+        _compile_group_row_cast_col_rht_quantize_kernel,
         _compile_group_row_rht_col_rht_amax_kernel,
         _compile_group_row_rht_col_rht_quantize_ms_eden_kernel,
     )
@@ -163,4 +165,7 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx)
     _compile_group_col_rht_requant_amax_kernel(idx)
     _compile_group_col_rht_requantize_kernel(idx)
+    _compile_group_row_cast_col_rht_amax_kernel(idx)
+    for fast_math in (False, True):
+        _compile_group_row_cast_col_rht_quantize_kernel(idx, fast_math)
     get_hadamard_matrix(128, _device_key(dev), torch.bfloat16)
