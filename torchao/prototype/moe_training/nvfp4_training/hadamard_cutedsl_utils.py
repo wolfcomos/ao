@@ -152,6 +152,7 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
         _compile_group_row_cast_col_rht_quantize_kernel,
         _compile_group_row_rht_col_rht_amax_kernel,
         _compile_group_row_rht_col_rht_quantize_ms_eden_kernel,
+        _get_group_amax_reduce_buffers,
     )
     from .hadamard_utils import _device_key, get_hadamard_matrix
 
@@ -159,9 +160,11 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     for sr in (False, True):
         for fast_math in (False, True):
             _compile_group_fused_kernel(idx, sr, fast_math)
-    # The V2 gradient amax forms its two rotation operands per launch from the cached
-    # Hadamard; warm that cache too, so neither the compile nor H128 lands in the graph pool.
+    # The V2 gradient amax validates against the cached Hadamard and reduces across CTAs
+    # through persistent per-device buffers; warm both, so neither the compile nor H128
+    # nor the reduction state lands in the graph pool.
     _compile_group_row_rht_col_rht_amax_kernel(idx)
+    _get_group_amax_reduce_buffers(idx)
     _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx)
     _compile_group_col_rht_requant_amax_kernel(idx)
     _compile_group_col_rht_requantize_kernel(idx)

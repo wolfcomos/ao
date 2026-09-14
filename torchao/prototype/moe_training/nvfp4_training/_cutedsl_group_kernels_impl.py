@@ -31,9 +31,9 @@ wrong layout.
 A third kernel, ``_Tcgen05GroupRowRhtColRhtAmax``, serves the V2 backward gradient
 amax: both axes are transformed by an RHT-128 with independent sign vectors. It is
 standalone (no CLC, a static persistent grid) and feeds two UMMA chains from one
-TMA'd 128x128 tile against two resident host-built ``R^T`` operands; its
-``RHT128_`` constants are its own, the unprefixed ones above belong to the RHT-16
-kernels.
+TMA'd 128x128 tile against two resident ``R^T`` operands its epilogue warps write
+into shared memory from the live sign vectors; its ``RHT128_`` constants are its
+own, the unprefixed ones above belong to the RHT-16 kernels.
 
 A fourth kernel, ``_Tcgen05GroupRowRhtColRhtQuantizeMsEden``, is the MS-EDEN quantize
 that consumes that amax kernel's two outputs: the same standalone two-chain mainloop,
@@ -1808,6 +1808,8 @@ RHT128_TPB = 32 * RHT128_N_WARPS
 RHT128_ACC_CONSUMER_WARPS = (COL_WARP_END - COL_WARP_BEGIN) + (
     RHT128_ROW_WARP_END - ROW_WARP_BEGIN
 )
+RHT128_ENTRY_BITS = 0x3DB5  # bfloat16(1 / sqrt(128)): |entry| of the normalized H128
+RHT128_B_READY_BAR = 3  # both R^T tiles written to shared memory
 
 
 def _static_tile_range(total, cta, n_ctas):
@@ -1892,27 +1894,153 @@ def _rht128_amax_epilogue(
     _flush_group_max(run_max, amax_t, g, lane)
 
 
+@functools.lru_cache(maxsize=None)
+def _get_group_amax_reduce_buffers(device_idx):
+    """Persistent per-device cross-CTA reduction state of ``_Tcgen05GroupRowRhtColRhtAmax``:
+    the ``(1,)`` int32 arrival ticket and the ``(2 * MAX_GROUPS,)`` float32 accumulator the
+    epilogues atomic-max into, both zero between launches -- the last CTA copies the
+    accumulator's ``2 * num_tensors`` slots into the outputs and re-zeroes them, and
+    resets the ticket. Persistent for the reason ``_get_sr_rng_buffer`` is: a fresh
+    per-call tensor would be an untracked allocation in the CUDA-graph pool. One state per
+    device, so two of these kernels running concurrently on different streams of one device
+    would race on it.
+    """
+    dev = torch.device("cuda", device_idx)
+    ticket = torch.zeros((1,), dtype=torch.int32, device=dev)
+    acc = torch.zeros((2 * MAX_GROUPS,), dtype=torch.float32, device=dev)
+    return ticket, acc
+
+
+@cute.jit
+def _rht128_amax_finalize(
+    acc_t, ticket_t, col_amax_t, row_amax_t, flag_t, barrier, num_tensors, gdim, tidx_e
+):
+    """Hand the accumulated per-group maxes to the outputs, by the last CTA to finish.
+
+    Run by the 256 epilogue threads of every CTA after their last flush and the barrier
+    that follows it: thread 0 takes an arrival ticket with an acq_rel RMW at gpu scope
+    (the release publishes the CTA's flushes, ordered before it by that barrier) and in
+    the CTA whose ticket is ``gdim - 1`` thread ``s < 2 * num_tensors`` -- ordered after
+    thread 0's acquire by the barrier -- moves slot ``s`` (``chain * num_tensors + g``,
+    chain 0 = col) to its output and re-zeroes it, and thread 0 resets the ticket, so the
+    next launch again accumulates into zeros. Until this point the slots of a launch are
+    written only by atomics and read by nobody, and the re-zeroing stores are the
+    reading threads' own, so no stale L1 line exists.
+    """
+    if tidx_e == cutlass.Int32(0):
+        ticket = cute.arch.atomic_add(
+            ticket_t.iterator, cutlass.Int32(1), sem="acq_rel", scope="gpu"
+        )
+        flag_t[0] = cutlass.Int32(
+            cutlass.select_(
+                ticket == gdim - cutlass.Int32(1), cutlass.Int32(1), cutlass.Int32(0)
+            )
+        )
+    barrier.arrive_and_wait()
+    if flag_t[0] != cutlass.Int32(0):
+        if tidx_e < num_tensors:
+            col_amax_t[tidx_e] = acc_t[tidx_e]
+            acc_t[tidx_e] = cutlass.Float32(0.0)
+        elif tidx_e < cutlass.Int32(2) * num_tensors:
+            row_amax_t[tidx_e - num_tensors] = acc_t[tidx_e]
+            acc_t[tidx_e] = cutlass.Float32(0.0)
+        if tidx_e == cutlass.Int32(0):
+            ticket_t[0] = cutlass.Int32(0)
+
+
+@cute.jit
+def _rht128_signed_operand_row(sign_t, b_base, j, lane):
+    """Write row ``j`` of a resident K-major SW128 ``R^T`` tile from the live int8 signs.
+
+    ``R^T[j, k] = s_k H128[j, k]`` and every ``|H128|`` entry is ``bfloat16(1 / sqrt(128))``
+    with sign ``popcount(j & k) & 1`` (Sylvester order), so the element is
+    ``RHT128_ENTRY_BITS`` with bit 15 ``= parity(j & k) ^ (s_k < 0)`` -- the bytes of
+    ``torch.mul(h128, s[None, :])``. Both sign words are formed once per thread as 128-bit
+    vectors over ``k`` (four 32-bit words): the ``s_k < 0`` bits by four warp ballots, the
+    ``parity(j & k)`` bits as the XOR of the alternating masks selected by the set bits of
+    ``j`` (bits 0-4 of ``k`` alternate inside a word, bits 5-6 pick the word). Per 16 B chunk
+    ``c`` (``k = 8 c .. 8 c + 7``) byte ``c`` of that vector is spread onto bits 15, 31, 47,
+    63 of two 64-bit words by one multiply per nibble, and stored at byte
+    ``(c // 8) * 16384 + 128 j + 16 ((c % 8) ^ x)`` of the tile, where ``x`` is the SW128
+    phase of the row's absolute address (bits 7-9), as the TMA that used to write these
+    tiles applied it.
+    """
+    neg0 = cutlass.Uint32(cute.arch.vote_ballot_sync(sign_t[lane] < cutlass.Int8(0)))
+    neg1 = cutlass.Uint32(
+        cute.arch.vote_ballot_sync(sign_t[lane + cutlass.Int32(32)] < cutlass.Int8(0))
+    )
+    neg2 = cutlass.Uint32(
+        cute.arch.vote_ballot_sync(sign_t[lane + cutlass.Int32(64)] < cutlass.Int8(0))
+    )
+    neg3 = cutlass.Uint32(
+        cute.arch.vote_ballot_sync(sign_t[lane + cutlass.Int32(96)] < cutlass.Int8(0))
+    )
+    ju = cutlass.Uint32(j)
+    zero = cutlass.Uint32(0)
+    one = cutlass.Uint32(1)
+    had = (
+        ((zero - (ju & one)) & cutlass.Uint32(0xAAAAAAAA))
+        ^ ((zero - ((ju >> one) & one)) & cutlass.Uint32(0xCCCCCCCC))
+        ^ ((zero - ((ju >> cutlass.Uint32(2)) & one)) & cutlass.Uint32(0xF0F0F0F0))
+        ^ ((zero - ((ju >> cutlass.Uint32(3)) & one)) & cutlass.Uint32(0xFF00FF00))
+        ^ ((zero - ((ju >> cutlass.Uint32(4)) & one)) & cutlass.Uint32(0xFFFF0000))
+    )
+    j5 = zero - ((ju >> cutlass.Uint32(5)) & one)
+    j6 = zero - ((ju >> cutlass.Uint32(6)) & one)
+    signs = (had ^ neg0, had ^ j5 ^ neg1, had ^ j6 ^ neg2, had ^ j5 ^ j6 ^ neg3)
+    # nibble bit i -> bit 15 + 16 i: the four partial products never overlap or carry.
+    spread = cutlass.Uint64(0x1000200040008000)
+    sign_bits = cutlass.Uint64(0x8000800080008000)
+    entries = cutlass.Uint64(RHT128_ENTRY_BITS * 0x0001000100010001)
+    row = cutlass.Int32(b_base) + j * cutlass.Int32(128)
+    x = (row >> cutlass.Int32(7)) & cutlass.Int32(7)
+    st2 = cute.make_rmem_tensor((2,), cutlass.Uint64)
+    for c in cutlass.range_constexpr(RHT128_DIM // 8):
+        sign8 = signs[c // 4] >> cutlass.Uint32(8 * (c % 4))
+        lo = cutlass.Uint64(sign8 & cutlass.Uint32(0xF))
+        hi = cutlass.Uint64((sign8 >> cutlass.Uint32(4)) & cutlass.Uint32(0xF))
+        st2[0] = ((lo * spread) & sign_bits) | entries
+        st2[1] = ((hi * spread) & sign_bits) | entries
+        off = (
+            row
+            + cutlass.Int32((c // 8) * 16384)
+            + ((cutlass.Int32(c % 8) ^ x) << cutlass.Int32(4))
+        )
+        cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Uint64, off, cute.AddressSpace.smem, assumed_align=16
+            ),
+            cute.make_layout((2,)),
+        ).store(st2.load())
+
+
 class _Tcgen05GroupRowRhtColRhtAmax:
     """Per-group ``max|dy @ R_n|`` and ``max|dy.t() @ R_m|`` in one pass over ``dy``.
 
     Standalone (no ``_GroupRhtMainloop``): every 128x128 tile is TMA'd once and
-    feeds two UMMA chains against two resident host-built K-major ``R^T`` tiles --
-    the col chain reads the stage MN-major (as the RHT-16 kernels do) and the row
-    chain reads the same bytes through a K-major view. Static persistent grid:
+    feeds two UMMA chains against two resident K-major ``R^T`` tiles, which the
+    col / row epilogue warps write into shared memory from the live sign vectors
+    (``_rht128_signed_operand_row``) before their first tile -- the col chain reads
+    the stage MN-major (as the RHT-16 kernels do) and the row chain reads the same
+    bytes through a K-major view. Static persistent grid:
     CTA ``b`` owns the contiguous tile chunk ``_static_tile_range``, tiles below
-    ``logical_packed_length`` only, hidden-fastest.
+    ``logical_packed_length`` only, hidden-fastest. The epilogues atomic-max into a
+    persistent zeroed accumulator and the last CTA to finish moves it into the
+    outputs (``_rht128_amax_finalize``), so the op fills nothing on the host.
     """
 
     @cute.jit
     def __call__(
         self,
         mA: cute.Tensor,  # dy.t().unsqueeze(-1): (hidden, tokens, 1)
-        mBrow: cute.Tensor,  # R_n^T (128 j, 128 k, 1), row chain (dgrad signs)
-        mBcol: cute.Tensor,  # R_m^T (128 j, 128 k, 1), col chain (wgrad signs)
-        amax_rht_dy_t_: cute.Tensor,  # (num_tensors,) f32, pre-zeroed: row chain
-        amax_rht_dy_t_t: cute.Tensor,  # (num_tensors,) f32, pre-zeroed: col chain
+        mSignRow: cute.Tensor,  # dgrad_rht (128,) int8: R_n, row chain
+        mSignCol: cute.Tensor,  # wgrad_rht (128,) int8: R_m, col chain
+        amax_rht_dy_t_: cute.Tensor,  # (num_tensors,) f32, written by the last CTA: row chain
+        amax_rht_dy_t_t: cute.Tensor,  # (num_tensors,) f32, written by the last CTA: col chain
         offsets_t: cute.Tensor,
         logical_len_t: cute.Tensor,
+        acc_t: cute.Tensor,  # (>= 2 * num_tensors,) f32 accumulator, zero between launches
+        ticket_t: cute.Tensor,  # (1,) int32 arrival counter, zero between launches
         hidden: cutlass.Int32,
         num_tensors: cutlass.Int32,
         num_ctas: cutlass.Int32,
@@ -1971,22 +2099,6 @@ class _Tcgen05GroupRowRhtColRhtAmax:
         b_smem_layout = tcgen05.tile_to_mma_shape(
             k_atom, cute.append(b_shape, 1), order=(1, 2, 3)
         )
-        tma_atom_b_col, tma_tensor_b_col = cute.nvgpu.make_tiled_tma_atom_B(
-            g2s,
-            mBcol,
-            cute.slice_(b_smem_layout, (None, None, None, 0)),
-            RHT128_CTA_TILE_COL,
-            tiled_mma_col,
-            (1, 1, 1, 1),
-        )
-        tma_atom_b_row, tma_tensor_b_row = cute.nvgpu.make_tiled_tma_atom_B(
-            g2s,
-            mBrow,
-            cute.slice_(b_smem_layout, (None, None, None, 0)),
-            RHT128_CTA_TILE_ROW,
-            tiled_mma_row,
-            (1, 1, 1, 1),
-        )
         cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((1, 1, 1)), (tiled_mma_col.thr_id.shape,)
         )
@@ -2002,14 +2114,14 @@ class _Tcgen05GroupRowRhtColRhtAmax:
             tiled_mma_row,
             tma_atom_a,
             tma_tensor_a,
-            tma_atom_b_col,
-            tma_tensor_b_col,
-            tma_atom_b_row,
-            tma_tensor_b_row,
+            mSignRow,
+            mSignCol,
             amax_rht_dy_t_,
             amax_rht_dy_t_t,
             offsets_t,
             logical_len_t,
+            acc_t,
+            ticket_t,
             cluster_layout_vmnk,
             a_smem_layout_staged,
             a_row_layout_staged,
@@ -2027,14 +2139,14 @@ class _Tcgen05GroupRowRhtColRhtAmax:
         tiled_mma_row: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA: cute.Tensor,
-        tma_atom_b_col: cute.CopyAtom,
-        mBcol: cute.Tensor,
-        tma_atom_b_row: cute.CopyAtom,
-        mBrow: cute.Tensor,
+        mSignRow: cute.Tensor,
+        mSignCol: cute.Tensor,
         row_amax_t: cute.Tensor,
         col_amax_t: cute.Tensor,
         offsets_t: cute.Tensor,
         logical_len_t: cute.Tensor,
+        acc_t: cute.Tensor,
+        ticket_t: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         a_row_layout_staged: cute.ComposedLayout,
@@ -2056,19 +2168,22 @@ class _Tcgen05GroupRowRhtColRhtAmax:
 
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
-            cpasync.prefetch_descriptor(tma_atom_b_col)
-            cpasync.prefetch_descriptor(tma_atom_b_row)
 
         @cute.struct
         class SharedStorage:
             ab_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_MAINLOOP_STAGES * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, RHT128_ACC_STAGES * 2]
-            b_mbar: cutlass.Int64
             tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
+            last_cta: cutlass.Int32
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
+        last_cta_t = cute.make_tensor(storage.last_cta.ptr, cute.make_layout((1,)))
+        # Accumulator slots (chain, group), chain 0 = col.
+        acc_row_t = cute.make_tensor(
+            acc_t.iterator + num_tensors, cute.make_layout((num_tensors,))
+        )
 
         ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_mbar.data_ptr(),
@@ -2097,6 +2212,10 @@ class _Tcgen05GroupRowRhtColRhtAmax:
         tmem_dealloc_barrier = pipeline.NamedBarrier(
             barrier_id=TMEM_DEALLOC_BAR, num_threads=COL_THREADS + COL_THREADS
         )
+        # Both epilogue groups write an R^T tile; the MMA warp waits for both.
+        b_ready_barrier = pipeline.NamedBarrier(
+            barrier_id=RHT128_B_READY_BAR, num_threads=32 + COL_THREADS + COL_THREADS
+        )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -2104,9 +2223,6 @@ class _Tcgen05GroupRowRhtColRhtAmax:
             is_two_cta=False,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
-        if warp_idx == TMA_WARP:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_init(storage.b_mbar.ptr, 1)
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
         raw_a = smem.allocate_array(
@@ -2131,15 +2247,8 @@ class _Tcgen05GroupRowRhtColRhtAmax:
 
         cta_layout = cute.make_layout((1,))
         thr_col = tiled_mma_col.get_slice(0)
-        thr_row = tiled_mma_row.get_slice(0)
         gA = cute.local_tile(
             mA, cute.slice_(RHT128_CTA_TILE_COL, (None, 0, None)), (None, None, None)
-        )
-        gBcol = cute.local_tile(
-            mBcol, cute.slice_(RHT128_CTA_TILE_COL, (0, None, None)), (None, None, None)
-        )
-        gBrow = cute.local_tile(
-            mBrow, cute.slice_(RHT128_CTA_TILE_ROW, (0, None, None)), (None, None, None)
         )
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
@@ -2147,20 +2256,6 @@ class _Tcgen05GroupRowRhtColRhtAmax:
             cta_layout,
             cute.group_modes(sA, 0, 3),
             cute.group_modes(thr_col.partition_A(gA), 0, 3),
-        )
-        tBsBcol, tBgBcol = cpasync.tma_partition(
-            tma_atom_b_col,
-            0,
-            cta_layout,
-            cute.group_modes(sBcol, 0, 3),
-            cute.group_modes(thr_col.partition_B(gBcol), 0, 3),
-        )
-        tBsBrow, tBgBrow = cpasync.tma_partition(
-            tma_atom_b_row,
-            0,
-            cta_layout,
-            cute.group_modes(sBrow, 0, 3),
-            cute.group_modes(thr_row.partition_B(gBrow), 0, 3),
         )
         tCrA_col = tiled_mma_col.make_fragment_A(sA)
         tCrB_col = tiled_mma_col.make_fragment_B(sBcol)
@@ -2171,22 +2266,6 @@ class _Tcgen05GroupRowRhtColRhtAmax:
 
         # ==================== TMA warp ====================
         if warp_idx == TMA_WARP:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    storage.b_mbar.ptr, 2 * RHT128_B_BYTES
-                )
-            cute.copy(
-                tma_atom_b_col,
-                tBgBcol[(None, 0, 0, 0)],
-                tBsBcol[(None, 0)],
-                tma_bar_ptr=storage.b_mbar.ptr,
-            )
-            cute.copy(
-                tma_atom_b_row,
-                tBgBrow[(None, 0, 0, 0)],
-                tBsBrow[(None, 0)],
-                tma_bar_ptr=storage.b_mbar.ptr,
-            )
             for i in cutlass.range(n_my, unroll=1):
                 t = t_begin + i
                 tile_n = t // tiles_in_m
@@ -2206,7 +2285,7 @@ class _Tcgen05GroupRowRhtColRhtAmax:
             tCtAcc = cute.make_tensor(
                 tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
             )
-            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            b_ready_barrier.arrive_and_wait()
             acc_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, RHT128_ACC_STAGES
             )
@@ -2240,13 +2319,19 @@ class _Tcgen05GroupRowRhtColRhtAmax:
 
         # ==================== col epilogue: max|dy.t() @ R_m| ====================
         if warp_idx >= COL_WARP_BEGIN and warp_idx < COL_WARP_END:
+            _rht128_signed_operand_row(
+                mSignCol, sBcol.iterator.toint(), tidx % cutlass.Int32(RHT128_DIM), lane
+            )
+            # Generic-proxy stores -> visible to the UMMA (async proxy) before the arrive.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            b_ready_barrier.arrive()
             tmem.allocate(num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
             tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
             _rht128_amax_epilogue(
                 0,
-                col_amax_t,
+                acc_t,
                 tCtAcc,
                 acc_pipeline,
                 offsets_t,
@@ -2258,17 +2343,33 @@ class _Tcgen05GroupRowRhtColRhtAmax:
                 lane,
             )
             tmem_dealloc_barrier.arrive_and_wait()
+            _rht128_amax_finalize(
+                acc_t,
+                ticket_t,
+                col_amax_t,
+                row_amax_t,
+                last_cta_t,
+                tmem_dealloc_barrier,
+                num_tensors,
+                gdim,
+                tidx - cutlass.Int32(COL_THREADS),
+            )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
         # ==================== row epilogue: max|dy @ R_n| ====================
         if warp_idx >= ROW_WARP_BEGIN and warp_idx < RHT128_ROW_WARP_END:
+            _rht128_signed_operand_row(
+                mSignRow, sBrow.iterator.toint(), tidx % cutlass.Int32(RHT128_DIM), lane
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            b_ready_barrier.arrive()
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
             tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
             _rht128_amax_epilogue(
                 1,
-                row_amax_t,
+                acc_row_t,
                 tCtAcc,
                 acc_pipeline,
                 offsets_t,
@@ -2280,6 +2381,17 @@ class _Tcgen05GroupRowRhtColRhtAmax:
                 lane,
             )
             tmem_dealloc_barrier.arrive_and_wait()
+            _rht128_amax_finalize(
+                acc_t,
+                ticket_t,
+                col_amax_t,
+                row_amax_t,
+                last_cta_t,
+                tmem_dealloc_barrier,
+                num_tensors,
+                gdim,
+                tidx - cutlass.Int32(COL_THREADS),
+            )
 
 
 @functools.lru_cache(maxsize=None)
@@ -2292,15 +2404,13 @@ def _compile_group_row_rht_col_rht_amax_kernel(device_idx: int):
     return cute.compile(
         k,
         make_fake_tensor(cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1)),
-        make_fake_tensor(
-            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
-        ),
-        make_fake_tensor(
-            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
-        ),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
         make_fake_tensor(cutlass.Int32, (free(),), stride=(1,)),
+        make_fake_tensor(cutlass.Int32, (1,), stride=(1,)),
+        make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
         make_fake_tensor(cutlass.Int32, (1,), stride=(1,)),
         cutlass.Int32(0),
         cutlass.Int32(0),
@@ -2312,27 +2422,27 @@ def _compile_group_row_rht_col_rht_amax_kernel(device_idx: int):
 
 def _cutedsl_group_row_rht_col_rht_amax_impl(
     dy: torch.Tensor,
-    row_rht_nk: torch.Tensor,
-    col_rht_nk: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    wgrad_rht: torch.Tensor,
     offsets: torch.Tensor,
     num_tensors: int,
     logical_packed_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-group ``max|dy @ R_n|`` and ``max|dy.t() @ R_m|``.
 
-    ``dy`` is ``(tokens, hidden)`` bfloat16 row-major; ``row_rht_nk`` /
-    ``col_rht_nk`` are the ``(128, 128)`` bfloat16 K-major ``R_n^T`` / ``R_m^T``
-    tiles built by the caller from the live sign vectors. Returns
+    ``dy`` is ``(tokens, hidden)`` bfloat16 row-major; ``dgrad_rht`` / ``wgrad_rht``
+    are the live ``(128,)`` int8 sign vectors of ``R_n`` / ``R_m``, from which the
+    kernel writes both ``R^T`` tiles into shared memory. Returns
     ``(amax_rht_dy, amax_rht_dy_t)``, each ``(num_tensors,)`` float32, rowwise
-    first like the Triton twin. The buffers start at zero because the epilogues
-    accumulate with atomic max.
+    first like the Triton twin, written whole by the kernel's last CTA.
     """
     tokens, hidden = dy.shape
     dev = dy.device
     dy = dy.detach()
 
-    amax_rht_dy = torch.zeros((num_tensors,), dtype=torch.float32, device=dev)
-    amax_rht_dy_t = torch.zeros((num_tensors,), dtype=torch.float32, device=dev)
+    amax_rht_dy = torch.empty((num_tensors,), dtype=torch.float32, device=dev)
+    amax_rht_dy_t = torch.empty((num_tensors,), dtype=torch.float32, device=dev)
+    ticket, acc = _get_group_amax_reduce_buffers(dev.index)
     if logical_packed_length is None:
         logical_packed_length = offsets[-1:]
     # See the fused kernel: the entry point requires byte_offset==0.
@@ -2343,12 +2453,14 @@ def _cutedsl_group_row_rht_col_rht_amax_impl(
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     _compile_group_row_rht_col_rht_amax_kernel(dev.index)(
         dy.t().unsqueeze(-1),
-        row_rht_nk.unsqueeze(-1),
-        col_rht_nk.unsqueeze(-1),
+        dgrad_rht,
+        wgrad_rht,
         amax_rht_dy,
         amax_rht_dy_t,
         offsets,
         logical_packed_length,
+        acc,
+        ticket,
         int(hidden),
         int(num_tensors),
         int(num_ctas),

@@ -52,6 +52,13 @@ def cutedsl_group_row_rht_col_rht_amax(
     ``max.NaN.f32`` and the cross-CTA atomic is a ``max.u32`` on the bit pattern, where a
     NaN outranks every finite float.
 
+    The sign vectors are read as sign bits (negative or not), exact for the ``{-1, +1}``
+    vectors the recipe passes; a magnitude other than 1 would scale the Triton op's
+    rotation but not this one. The cross-CTA reduction runs through one persistent
+    per-device accumulator and arrival ticket (the class of state ``_get_sr_rng_buffer``
+    holds), so two of these ops must not run concurrently on different streams of one
+    device.
+
     Raises:
         NotImplementedError: pre-SM100 or a missing CuteDSL runtime.
         ValueError: bad shapes/dtypes, a sign tensor that is not a ``(128,)`` tensor on
@@ -71,16 +78,15 @@ def cutedsl_group_row_rht_col_rht_amax(
             )
         if not sv.is_cuda or sv.device != dy.device:
             raise ValueError(f"{name} must be on the same device as dy")
-    # H128 is symmetric, so ``H128 * signs[None, :]`` is ``get_dynamic_rht_matrix(signs).t()``
-    # -- the (N, K) UMMA operand -- without the transpose copy; ``.to`` is a no-op for the
-    # int8 / bfloat16 buffers the recipe passes and only converts other dtypes. Formed per
-    # launch: the sign buffers are live tensors resampled in place, never a cache key.
+    # The kernel writes both ``R^T`` operands into shared memory from the live sign
+    # vectors (resampled in place, never a cache key); the cached H128 only validates.
+    # ``.to`` is a no-op for the recipe's int8 buffers -- the same tensor object, so
+    # CUDA-graph addresses stay stable -- and converts bfloat16 / float32 signs as the
+    # Triton op would; ``.contiguous`` makes a strided sign view a plain buffer.
     h128 = get_hadamard_matrix(RHT_SIZE, _device_key(dy.device), torch.bfloat16)
-    row_rht_nk = torch.mul(h128, dgrad_rht[None, :]).to(torch.bfloat16)
-    col_rht_nk = torch.mul(h128, wgrad_rht[None, :]).to(torch.bfloat16)
     _validate_grouped_hadamard_inputs(
         dy,
-        row_rht_nk,
+        h128,
         offsets,
         num_tensors,
         packed_sequence_length,
@@ -97,8 +103,8 @@ def cutedsl_group_row_rht_col_rht_amax(
 
     return _cutedsl_group_row_rht_col_rht_amax_impl(
         dy,
-        row_rht_nk,
-        col_rht_nk,
+        dgrad_rht.to(torch.int8).contiguous(),
+        wgrad_rht.to(torch.int8).contiguous(),
         offsets,
         num_tensors,
         logical_packed_length=logical_packed_length,
