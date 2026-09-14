@@ -4616,13 +4616,17 @@ def _cutedsl_group_col_rht_requantize_impl(
 
 # --- grouped rowwise cast + columnwise-RHT amax (RHT-128 on the token axis) ---
 # The dynamic-RHT path of ``cutedsl_group_rht_amax``: ``_Tcgen05GroupRowRhtColRhtAmax``'s
-# col chain against one resident host-built ``R^T`` tile, with the RHT-16 amax kernel's
+# col chain against one resident ``R^T`` tile -- the cached ``H128`` TMA'd once and
+# sign-flipped in SMEM by warps 2-3 -- with the RHT-16 amax kernel's
 # SMEM row epilogue reading the same A stage through the plain (hidden, token, stage)
 # view -- so the stage has two consumer groups (``PipelineTmaMultiConsumersAsync``), as
-# in the RHT-16 kernels. Warps: 0 MMA, 1 TMA, 2-3 idle, 4-7 col (TMEM), 8-15 row (SMEM).
+# in the RHT-16 kernels. Warps: 0 MMA, 1 TMA, 2-3 sign, 4-7 col (TMEM), 8-15 row (SMEM).
 RHT128_ROWCAST_MAINLOOP_STAGES = (
     _SMEM_CAPACITY - _SMEM_RESERVE - RHT128_B_BYTES
 ) // _A_TILE_BYTES  # 6
+RHT128_ROWCAST_SIGN_WARP_BEGIN = 2
+RHT128_ROWCAST_SIGN_WARP_END = 4
+RHT128_ROWCAST_B_SIGN_BAR = 3
 RHT128_ROWCAST_COL_WARP_BEGIN = 4
 RHT128_ROWCAST_COL_WARP_END = 8
 RHT128_ROWCAST_ROW_WARP_BEGIN = 8
@@ -4635,30 +4639,176 @@ RHT128_ROWCAST_COL_THREADS = 32 * (
 RHT128_ROWCAST_ROW_THREADS = 32 * (
     RHT128_ROWCAST_ROW_WARP_END - RHT128_ROWCAST_ROW_WARP_BEGIN
 )
+RHT128_ROWCAST_SIGN_THREADS = 32 * (
+    RHT128_ROWCAST_SIGN_WARP_END - RHT128_ROWCAST_SIGN_WARP_BEGIN
+)
 RHT128_ROWCAST_ACC_CONSUMER_WARPS = (
     RHT128_ROWCAST_COL_WARP_END - RHT128_ROWCAST_COL_WARP_BEGIN
 )
+
+
+@dsl_user_op
+def _max_abs_bf16x2_x8(
+    w0: cutlass.Uint32,
+    w1: cutlass.Uint32,
+    w2: cutlass.Uint32,
+    w3: cutlass.Uint32,
+    w4: cutlass.Uint32,
+    w5: cutlass.Uint32,
+    w6: cutlass.Uint32,
+    w7: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Per-half ``max|.|`` of eight packed bf16 pairs, as a packed pair with junk signs.
+
+    ``max.NaN.xorsign.abs.bf16x2`` keeps the larger magnitude of each half exactly (a
+    comparison, no rounding), makes any NaN input a NaN as ``max.NaN.f32`` does, and
+    sets the result's sign to the XOR of the input signs -- junk that
+    ``_bf16x2_amax_to_f32`` masks off. One ``HMNMX2`` per word replaces the widen pair
+    plus the f32 max of the scalar path.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [w.ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3, w4, w5, w6, w7)],
+            (
+                "{\n"
+                ".reg .b32 m0, m1, m2, m3;\n"
+                "max.NaN.xorsign.abs.bf16x2 m0, $1, $2;\n"
+                "max.NaN.xorsign.abs.bf16x2 m1, $3, $4;\n"
+                "max.NaN.xorsign.abs.bf16x2 m2, $5, $6;\n"
+                "max.NaN.xorsign.abs.bf16x2 m3, $7, $8;\n"
+                "max.NaN.xorsign.abs.bf16x2 m0, m0, m1;\n"
+                "max.NaN.xorsign.abs.bf16x2 m2, m2, m3;\n"
+                "max.NaN.xorsign.abs.bf16x2 $0, m0, m2;\n"
+                "}"
+            ),
+            "=r,r,r,r,r,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _bf16x2_amax_to_f32(
+    m0: cutlass.Uint32,
+    m1: cutlass.Uint32,
+    m2: cutlass.Uint32,
+    m3: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    """Fold four packed magnitude pairs into the f32 ``max|.|`` the scalar path's
+    ``max.NaN.f32`` chain yields over the same values: the mask clears the junk signs,
+    the shift and the mask widen both halves exactly (see ``_bf16lo_to_f32``)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [m.ir_value(loc=loc, ip=ip) for m in (m0, m1, m2, m3)],
+            (
+                "{\n"
+                ".reg .b32 a, b, lo, hi;\n"
+                ".reg .f32 fl, fh;\n"
+                "max.NaN.xorsign.abs.bf16x2 a, $1, $2;\n"
+                "max.NaN.xorsign.abs.bf16x2 b, $3, $4;\n"
+                "max.NaN.xorsign.abs.bf16x2 a, a, b;\n"
+                "and.b32 a, a, 0x7fff7fff;\n"
+                "shl.b32 lo, a, 16;\n"
+                "and.b32 hi, a, 0xffff0000;\n"
+                "mov.b32 fl, lo;\n"
+                "mov.b32 fh, hi;\n"
+                "max.NaN.f32 $0, fl, fh;\n"
+                "}"
+            ),
+            "=f,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _rowcast_tile_amax(rWords):
+    """``max|A|`` over a row thread's share of one tile -- ``ROW_PASSES`` tokens, two 16 B
+    chunks each, held as u32 word views -- as f32."""
+    m = []
+    for p in range(ROW_PASSES):
+        a, b = rWords[2 * p], rWords[2 * p + 1]
+        m.append(_max_abs_bf16x2_x8(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]))
+    return _bf16x2_amax_to_f32(m[0], m[1], m[2], m[3])
+
+
+@dsl_user_op
+def _st_release_gpu_u32(
+    addr: cutlass.Pointer, val: cutlass.Uint32, *, loc=None, ip=None
+):
+    """Release-store one u32 at GPU scope: every prior store of this thread is visible to
+    a thread that acquire-loads the value."""
+    llvm.inline_asm(
+        None,
+        [addr.llvm_ptr, val.ir_value(loc=loc, ip=ip)],
+        "st.release.gpu.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _ld_acquire_gpu_u32(addr: cutlass.Pointer, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Acquire-load one u32 at GPU scope (the pair of ``_st_release_gpu_u32``)."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.llvm_ptr],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def _bf16x2_sign_mask(sign_t, k):
+    """XOR mask that negates the bf16 pair ``(k, k + 1)`` where ``sign_t`` is negative."""
+    lo = sign_t[k] < cutlass.Int8(0)
+    hi = sign_t[k + cutlass.Int32(1)] < cutlass.Int8(0)
+    return cutlass.Uint32(
+        cutlass.select_(lo, cutlass.Uint32(0x8000), cutlass.Uint32(0))
+    ) | cutlass.Uint32(
+        cutlass.select_(hi, cutlass.Uint32(0x80000000), cutlass.Uint32(0))
+    )
 
 
 class _Tcgen05GroupRowCastColRhtAmax:
     """Per-group ``max|A.t() @ R|`` and ``max|A|`` in one pass over ``A``.
 
     Standalone (no ``_GroupRhtMainloop``): every 128x128 tile is TMA'd once and
-    feeds one UMMA chain against the resident host-built K-major ``R^T`` tile --
-    the col chain of ``_Tcgen05GroupRowRhtColRhtAmax`` -- while the row warps read
-    the same bytes through the RHT-16 kernels' plain ``(hidden, token, stage)``
-    view and reduce the raw ``max|A|``. Static persistent grid: CTA ``b`` owns the
-    contiguous tile chunk ``_static_tile_range``, tiles below
-    ``logical_packed_length`` only, hidden-fastest.
+    feeds one UMMA chain against the resident K-major ``R^T`` tile -- the col chain
+    of ``_Tcgen05GroupRowRhtColRhtAmax``, its operand the TMA'd ``H128`` whose
+    columns the sign warps negate in SMEM (``R^T[j, k] = H[j, k] * s_k``, a bf16
+    sign-bit flip) -- while the row warps read the same bytes through the RHT-16
+    kernels' plain ``(hidden, token, stage)`` view and reduce the raw ``max|A|``.
+    Static persistent grid: CTA ``b`` owns the contiguous tile chunk
+    ``_static_tile_range``, tiles below ``logical_packed_length`` only,
+    hidden-fastest.
     """
 
     @cute.jit
     def __call__(
         self,
         mA: cute.Tensor,  # A.t().unsqueeze(-1): (hidden, tokens, 1)
-        mB: cute.Tensor,  # R^T (128 j, 128 k, 1), col chain (wgrad signs)
-        col_amax_t: cute.Tensor,  # (num_tensors,) f32, pre-zeroed
-        row_amax_t: cute.Tensor,  # (num_tensors,) f32, pre-zeroed
+        mB: cute.Tensor,  # H128 (128 j, 128 k, 1), K-major (symmetric)
+        mSign: cute.Tensor,  # wgrad_rht (128,) int8
+        col_amax_t: cute.Tensor,  # (num_tensors + 1,) f32, pre-zeroed; [-1] = row flag
+        row_amax_t: cute.Tensor,  # (num_tensors,) f32, zeroed by CTA 0 behind the flag
         offsets_t: cute.Tensor,
         logical_len_t: cute.Tensor,
         hidden: cutlass.Int32,
@@ -4735,6 +4885,7 @@ class _Tcgen05GroupRowCastColRhtAmax:
             tma_tensor_a,
             tma_atom_b,
             tma_tensor_b,
+            mSign,
             col_amax_t,
             row_amax_t,
             offsets_t,
@@ -4757,6 +4908,7 @@ class _Tcgen05GroupRowCastColRhtAmax:
         mA: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB: cute.Tensor,
+        mSign: cute.Tensor,
         col_amax_t: cute.Tensor,
         row_amax_t: cute.Tensor,
         offsets_t: cute.Tensor,
@@ -4829,6 +4981,11 @@ class _Tcgen05GroupRowCastColRhtAmax:
         tmem_dealloc_barrier = pipeline.NamedBarrier(
             barrier_id=TMEM_DEALLOC_BAR, num_threads=RHT128_ROWCAST_COL_THREADS
         )
+        # The sign warps hand the negated B tile to the MMA warp.
+        b_sign_barrier = pipeline.NamedBarrier(
+            barrier_id=RHT128_ROWCAST_B_SIGN_BAR,
+            num_threads=32 + RHT128_ROWCAST_SIGN_THREADS,
+        )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -4855,6 +5012,14 @@ class _Tcgen05GroupRowCastColRhtAmax:
         sA_clean = cute.make_tensor(swz_ptr, a_clean_layout.outer)
         sB = smem.allocate_tensor(
             cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+        # The same bytes as a plain (j, k % 64, k // 64) view for the sign warps: the
+        # K-major SW128 tile is two 16 KB halves of 128 rows x 64 k.
+        sB_clean = cute.make_tensor(
+            sB.iterator,
+            cute.make_layout(
+                (RHT128_DIM, RHT128_DIM // 2, 2), stride=(RHT128_DIM // 2, 1, 8192)
+            ),
         )
 
         cta_layout = cute.make_layout((1,))
@@ -4913,13 +5078,71 @@ class _Tcgen05GroupRowCastColRhtAmax:
                 ab_producer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
 
+        # ==================== sign warps: R^T = H128 * s_k in SMEM ====================
+        if (
+            warp_idx >= RHT128_ROWCAST_SIGN_WARP_BEGIN
+            and warp_idx < RHT128_ROWCAST_SIGN_WARP_END
+        ):
+            # Thread ``t`` owns one 16 B chunk of 32 rows: k in [8 c, 8 c + 8) of rows
+            # j0 .. j0 + 31, so a quarter-warp reads eight distinct chunks of one row
+            # (conflict-free) and needs only its eight signs, which fold into one XOR
+            # mask per bf16 pair; a negative sign flips the bf16 sign bit, exactly
+            # ``H[j, k] * -1``. The masks are built before the B tile lands.
+            t = tidx - RHT128_ROWCAST_SIGN_WARP_BEGIN * cutlass.Int32(32)
+            # CTA 0 zeroes the row buffer and publishes it behind the flag that shares
+            # the col buffer's fill; the row warps of every CTA acquire it before their
+            # first flush. CTA 0 is dispatched no later than any other CTA and waits on
+            # nothing here, so the grid makes progress.
+            if bidx == cutlass.Int32(0) and t == cutlass.Int32(0):
+                for e in cutlass.range(num_tensors, unroll=1):
+                    row_amax_t[e] = cutlass.Float32(0.0)
+                _st_release_gpu_u32(
+                    col_amax_t.iterator + num_tensors, cutlass.Uint32(1)
+                )
+            c = t % cutlass.Int32(16)
+            j0 = (t // cutlass.Int32(16)) * cutlass.Int32(32)
+            k0 = c * cutlass.Int32(8)
+            m0 = _bf16x2_sign_mask(mSign, k0)
+            m1 = _bf16x2_sign_mask(mSign, k0 + cutlass.Int32(2))
+            m2 = _bf16x2_sign_mask(mSign, k0 + cutlass.Int32(4))
+            m3 = _bf16x2_sign_mask(mSign, k0 + cutlass.Int32(6))
+            half = c // cutlass.Int32(8)
+            chunk = c % cutlass.Int32(8)
+            rRows = []
+            rWords = []
+            for r in cutlass.range_constexpr(8):
+                rRows.append(cute.make_rmem_tensor((8,), cutlass.BFloat16))
+                rWords.append(cute.recast_tensor(rRows[r], cutlass.Uint32))
+            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            for b in cutlass.range_constexpr(4):
+                for r in cutlass.range_constexpr(8):
+                    j = j0 + cutlass.Int32(b * 8 + r)
+                    cute.autovec_copy(
+                        cute.local_tile(sB_clean[(j, None, half)], (8,), (chunk,)),
+                        rRows[r],
+                    )
+                for r in cutlass.range_constexpr(8):
+                    rWords[r][0] = rWords[r][0] ^ m0
+                    rWords[r][1] = rWords[r][1] ^ m1
+                    rWords[r][2] = rWords[r][2] ^ m2
+                    rWords[r][3] = rWords[r][3] ^ m3
+                for r in cutlass.range_constexpr(8):
+                    j = j0 + cutlass.Int32(b * 8 + r)
+                    cute.autovec_copy(
+                        rRows[r],
+                        cute.local_tile(sB_clean[(j, None, half)], (8,), (chunk,)),
+                    )
+            # Generic-proxy stores -> visible to the UMMA (async proxy) before the arrive.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            b_sign_barrier.arrive_and_wait()
+
         # ==================== MMA warp ====================
         if warp_idx == MMA_WARP:
             tmem.wait_for_alloc()
             tCtAcc = cute.make_tensor(
                 tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
             )
-            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
+            b_sign_barrier.arrive_and_wait()
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, RHT128_ROWCAST_MAINLOOP_STAGES
             )
@@ -4982,7 +5205,15 @@ class _Tcgen05GroupRowCastColRhtAmax:
             hb = r_local % cutlass.Int32(ROW_HB)
             t0 = r_local // cutlass.Int32(ROW_HB)
 
-            rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+            # Lane ``hb`` reads 16 B chunk ``hb`` of both 128 B swizzle rows of its token
+            # (hidden [8 hb, 8 hb + 8) and [64 + 8 hb, 64 + 8 hb + 8)), so a quarter-warp
+            # covers one whole row per LDS.128, conflict-free; all eight loads of a tile
+            # issue before the first max and the stage is released before the reduction.
+            rBlk = []
+            rWords = []
+            for i in cutlass.range_constexpr(2 * ROW_PASSES):
+                rBlk.append(cute.make_rmem_tensor((8,), cutlass.BFloat16))
+                rWords.append(cute.recast_tensor(rBlk[i], cutlass.Uint32))
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, RHT128_ROWCAST_MAINLOOP_STAGES
             )
@@ -4993,6 +5224,9 @@ class _Tcgen05GroupRowCastColRhtAmax:
             )
             g_end = offsets_t[g]
             run_max = cutlass.Float32(0.0)
+            ready = _ld_acquire_gpu_u32(col_amax_t.iterator + num_tensors)
+            while ready == cutlass.Uint32(0):
+                ready = _ld_acquire_gpu_u32(col_amax_t.iterator + num_tensors)
             for i in cutlass.range(n_my, unroll=1):
                 token = ((t_begin + i) // tiles_in_m) * cutlass.Int32(TOKEN_TILE)
                 if token >= g_end:
@@ -5002,27 +5236,21 @@ class _Tcgen05GroupRowCastColRhtAmax:
                     g_end = offsets_t[g]
                 ab_pipeline.consumer_wait(ab_consumer_state)
                 stage = ab_consumer_state.index
-                tile_max = cutlass.Float32(0.0)
                 for p in cutlass.range_constexpr(ROW_PASSES):
                     tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
-                    cute.autovec_copy(
-                        cute.local_tile(sA_clean[(None, tok, stage)], (16,), (hb,)),
-                        rBlk,
-                    )
-                    rWords = cute.recast_tensor(rBlk, cutlass.Uint32)
-                    for j in cutlass.range_constexpr(8):
-                        tile_max = _max_f32(
-                            tile_max, _abs_f32(_bf16lo_to_f32(rWords[j]))
-                        )
-                        tile_max = _max_f32(
-                            tile_max, _abs_f32(_bf16hi_to_f32(rWords[j]))
+                    for r in cutlass.range_constexpr(2):
+                        cute.autovec_copy(
+                            cute.local_tile(
+                                sA_clean[(None, tok, stage)], (8,), (r * ROW_HB + hb,)
+                            ),
+                            rBlk[2 * p + r],
                         )
                 ab_pipeline.consumer_release(
                     ab_consumer_state, pipeline.PipelineOp.AsyncThread
                 )
                 ab_consumer_state.advance()
 
-                run_max = _max_f32(run_max, tile_max)
+                run_max = _max_f32(run_max, _rowcast_tile_amax(rWords))
             _flush_group_max(run_max, row_amax_t, g, lane)
 
 
@@ -5039,6 +5267,7 @@ def _compile_group_row_cast_col_rht_amax_kernel(device_idx: int):
         make_fake_tensor(
             cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
         ),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
         make_fake_tensor(cutlass.Int32, (free(),), stride=(1,)),
@@ -5053,25 +5282,29 @@ def _compile_group_row_cast_col_rht_amax_kernel(device_idx: int):
 
 def _cutedsl_group_row_cast_col_rht_amax_impl(
     A: torch.Tensor,
-    col_rht_nk: torch.Tensor,
+    wgrad_rht: torch.Tensor,
+    h128: torch.Tensor,
     offsets: torch.Tensor,
     num_tensors: int,
     logical_packed_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-group ``max|A.t() @ R|`` and ``max|A|``.
 
-    ``A`` is ``(tokens, hidden)`` bfloat16 row-major; ``col_rht_nk`` is the
-    ``(128, 128)`` bfloat16 K-major ``R^T`` tile built by the caller from the live
-    sign vector. Returns ``(col_amax, row_amax)``, each ``(num_tensors,)`` float32,
-    in ``cutedsl_group_rht_amax``'s order. The buffers start at zero because the
-    epilogues accumulate with atomic max.
+    ``A`` is ``(tokens, hidden)`` bfloat16 row-major; ``wgrad_rht`` is the ``(128,)``
+    int8 sign vector and ``h128`` the cached ``(128, 128)`` bfloat16 Hadamard
+    (symmetric, so it is the K-major ``(N, K)`` UMMA operand as is; the signs reach
+    the kernel's SMEM copy of it). Returns ``(col_amax, row_amax)``, each
+    ``(num_tensors,)`` float32, in ``cutedsl_group_rht_amax``'s order. The buffers
+    start at zero because the epilogues accumulate with atomic max: one fill zeroes
+    the col buffer together with the flag behind which CTA 0 zeroes the row buffer.
     """
     tokens, hidden = A.shape
     dev = A.device
     A = A.detach()
 
-    col_amax = torch.zeros((num_tensors,), dtype=torch.float32, device=dev)
-    row_amax = torch.zeros((num_tensors,), dtype=torch.float32, device=dev)
+    col_amax_flag = torch.zeros((num_tensors + 1,), dtype=torch.float32, device=dev)
+    col_amax = col_amax_flag[:num_tensors]
+    row_amax = torch.empty((num_tensors,), dtype=torch.float32, device=dev)
     if logical_packed_length is None:
         logical_packed_length = offsets[-1:]
     # See the fused kernel: the entry point requires byte_offset==0.
@@ -5082,8 +5315,9 @@ def _cutedsl_group_row_cast_col_rht_amax_impl(
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     _compile_group_row_cast_col_rht_amax_kernel(dev.index)(
         A.t().unsqueeze(-1),
-        col_rht_nk.unsqueeze(-1),
-        col_amax,
+        h128.unsqueeze(-1),
+        wgrad_rht,
+        col_amax_flag,
         row_amax,
         offsets,
         logical_packed_length,
