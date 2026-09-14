@@ -10,6 +10,14 @@ does the columnwise RHT, a row warp group reads the same tile):
 
 A third kernel, ``_RowCastQuantize`` (end of file), is the rowwise 1x16 weight cast of a
 dense expert stack on plain CUDA cores -- no MMA/TMA -- reusing the rowwise helper chain.
+
+A fourth, ``_RequantAmax`` (after it), is the per-expert amax of the dequantized packed
+weight (§11.6), the same kind of streaming kernel over the codes and scales that cast
+wrote; it decodes nothing but each block's largest code.
+
+A fifth, ``_Requantize`` (last), is the columnwise 1x16 requantize of that packed weight
+(§11.7): it rebuilds each ``W_qdq`` tile into SMEM and quantizes it down the columns on
+CUDA cores, so the transpose keeps the sign of every zero.
 """
 
 import functools
@@ -3476,3 +3484,626 @@ def _cutedsl_group_row_cast_quantize_impl(
     )
     # uint32 -> uint8 quadruples the last extent: (E, M, N//8) -> (E, M, N//2).
     return row_fp4.view(torch.uint8), row_sf
+
+
+# ---------------------------------------------------------------------------
+# Requant amax of the packed rowwise weight (§11.6) -- plain CUDA-core streaming kernel
+# ---------------------------------------------------------------------------
+# 128 threads per 128x128 tile, 64 B of codes each as four 16 B vector loads; the lane
+# map below makes a warp's code load cover 8 rows x 64 B (8 lines) and its scale load
+# 128 contiguous bytes of one atom.
+REQUANT_AMAX_THREADS = M_TILE
+REQUANT_AMAX_WARPS = REQUANT_AMAX_THREADS // 32
+# Latency hiding comes from resident CTAs rather than in-thread unrolling: the kernel
+# holds few registers and no pipeline SMEM, so the grid is sized for this many CTAs per
+# SM (spread over the column-tile and expert grid dimensions).
+REQUANT_AMAX_CTAS_PER_SM = 16
+
+
+def _block_max_magnitude(w0, w1):
+    """Largest E2M1 magnitude in a 1x16 block, decoded to f32, from its two code words.
+
+    E2M1 magnitudes (0, .5, 1, 1.5, 2, 3, 4, 6) are monotone in the 3-bit magnitude
+    field, so the block max is the lexicographic max of those fields over the 16
+    nibbles -- found bit by bit with masks, never per nibble: ``any2`` says whether
+    some nibble has bit 2 set; the candidates for bit 1 are then those nibbles (or
+    all of them when none had bit 2), and so on for bit 0. Sign bits (nibble bit 3)
+    never enter a mask. The winning 3-bit field is decoded with a select chain.
+    """
+    bit2 = cutlass.Uint32(0x44444444)
+    bit1 = cutlass.Uint32(0x22222222)
+    zero = cutlass.Uint32(0)
+
+    t0 = w0 & bit2
+    t1 = w1 & bit2
+    any2 = (t0 | t1) != zero
+    m0 = cutlass.Uint32(cutlass.select_(any2, t0 >> 1, bit1))
+    m1 = cutlass.Uint32(cutlass.select_(any2, t1 >> 1, bit1))
+    u0 = w0 & m0
+    u1 = w1 & m1
+    any1 = (u0 | u1) != zero
+    n0 = cutlass.Uint32(cutlass.select_(any1, u0 >> 1, m0 >> 1))
+    n1 = cutlass.Uint32(cutlass.select_(any1, u1 >> 1, m1 >> 1))
+    any0 = ((w0 & n0) | (w1 & n1)) != zero
+
+    hi = cutlass.Float32(
+        cutlass.select_(
+            any1,
+            cutlass.select_(any0, cutlass.Float32(6.0), cutlass.Float32(4.0)),
+            cutlass.select_(any0, cutlass.Float32(3.0), cutlass.Float32(2.0)),
+        )
+    )
+    lo = cutlass.Float32(
+        cutlass.select_(
+            any1,
+            cutlass.select_(any0, cutlass.Float32(1.5), cutlass.Float32(1.0)),
+            cutlass.select_(any0, cutlass.Float32(0.5), cutlass.Float32(0.0)),
+        )
+    )
+    return cutlass.Float32(cutlass.select_(any2, hi, lo))
+
+
+class _RequantAmax:
+    """Per-expert amax of the dequantized forward weight (§11.6), streaming.
+
+    Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, y, e)`` walks the row blocks
+    ``y, y + GRID_Y, ...`` of column tile ``cn`` of expert ``e``, so no CTA ever
+    divides. A tile is 128 rows x 128 columns = 8 KB of codes plus the two
+    adjacent 512 B scale atoms.
+
+    Lane map (the kernel streams, so L1 wavefronts per byte decide its speed): lane
+    ``l`` of warp ``w`` owns 16 B piece ``p = l % 4`` (blocks ``2p, 2p+1``) of the
+    64 B row segment in rows ``32j + 8w + l//4`` for ``j = 0..3``. A warp's code
+    load then covers 8 consecutive rows x 64 B, and because the swizzled atom
+    stores row ``r``'s four scale bytes at word ``(r % 32) * 4 + r // 32``, a
+    thread's four rows are four CONSECUTIVE words -- one 16 B load, contiguous
+    across the 8 lanes of a row group.
+
+    Numerics, matching the Triton reconstruction (``hadamard_utils``
+    ``_nvfp4_dequantize`` + ``_reconstruct_qdq_weight_tile``:
+    ``bf16(f32((q * sf) * dec))``, zero for a NaN/inf amax) bit for bit while
+    doing almost none of its arithmetic:
+
+    * Per 1x16 block only the max magnitude code ``q`` is needed, and the product
+      ``p = q * |sf|`` is exact in f32 (a <= 2-bit by <= 4-bit significand product).
+    * ``x -> bf16_rtne(f32(x * dec))`` is monotone non-decreasing on ``x >= 0`` and
+      the max of a monotone function is the function of the max, so
+      ``max_i bf16((q_i * sf) * dec) == bf16((max_b p_b) * dec)`` over every block
+      of the expert. The whole reduction therefore runs on the exact products and
+      the multiply by ``dec`` plus the one bf16 rounding happen once per CTA.
+    * A NaN or inf ``global_amax`` selects zero explicitly (``_global_scale`` alone
+      would give a finite ``dec`` for NaN).
+    * "Bit for bit" holds for finite scale bytes. A NaN scale byte (0x7f / 0xff,
+      which the quantizer never emits) propagates to a NaN in both backends, with
+      different payloads (``max.NaN``'s canonical NaN here, ``float("nan")`` in
+      Triton).
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mCodes: cute.Tensor,  # (E*M*N/8,) u32 = row_fp4_w.view(torch.uint32).view(-1)
+        mSF: cute.Tensor,  # (E*M*N/64,) u32 = row_sf_w.view(torch.uint32).view(-1)
+        amax_t: cute.Tensor,  # (E,) f32
+        out_t: cute.Tensor,  # (E,) f32, zero-initialised
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(mCodes, mSF, amax_t, out_t, N, m_blocks, GRID_Y).launch(
+            grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
+            block=(REQUANT_AMAX_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        amax_t: cute.Tensor,
+        out_t: cute.Tensor,
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cn, by, e = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx % cutlass.Int32(32)
+        piece = lane % cutlass.Int32(4)  # 16 B piece of the 64 B row segment
+        row_lo = warp_idx * cutlass.Int32(8) + lane // cutlass.Int32(4)  # r % 32
+        # The two blocks of a piece are bytes 2*(p % 2), +1 of the row's scale word.
+        sf_shift = (lane % cutlass.Int32(2)) * cutlass.Int32(16)
+
+        smem = utils.SmemAllocator()
+        warp_max = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((REQUANT_AMAX_WARPS,)), 16
+        )
+
+        # SF bytes per 128-row block of one expert: (N // 64) atoms of 512 B.
+        sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
+        row_bytes = cutlass.Int64(N // cutlass.Int32(2))  # packed codes per row
+        row_block_bytes = row_bytes * cutlass.Int64(M_TILE)
+        row32_bytes = row_bytes * cutlass.Int64(32)
+
+        # Expert-, tile-column- and thread-constant parts of both addresses. Codes:
+        # row (e*M + rb*128 + 32j + row_lo), byte cn*64 + 16*piece -- 16 B aligned
+        # because N % 128 == 0 makes the row pitch a multiple of 64 B. Scales: atom
+        # (e*M//128 + rb) * (N//64) + 2*cn + piece//2, words row_lo*4 .. +3 (= rows
+        # 32j + row_lo, j = 0..3; the swizzle of the rowwise cast above).
+        codes_base = (
+            mCodes.iterator.toint()
+            + cutlass.Int64(e * m_blocks * cutlass.Int32(M_TILE) + row_lo) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2) + piece * cutlass.Int32(16))
+        )
+        sf_base = (
+            mSF.iterator.toint()
+            + cutlass.Int64(e * m_blocks) * cutlass.Int64(sf_rb_bytes)
+            + cutlass.Int64(
+                (cn * cutlass.Int32(2) + piece // cutlass.Int32(2))
+                * cutlass.Int32(SF_BLK)
+                + row_lo * cutlass.Int32(16)
+            )
+        )
+
+        run_max = cutlass.Float32(0.0)
+        for rb in cutlass.range(by, m_blocks, GRID_Y):
+            tile_codes = codes_base + cutlass.Int64(rb) * row_block_bytes
+            rows = []
+            for j in cutlass.range_constexpr(4):
+                codes_ptr = cute.make_ptr(
+                    cutlass.Uint32,
+                    tile_codes + cutlass.Int64(j) * row32_bytes,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                rows.append(cute.make_tensor(codes_ptr, cute.make_layout((4,))).load())
+            sf_ptr = cute.make_ptr(
+                cutlass.Uint32,
+                sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            sf_words = cute.make_tensor(sf_ptr, cute.make_layout((4,))).load()
+
+            for j in cutlass.range_constexpr(4):
+                # |sf| for the piece's two blocks: e4m3 sign is bit 7 of each byte
+                # (NaN 0xff stays NaN as 0x7f).
+                sf2 = _e4m3x2_to_f16x2(
+                    (sf_words[j] >> sf_shift) & cutlass.Uint32(0x7F7F)
+                )
+                q_even = _block_max_magnitude(rows[j][0], rows[j][1])
+                q_odd = _block_max_magnitude(rows[j][2], rows[j][3])
+                run_max = _max_f32(run_max, q_even * _f16lo_to_f32(sf2))  # exact
+                run_max = _max_f32(run_max, q_odd * _f16hi_to_f32(sf2))
+
+        for offset in range(5):
+            run_max = _max_f32(
+                run_max, cute.arch.shuffle_sync_bfly(run_max, 1 << (4 - offset))
+            )
+        if lane == cutlass.Int32(0):
+            warp_max[warp_idx] = run_max
+        cute.arch.sync_threads()
+        if tidx == cutlass.Int32(0):
+            cta_max = warp_max[0]
+            for w in range(1, REQUANT_AMAX_WARPS):
+                cta_max = _max_f32(cta_max, warp_max[w])
+            amax = amax_t[e]
+            _, dec, _ = _global_scale(amax)
+            t = cta_max * _abs_f32(dec)  # the one rounding, Triton's association
+            t = cutlass.Float32(cutlass.BFloat16(t))  # RTNE, as the .to(bf16)
+            # Finite iff |amax| <= FP32_MAX: the comparison is false for NaN and inf.
+            valid = _abs_f32(amax) <= cutlass.Float32(FP32_MAX)
+            t = cutlass.Float32(cutlass.select_(valid, t, cutlass.Float32(0.0)))
+            _atom_max_f32_nonneg(out_t.iterator + e, t)
+
+
+# Every parameter is required and every caller passes it positionally: an lru_cache key is
+# the literal (args, kwargs) shape (see _compile_fused_kernel).
+@functools.lru_cache(maxsize=None)
+def _compile_requant_amax_kernel(device_idx):
+    """Compile the streaming requant amax with symbolic extents (cached per device).
+
+    Both packed inputs are handed over as flat u32 views (the codes' row pitch and
+    the 512 B atoms are both multiples of 16 B, so the 16 B code loads are aligned);
+    N, the per-expert row-block count, the y-grid and E are runtime Int32 args.
+    """
+    free = cute.sym_int
+    fake_codes = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16)
+    fake_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    fake_out = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    return cute.compile(
+        _RequantAmax(),
+        fake_codes,
+        fake_sf,
+        fake_amax,
+        fake_out,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_col_cast_requant_amax_impl(
+    row_fp4_w: torch.Tensor, row_sf_w: torch.Tensor, global_amax: torch.Tensor
+) -> torch.Tensor:
+    """Per-expert ``max|bf16(dequant(row_fp4_w[e]))|`` from the rowwise NVFP4 weight.
+
+    ``row_fp4_w`` is ``(E, M, N//2)`` uint8, ``row_sf_w`` the ``(E, M//128, N//64, 32, 16)``
+    swizzled e4m3 scales, ``global_amax`` the ``(E,)`` decode amax. Both packed inputs are
+    handed over as ``assumed_align=16`` flat u32 views, so each must start at a 16 B
+    aligned address (the DSL raises a host ``ValueError`` otherwise; every producer in
+    this package allocates such buffers). Returns ``(E,)`` float32, zero-initialised
+    because the tail accumulates with atomic max.
+    """
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    dev = row_fp4_w.device
+
+    amax_w_qdq_t = torch.zeros((E,), dtype=torch.float32, device=dev)
+    # An empty stack (E, M or N = 0) passes validation and has nothing to reduce: the
+    # pre-zeroed output is the answer, as for the Triton twin, whose zero-size grid
+    # never launches.
+    if row_fp4_w.numel() == 0:
+        return amax_w_qdq_t
+
+    m_blocks = M // M_TILE
+    NUM_SMS = _get_num_sms(dev.index)
+    GRID_Y = min(
+        m_blocks, -(-REQUANT_AMAX_CTAS_PER_SM * NUM_SMS // (E * (N // M_TILE)))
+    )
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    requant_amax = _compile_requant_amax_kernel(dev.index)
+    requant_amax(
+        row_fp4_w.view(torch.uint32).view(-1),
+        row_sf_w.view(torch.uint32).view(-1),
+        global_amax,
+        amax_w_qdq_t,
+        int(N),
+        int(m_blocks),
+        int(GRID_Y),
+        int(E),
+        stream,
+    )
+    return amax_w_qdq_t
+
+
+# ---------------------------------------------------------------------------
+# Columnwise requantize of the packed rowwise weight (§11.7) -- CUDA-core SMEM transpose
+# ---------------------------------------------------------------------------
+# 128 threads per 128x128 tile: thread ``m`` rebuilds weight row ``m`` (64 B of codes as
+# four 16 B loads plus its two scale words) into a padded bf16 SMEM tile; after the
+# barrier thread ``t`` quantizes the two output rows ``2 * (t % 64)``, ``+ 1`` over
+# blocks ``4 * (t // 64) .. + 3``, reading the tile down its columns.
+REQUANTIZE_THREADS = M_TILE
+# Row pitch of the SMEM tile in u32 words: 128 bf16 columns are 64 words, padded to 68 so
+# the eight 16 B row stores of one store phase land on disjoint banks (68 % 32 == 4) and
+# a warp's 32 consecutive column words stay conflict-free.
+REQUANTIZE_PITCH_WORDS = M_TILE // 2 + 4
+# 34 KB of SMEM per CTA (no pipeline stages): the grid is sized for this many resident
+# CTAs per SM.
+REQUANTIZE_CTAS_PER_SM = 4
+
+
+class _Requantize:
+    """Per-expert columnwise 1x16 NVFP4 requantization of the forward weight (§11.7).
+
+    Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, y, e)`` walks the row blocks ``y, y + GRID_Y,
+    ...`` of column tile ``cn`` of expert ``e``, so both per-expert scales are
+    loop-invariant. Per tile the CTA first rebuilds ``W_qdq`` row by row into SMEM --
+    thread ``m`` decodes its 16 code words with ``_dequant_e2m1x8_bf16x2x4`` (the Triton
+    reconstruction op for op, including the ``+0`` of a NaN / inf expert amax) and
+    stores each as one 16 B chunk of the padded row -- then, after the barrier, reads
+    the tile down its columns: thread ``t`` owns output rows ``n = 2 * (t % 64)``, ``+ 1``
+    (the low and high bf16 of one column word) and blocks ``4 * (t // 64) .. + 3`` along
+    ``m``, quantizes each 1x16 block with the plain ``_quant16`` (the values are already
+    bf16-exact, so no round-through) and stores the two 32 B code runs as ``st.global.v4``
+    and the four scale bytes per row in the §11.1 swizzle. No MMA: the transpose is a
+    plain SMEM gather, so ``-0`` codes survive as Triton's ``tl.trans`` keeps them.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mCodes: cute.Tensor,  # (E*M*N/8,) u32 = row_fp4_w.view(torch.uint32).view(-1)
+        mSF: cute.Tensor,  # (E*M*N/64,) u32 = row_sf_w.view(torch.uint32).view(-1)
+        amax_t: cute.Tensor,  # (E,) f32 global_amax
+        amax_out_t: cute.Tensor,  # (E,) f32 amax_w_qdq_t (§11.6)
+        mColFP4: cute.Tensor,  # (E*N*M/8,) u32 = col_fp4.view(-1)
+        mColSF: cute.Tensor,  # (E*N*M/16,) e4m3 = col_sf.view(-1)
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mCodes, mSF, amax_t, amax_out_t, mColFP4, mColSF, N, m_blocks, GRID_Y
+        ).launch(
+            grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
+            block=(REQUANTIZE_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        amax_t: cute.Tensor,
+        amax_out_t: cute.Tensor,
+        mColFP4: cute.Tensor,
+        mColSF: cute.Tensor,
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cn, by, e = cute.arch.block_idx()
+
+        smem = utils.SmemAllocator()
+        tile = smem.allocate_array(
+            cutlass.Uint32, M_TILE * REQUANTIZE_PITCH_WORDS, byte_alignment=16
+        )
+        tile_base = tile.toint()
+        pitch_bytes = cutlass.Int32(4 * REQUANTIZE_PITCH_WORDS)
+
+        # --- producer: thread m rebuilds weight row m of the tile ---------------------
+        m = tidx
+        # Codes: row (e*M + rb*128 + m), bytes cn*64 .. +63 -- 16 B aligned because
+        # N % 128 == 0 makes the row pitch a multiple of 64 B. Scales: the two words
+        # (m % 32) * 4 + m // 32 of atoms (e*M//128 + rb) * (N//64) + 2*cn, +1 (the
+        # swizzle of the rowwise cast above), 512 B apart.
+        row_bytes = cutlass.Int64(N // cutlass.Int32(2))
+        row_block_bytes = row_bytes * cutlass.Int64(M_TILE)
+        sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
+        codes_base = (
+            mCodes.iterator.toint()
+            + cutlass.Int64(e * m_blocks * cutlass.Int32(M_TILE) + m) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2))
+        )
+        sf_base = (
+            mSF.iterator.toint()
+            + cutlass.Int64(e * m_blocks) * cutlass.Int64(sf_rb_bytes)
+            + cutlass.Int64(
+                cn * cutlass.Int32(2 * SF_BLK)
+                + (m % cutlass.Int32(32)) * cutlass.Int32(16)
+                + (m // cutlass.Int32(32)) * cutlass.Int32(4)
+            )
+        )
+        row_off = tile_base + m * pitch_bytes
+        amax_e = amax_t[e]
+        _, gds, _ = _global_scale(amax_e)
+        # A NaN or inf global_amax reconstructs to +0, as Triton's tl.where does.
+        valid = _abs_f32(amax_e) < cutlass.Float32(float("inf"))
+        st4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
+
+        # --- epilogue: thread t quantizes output rows 2j, 2j+1 over blocks 4hb .. 4hb+3 --
+        j = tidx % cutlass.Int32(64)
+        hb = tidx // cutlass.Int32(64)
+        _, dec, enc_over_fp4max = _global_scale(amax_out_t[e])
+        n_glob = cn * cutlass.Int32(M_TILE) + cutlass.Int32(2) * j
+        out_row_bytes = cutlass.Int64(m_blocks * cutlass.Int32(M_TILE // 2))
+        # Output row n_glob of expert e, bytes rb*64 + hb*32 .. +31: 16 B aligned (64 B
+        # code rows). Row n_glob + 1 is one row pitch further.
+        out_base = (
+            mColFP4.iterator.toint()
+            + (cutlass.Int64(e) * cutlass.Int64(N) + cutlass.Int64(n_glob))
+            * out_row_bytes
+            + cutlass.Int64(hb * cutlass.Int32(32))
+        )
+        # swizzled SF[r, c] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4] of the expert's
+        # (N//128, M//64, 32, 16) tile; here r = n_glob (+1 is the next 16 B line) and
+        # c = rb*8 + 4*hb + b, so the atom is 2*rb + hb and the byte within the row is b.
+        sf_rows = m_blocks * cutlass.Int32(2 * SF_BLK)  # SF bytes per 128 rows
+        sf_out_base = (
+            (e * (N // cutlass.Int32(M_TILE)) + cn) * sf_rows
+            + hb * cutlass.Int32(SF_BLK)
+            + ((cutlass.Int32(2) * j) % cutlass.Int32(32)) * cutlass.Int32(16)
+            + ((cutlass.Int32(2) * j) // cutlass.Int32(32)) * cutlass.Int32(4)
+        )
+        col_base = (
+            tile_base + hb * (pitch_bytes * cutlass.Int32(64)) + j * cutlass.Int32(4)
+        )
+        blk_lo = cute.make_rmem_tensor((16,), cutlass.Float32)
+        blk_hi = cute.make_rmem_tensor((16,), cutlass.Float32)
+        codes_lo = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        codes_hi = cute.make_rmem_tensor((8,), cutlass.Uint32)
+
+        for rb in cutlass.range(by, m_blocks, GRID_Y):
+            tile_codes = codes_base + cutlass.Int64(rb) * row_block_bytes
+            tile_sf = sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes)
+            for h in cutlass.range_constexpr(2):
+                sfw = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint32,
+                        tile_sf + cutlass.Int64(h * SF_BLK),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    ),
+                    cute.make_layout((1,)),
+                )[0]
+                # 16 B piece 2h + k holds blocks 4h + 2k, +1: scale bytes 2k, 2k + 1.
+                for k in cutlass.range_constexpr(2):
+                    piece = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            tile_codes + cutlass.Int64(16 * (2 * h + k)),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4,)),
+                    ).load()
+                    sf2 = _e4m3x2_to_f16x2(sfw >> cutlass.Uint32(16 * k))
+                    sf_even = _f16lo_to_f32(sf2)
+                    sf_odd = _f16hi_to_f32(sf2)
+                    for w in cutlass.range_constexpr(4):  # code word q = 8h + 4k + w
+                        v0, v1, v2, v3 = _dequant_e2m1x8_bf16x2x4(
+                            piece[w], sf_even if w < 2 else sf_odd, gds
+                        )
+                        st4[0] = cutlass.Uint32(
+                            cutlass.select_(valid, v0, cutlass.Uint32(0))
+                        )
+                        st4[1] = cutlass.Uint32(
+                            cutlass.select_(valid, v1, cutlass.Uint32(0))
+                        )
+                        st4[2] = cutlass.Uint32(
+                            cutlass.select_(valid, v2, cutlass.Uint32(0))
+                        )
+                        st4[3] = cutlass.Uint32(
+                            cutlass.select_(valid, v3, cutlass.Uint32(0))
+                        )
+                        cute.make_tensor(
+                            cute.make_ptr(
+                                cutlass.Uint32,
+                                row_off + cutlass.Int32(16 * (8 * h + 4 * k + w)),
+                                cute.AddressSpace.smem,
+                                assumed_align=16,
+                            ),
+                            cute.make_layout((4,)),
+                        ).store(st4.load())
+            cute.arch.sync_threads()
+
+            # Block 4hb + b: rows m = 16 * (4hb + b) .. + 15 down the thread's column word.
+            for b in cutlass.range_constexpr(4):
+                col = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint32,
+                        col_base + cutlass.Int32(16 * b) * pitch_bytes,
+                        cute.AddressSpace.smem,
+                        assumed_align=4,
+                    ),
+                    cute.make_layout((16,), stride=(REQUANTIZE_PITCH_WORDS,)),
+                ).load()
+                for i in cutlass.range_constexpr(16):
+                    blk_lo[i] = _bf16lo_to_f32(col[i])
+                    blk_hi[i] = _bf16hi_to_f32(col[i])
+                w0, w1, sf_lo = _quant16(blk_lo, enc_over_fp4max, dec)
+                codes_lo[2 * b] = w0
+                codes_lo[2 * b + 1] = w1
+                w0, w1, sf_hi = _quant16(blk_hi, enc_over_fp4max, dec)
+                codes_hi[2 * b] = w0
+                codes_hi[2 * b + 1] = w1
+                sf_out = sf_out_base + rb * cutlass.Int32(2 * SF_BLK) + cutlass.Int32(b)
+                mColSF[sf_out] = sf_lo
+                mColSF[sf_out + cutlass.Int32(16)] = sf_hi
+            out_lo = out_base + cutlass.Int64(rb) * cutlass.Int64(M_TILE // 2)
+            out_hi = out_lo + out_row_bytes
+            _st_global_v4_u32(
+                out_lo, codes_lo[0], codes_lo[1], codes_lo[2], codes_lo[3]
+            )
+            _st_global_v4_u32(
+                out_lo + cutlass.Int64(16),
+                codes_lo[4],
+                codes_lo[5],
+                codes_lo[6],
+                codes_lo[7],
+            )
+            _st_global_v4_u32(
+                out_hi, codes_hi[0], codes_hi[1], codes_hi[2], codes_hi[3]
+            )
+            _st_global_v4_u32(
+                out_hi + cutlass.Int64(16),
+                codes_hi[4],
+                codes_hi[5],
+                codes_hi[6],
+                codes_hi[7],
+            )
+            # The tile is reused by the next row block once every column read is done.
+            cute.arch.sync_threads()
+
+
+# Every parameter is required and every caller passes it positionally: an lru_cache key is
+# the literal (args, kwargs) shape (see _compile_fused_kernel).
+@functools.lru_cache(maxsize=None)
+def _compile_requantize_kernel(device_idx):
+    """Compile the columnwise weight requantize with symbolic extents (cached per device).
+
+    The packed inputs and the codes out are flat u32 views with ``assumed_align=16``
+    (64 B code rows, 512 B scale atoms); the scales out the flat e4m3 run of 512 B atoms.
+    N, the per-expert row-block count, the y-grid and E are runtime Int32 args.
+    """
+    free = cute.sym_int
+    fake_codes = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16)
+    fake_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    fake_amax_out = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    fake_cfp4 = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_csf = make_fake_tensor(cutlass.Float8E4M3FN, (free(),), stride=(1,))
+    return cute.compile(
+        _Requantize(),
+        fake_codes,
+        fake_sf,
+        fake_amax,
+        fake_amax_out,
+        fake_cfp4,
+        fake_csf,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_col_cast_requantize_impl(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_w_qdq_t: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert columnwise NVFP4 requantization of ``W_qdq.bf16().t()``.
+
+    Operands as ``_cutedsl_group_col_cast_requant_amax_impl`` plus ``amax_w_qdq_t``, that
+    op's ``(E,)`` output. Returns ``(E, N, M//2)`` uint8 codes (a view of the u32 buffer
+    the kernel writes) and ``(E, N//128, M//64, 32, 16)`` float8_e4m3fn swizzled scales.
+    """
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    dev = row_fp4_w.device
+
+    col_fp4 = torch.empty((E, N, M // 8), dtype=torch.uint32, device=dev)
+    col_sf = torch.empty(
+        (E, N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    # An empty stack (E, M or N = 0) passes validation and has nothing to quantize: a
+    # zero grid dimension is a launch error here where the Triton launcher skips it.
+    if row_fp4_w.numel() == 0:
+        return col_fp4.view(torch.uint8), col_sf
+
+    m_blocks = M // M_TILE
+    NUM_SMS = _get_num_sms(dev.index)
+    GRID_Y = min(m_blocks, -(-REQUANTIZE_CTAS_PER_SM * NUM_SMS // (E * (N // M_TILE))))
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    requantize = _compile_requantize_kernel(dev.index)
+    requantize(
+        row_fp4_w.view(torch.uint32).view(-1),
+        row_sf_w.view(torch.uint32).view(-1),
+        global_amax,
+        amax_w_qdq_t,
+        col_fp4.view(-1),
+        col_sf.view(-1),
+        int(N),
+        int(m_blocks),
+        int(GRID_Y),
+        int(E),
+        stream,
+    )
+    # uint32 -> uint8 quadruples the last extent: (E, N, M//8) -> (E, N, M//2).
+    return col_fp4.view(torch.uint8), col_sf
