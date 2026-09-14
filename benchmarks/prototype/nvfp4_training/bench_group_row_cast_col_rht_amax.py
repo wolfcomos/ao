@@ -6,7 +6,7 @@
 
 """Benchmark the grouped rowwise-cast + columnwise-RHT amax kernel across backends (triton, cutedsl).
 
-One launch over the packed activation x = (E * tokens, hidden) bf16 computes per group the
+One launch over the packed activation x = (E * tokens, dim) bf16 computes per group the
 raw rowwise amax of |x_g| and the amax of |x_g^T @ R| with a 128-point randomized Hadamard
 transform along the tokens (wgrad signs) -- the V2 forward activation operands, the
 ``dynamic_rht=True`` path of ``group_rht_amax``. Reports device kernel time (see
@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from benchmarks.prototype.nvfp4_training.bench_utils import kernel_time_us
 from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
-    get_deepseek_v3_weight_shapes,
+    get_deepseek_v3_activation_shapes,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     VARYING_FIRST_DIM,
@@ -49,7 +49,7 @@ LOCAL_EXPERTS = 4
 class ExperimentConfig:
     experts: int
     tokens: int
-    hidden: int
+    dim: int
     model: str = ""
     projection: str = ""
 
@@ -112,8 +112,8 @@ def make_runner(
 
 
 def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
-    E, tokens, hidden = config.experts, config.tokens, config.hidden
-    x = torch.randn((E * tokens, hidden), dtype=torch.bfloat16, device=device)
+    E, tokens, dim = config.experts, config.tokens, config.dim
+    x = torch.randn((E * tokens, dim), dtype=torch.bfloat16, device=device)
     wgrad_rht = _signs(seed=0)
     offsets = torch.arange(1, E + 1, dtype=torch.int32, device=device) * tokens
     logical_packed_length = offsets[-1:]
@@ -135,7 +135,7 @@ def print_results(experiments: List[Experiment]) -> None:
         "projection",
         "E",
         "tokens",
-        "hidden",
+        "dim",
         "cutedsl_us",
         "triton_us",
         "speedup",
@@ -154,7 +154,7 @@ def print_results(experiments: List[Experiment]) -> None:
                 e.config.projection,
                 e.config.experts,
                 e.config.tokens,
-                e.config.hidden,
+                e.config.dim,
                 round(c, 3) if c else "n/a",
                 round(t, 3) if t else "n/a",
                 speedup,
@@ -169,17 +169,17 @@ def main() -> None:
         raise RuntimeError("Grouped NVFP4 amax requires SM100+")
 
     torch.random.manual_seed(123)
-    # Tokens per expert equal the weight row count m and hidden the weight column count
-    # n, so x is the activation the weight consumes, as in the recorded Triton baseline.
     configs = [
         ExperimentConfig(
             shape.experts,
-            shape.m,
-            shape.n,
+            shape.tokens,
+            shape.dim,
             model=shape.model,
             projection=shape.projection,
         )
-        for shape in get_deepseek_v3_weight_shapes(factorized_experts=LOCAL_EXPERTS)
+        for shape in get_deepseek_v3_activation_shapes(
+            "x", factorized_experts=LOCAL_EXPERTS
+        )
     ]
     experiments = []
     for config in tqdm(configs):

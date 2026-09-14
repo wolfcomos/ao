@@ -6,7 +6,7 @@
 
 """Benchmark the grouped rowwise-RHT + columnwise-RHT MS-EDEN quantize kernel across backends (triton, cutedsl).
 
-One launch over the packed gradient dy = (E * tokens, hidden) bf16 quantizes per group
+One launch over the packed gradient dy = (E * tokens, dim) bf16 quantizes per group
 dy_g @ R_n (rowwise, dgrad signs) and dy_g^T @ R_m (columnwise, wgrad signs) with
 independent 128-point randomized Hadamard transforms on both axes -- RTNE FP4 codes and
 corrected, stochastically rounded E4M3 block scales against the group amaxes of
@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 from benchmarks.prototype.nvfp4_training.bench_utils import kernel_time_us
 from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
-    get_deepseek_v3_weight_shapes,
+    get_deepseek_v3_activation_shapes,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     VARYING_FIRST_DIM,
@@ -50,7 +50,7 @@ LOCAL_EXPERTS = 4
 class ExperimentConfig:
     experts: int
     tokens: int
-    hidden: int
+    dim: int
     model: str = ""
     projection: str = ""
 
@@ -119,8 +119,8 @@ def make_runner(
 
 
 def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
-    E, tokens, hidden = config.experts, config.tokens, config.hidden
-    dy = torch.randn((E * tokens, hidden), dtype=torch.bfloat16, device=device)
+    E, tokens, dim = config.experts, config.tokens, config.dim
+    dy = torch.randn((E * tokens, dim), dtype=torch.bfloat16, device=device)
     dgrad_rht, wgrad_rht = _signs(seed=0), _signs(seed=1)
     offsets = torch.arange(1, E + 1, dtype=torch.int32, device=device) * tokens
     logical_packed_length = offsets[-1:]
@@ -142,7 +142,7 @@ def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
         offsets,
         E,
         E * tokens,
-        hidden,
+        dim,
         VARYING_FIRST_DIM,
         logical_packed_length,
     )
@@ -176,7 +176,7 @@ def print_results(experiments: List[Experiment]) -> None:
         "projection",
         "E",
         "tokens",
-        "hidden",
+        "dim",
         "cutedsl_us",
         "triton_us",
         "speedup",
@@ -195,7 +195,7 @@ def print_results(experiments: List[Experiment]) -> None:
                 e.config.projection,
                 e.config.experts,
                 e.config.tokens,
-                e.config.hidden,
+                e.config.dim,
                 round(c, 3) if c else "n/a",
                 round(t, 3) if t else "n/a",
                 speedup,
@@ -210,16 +210,17 @@ def main() -> None:
         raise RuntimeError("Grouped NVFP4 MS-EDEN quantize requires SM100+")
 
     torch.random.manual_seed(123)
-    # Tokens per expert equal the weight row count m, as in the recorded Triton baseline.
     configs = [
         ExperimentConfig(
             shape.experts,
-            shape.m,
-            shape.m,
+            shape.tokens,
+            shape.dim,
             model=shape.model,
             projection=shape.projection,
         )
-        for shape in get_deepseek_v3_weight_shapes(factorized_experts=LOCAL_EXPERTS)
+        for shape in get_deepseek_v3_activation_shapes(
+            "dy", factorized_experts=LOCAL_EXPERTS
+        )
     ]
     experiments = []
     for config in tqdm(configs):

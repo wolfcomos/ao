@@ -18,8 +18,20 @@ environment, so compare numbers within this file only.
   kernel here compiles and is bitwise-checked on both.
 - Device kernel time via `bench_utils.kernel_time_us` (15 warmups / 50 iterations, CUDA
   self-time, memcpy/memset excluded) -- op time for everything the custom op launches.
-  `E = 4` local experts, DeepSeek-V3 shapes from `deepseek_v3_shapes.py`, medians of three
-  full script passes.
+- `E = 4` local experts (the 671B EP-64 layout; the V2 training runs use 8 local experts at
+  ep 32 / ep 8), DeepSeek-V3 shapes from `deepseek_v3_shapes.py`. Weight tables: `w` is
+  `(E, M, N)`, `M` rows (out features), `N` columns (in features). Activation tables:
+  `x = (E * tokens, dim)` with `dim = N` (weight columns) and `dy = (E * tokens, dim)` with
+  `dim = M` (weight rows); `tokens` per expert is the recipe's per-step count for a balanced
+  router, EP-group ranks x local batch x seq x top_k / experts -- 16B 8 x 4 x 4096 x 6 / 64
+  = 12288 (2 nodes x 4 GPUs, ep 8, local batch 4, seq 4096), 671B 32 x 8 x 4096
+  x 8 / 256 = 32768 (16 nodes x 4 GPUs, ep 32, local batch 8, seq 4096; the EP-64 layout
+  with the same batch would give 65536), debugmodel 256 (no such run; 16 tiles at `E = 4`).
+  Debug-model rows are 16-tile launch-floor probes on either backend, so their speedup is a
+  latency ratio, not a throughput one.
+- Medians of three full script passes. The four activation tables and the baseline's
+  activation rows were re-measured at the recipe token counts on 2026-09-14 (GPU 3 of the
+  same node, 1200 MHz local cap; Triton 3.6.0 in the CUDA 13.4 container on the same GPU).
 
 ## Kernels
 
@@ -58,7 +70,7 @@ backend and is latency-bound.
 ### group_row_rht_col_rht_amax (`cutedsl_group_row_rht_col_rht_amax` vs `triton_group_row_rht_col_rht_amax`)
 
 The V2 backward gradient amax: one pass over the packed gradient
-`dy = (E * tokens, hidden)` returns, per expert, the amax of `|dy_g @ R_n|` (rowwise, the
+`dy = (E * tokens, dim)` returns, per expert, the amax of `|dy_g @ R_n|` (rowwise, the
 dgrad signs) and of `|dy_g.t() @ R_m|` (columnwise, the wgrad signs) -- two RHT-128
 transforms with independent sign vectors. The CuteDSL kernel loads every 128x128 tile into
 shared memory once (TMA) and applies both transforms to that one copy through two tcgen05
@@ -72,40 +84,44 @@ counted.
 python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_amax
 ```
 
-| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+| model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 20.31 | 26.67 | 1.31x | 25.8 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 20.30 | 26.74 | 1.32x | 25.8 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 1408 | 23.17 | 37.07 | 1.60x | 684.4 |
-| 16B | down (w2) | 4 | 2048 | 2048 | 25.93 | 55.74 | 2.15x | 1293.9 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 2048 | 25.94 | 55.74 | 2.15x | 1293.7 |
-| 671B | down (w2) | 4 | 7168 | 7168 | 98.14 | 442.72 | 4.51x | 4188.3 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 19.73 | 25.83 | 1.31x | 26.6 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 19.74 | 25.95 | 1.31x | 26.6 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 47.56 | 163.76 | 3.44x | 2910.4 |
+| 16B | down (w2) | 4 | 12288 | 2048 | 59.47 | 227.81 | 3.83x | 3385.2 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 120.56 | 575.00 | 4.77x | 4453.1 |
+| 671B | down (w2) | 4 | 32768 | 7168 | 366.71 | 1935.77 | 5.28x | 5124.0 |
 
 - Op time includes the same torch glue on both backends -- two sign-to-matrix builds and
-  two `torch.zeros` fills -- 14.10-15.60 us for CuteDSL and 15.78-19.28 us for Triton. At
-  671B gate/up, `dy (8192, 2048)`: CuteDSL two `torch.mul(h128, sign[None, :])` 10.23 us
+  two `torch.zeros` fills -- 13.8-16.5 us for CuteDSL and 15.5-19.3 us for Triton. At
+  671B gate/up, `dy (131072, 2048)`: CuteDSL two `torch.mul(h128, sign[None, :])` 11.61 us
   (the int8 sign operand puts them on ATen's casting `gpu_kernel_impl`; with bfloat16
-  signs the pair takes 6.77 us) + two fills 3.94 us; Triton two `get_dynamic_rht_matrix`
-  7.01 us + their two int8->bfloat16 copies 4.93 us + two fills 3.98 us. Kernel-only
-  (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 8.78 vs 21.10 us at 16B
-  gate/up (2.40x), 11.55 vs 39.82 us at 16B down (3.45x), 11.55 vs 38.85 us at 671B
-  gate/up (3.36x), 82.48 vs 423.51 us at 671B down (5.13x). The metric excludes the
-  1.99-2.44 us `Memcpy DtoD` of the CuteDSL impl's `logical_packed_length.clone()`, which
+  signs the pair takes 6.77 us) + two fills 3.93 us; Triton two `get_dynamic_rht_matrix`
+  8.74 us + their two int8->bfloat16 copies 5.86 us + two fills 4.67 us. Kernel-only
+  (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 32.10 vs 145.95 us at
+  16B gate/up (4.55x), 44.06 vs 208.27 us at 16B down (4.73x), 105.20 vs 555.25 us at 671B
+  gate/up (5.28x), 350.12 vs 1919.80 us at 671B down (5.48x). The metric excludes the
+  1.98-2.74 us `Memcpy DtoD` of the CuteDSL impl's `logical_packed_length.clone()`, which
   the Triton op does not issue.
-- The 671B gate: gate/up `dy (8192, 2048)` 25.94 us against <= 22 us -- over by 3.94 us
-  (17.9%); down `dy (28672, 7168)` 98.14 us against <= 105 us -- under by 6.86 us (6.5%).
-  At gate/up the kernel is 11.55 us, under the gate on its own, and the glue 14.18 us,
-  55% of the op: the miss is the glue, the two int8-sign `torch.mul` at 5.1 us each; the
-  kernel's fixed floor is 6.04-6.08 us (the debug model: 16 CTAs, one tile each).
-- At 671B down the op reads 411 MB at 4188.3 GB/s, 52.8% of the 7936 GB/s peak; the kernel
-  alone runs at 4984 GB/s, 62.8%. At the 1200 MHz application clock the kernel is
+- The 671B gates of the port plan were set at the earlier record's shapes, which are no
+  longer in the table: gate/up `dy (8192, 2048)` 25.94 us against <= 22 us -- over by
+  3.94 us (17.9%); down `dy (28672, 7168)` 98.14 us against <= 105 us -- under by 6.86 us
+  (6.5%). At that gate/up shape the kernel was 11.55 us, under the gate on its own, and the
+  glue 14.18 us, 55% of the op: the miss is the glue, the two int8-sign `torch.mul` at
+  5.1 us each. At the recipe token counts the same glue is 13% of the 671B gate/up op
+  (15.5 of 120.7 us) and 5% at 671B down; the kernel's fixed floor is 5.96 us (the debug
+  model: 16 CTAs, one tile each).
+- At 671B down the op reads 1879 MB at 5124.0 GB/s, 64.6% of the 7936 GB/s peak; the kernel
+  alone runs at 5367 GB/s, 67.6%. At the 1200 MHz application clock the kernel is
   tensor-bound: every 128x128 tile costs 16 `(128, 128, 16)` bfloat16 UMMAs, and the
-  steady state derived from the 671B rows after a 6.06 us fixed floor is 1099-1118 cycles
-  per tile, inside the 1024-1100 the UMMA rate predicts.
+  steady state derived from the 671B rows (108 and 378 tiles on the busiest of the 152
+  CTAs) after the 5.96 us fixed floor is 1093-1103 cycles per tile, inside the 1024-1100
+  the UMMA rate predicts.
 - On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL column
-  is 0.97-1.00x of the values above (25.76 us at 671B gate/up, 95.42 us at 671B down); the
-  Triton twin does not compile there (`TritonNvidiaGPUOptimizeTMemLayoutsPass`, as in the
-  baseline table), so the Triton column is Triton 3.8.0 only.
+  is 0.97-1.00x of the values above (117.07 us at 671B gate/up, 354.27 us at 671B down, one
+  pass); the Triton twin does not compile there (`TritonNvidiaGPUOptimizeTMemLayoutsPass`,
+  as in the baseline table), so the Triton column is Triton 3.8.0 only.
 - `cuobjdump -res-usage` of the compiled kernel: REG 50, STACK 0, SHARED 1024 (static),
   LOCAL 0, at 384 threads and no `setmaxnreg`. Its SASS holds 16 `UTCHMMA` (the 8 + 8
   UMMAs of the two chains), 2 `UTCBAR` and no `HMMA`, `LDSM` or `STSM`: the dynamic shared
@@ -116,7 +132,7 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_amax
 ### group_row_rht_col_rht_quantize_ms_eden (`cutedsl_group_row_rht_col_rht_quantize_ms_eden` vs `triton_group_row_rht_col_rht_quantize_ms_eden`)
 
 The V2 backward gradient quantize: one pass over the packed gradient
-`dy = (E * tokens, hidden)` emits both MS-EDEN operands -- rowwise `ms_eden(dy_g @ R_n)` (the
+`dy = (E * tokens, dim)` emits both MS-EDEN operands -- rowwise `ms_eden(dy_g @ R_n)` (the
 dgrad signs) and columnwise `ms_eden(dy_g.t() @ R_m)` (the wgrad signs) -- RTNE FP4 codes with
 a corrected, stochastically rounded E4M3 block scale (ceiling 256, decode numerator 1536),
 each against its group's amax from `group_row_rht_col_rht_amax` and its own Philox stream.
@@ -133,39 +149,42 @@ bfloat16 read plus the FP4 codes and swizzled scales on both axes, 3.125 bytes p
 python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quantize_ms_eden
 ```
 
-| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+| model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 20.41 | 32.19 | 1.58x | 40.1 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 20.37 | 32.30 | 1.59x | 40.2 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 1408 | 33.63 | 51.67 | 1.54x | 736.8 |
-| 16B | down (w2) | 4 | 2048 | 2048 | 46.38 | 86.84 | 1.87x | 1130.3 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 2048 | 46.33 | 86.81 | 1.87x | 1131.6 |
-| 671B | down (w2) | 4 | 7168 | 7168 | 391.43 | 800.95 | 2.05x | 1640.8 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 20.39 | 32.16 | 1.58x | 40.2 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 20.36 | 32.27 | 1.58x | 40.2 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 142.91 | 289.51 | 2.03x | 1513.3 |
+| 16B | down (w2) | 4 | 12288 | 2048 | 200.20 | 406.08 | 2.03x | 1571.3 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 493.43 | 1034.84 | 2.10x | 1700.0 |
+| 671B | down (w2) | 4 | 32768 | 7168 | 1699.15 | 3564.01 | 2.10x | 1727.9 |
 
 - Op time includes the same torch glue on both backends -- the two sign-to-matrix builds, no
-  fills -- 10.0-11.7 us for CuteDSL (two `torch.mul(h128, sign[None, :])` at ~5 us each on
-  ATen's casting `gpu_kernel_impl`, the int8 sign operand) and 12.2-14.5 us for Triton (two
-  `get_dynamic_rht_matrix` 7.1-8.8 us plus their two int8->bfloat16 copies 5.0-5.7 us).
-  Kernel-only (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 10.41 vs
-  20.06 us at the debug model (1.93x), 23.61 vs 39.59 us at 16B gate/up (1.68x), 36.33 vs
-  74.56 us at 16B down (2.05x), 36.34 vs 74.43 us at 671B gate/up (2.05x), 379.58 vs
-  783.31 us at 671B down (2.06x). The metric excludes the CuteDSL impl's two `Memcpy DtoD`
-  (`logical_packed_length.clone()` and the `rng_state` copy into the persistent Philox
-  buffer), 3.9-5.0 us of wall time per op that the Triton op does not issue.
-- The 671B gate: down `dy (28672, 7168)` 391.43 us against the re-set <= 400 us -- PASS,
-  8.6 us (2.1%) under -- and against the provisional <= 300 us -- FAIL, 1.30x over; the op
-  is 2.05x Triton 3.8's 800.95 us and the kernel 2.06x (379.6 vs 783.3 us). Gate/up
-  `dy (8192, 2048)` 46.33 us against the reported <= 44 us -- FAIL, 2.3 us (5.3%) over;
-  1.87x Triton (kernel 36.3 vs 74.4 us). At gate/up the kernel is 36.3 us, under the gate
-  on its own, and the glue 10.0 us, 22% of the op: the miss is the glue, the two int8-sign
-  `torch.mul` at ~5 us each, as for the amax twin. At 671B down the glue is 3% of the op,
-  so both verdicts there are the kernel's.
-- At 671B down the op moves 642 MB at 1640.8 GB/s, 20.7% of the 7936 GB/s peak (the kernel
-  alone 1692 GB/s): SM-bound, not memory-bound. The steady state from the two 671B rows (7
-  and 83 tiles on the busiest CTA, kernel-only 36.3 and 379.6 us) is 4.52 us = 5.4k cycles
-  per 128x128 tile at the 1200 MHz application clock (ncu on the 671B down launch: 5.3k
-  SM-active cycles per tile) against the 1024-cycle UMMA floor -- the tensor pipe is 19%
-  active. The first version of this epilogue -- 12 warps, one warp per TMEM quadrant per
+  fills -- 9.9-12.1 us for CuteDSL (two `torch.mul(h128, sign[None, :])` at 5-6 us each on
+  ATen's casting `gpu_kernel_impl`, the int8 sign operand) and 12.0-15.1 us for Triton (two
+  `get_dynamic_rht_matrix` 7.2-9.0 us plus their two int8->bfloat16 copies 4.8-6.2 us).
+  Kernel-only (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 10.37 vs
+  19.99 us at the debug model (1.93x), 131.43 vs 275.23 us at 16B gate/up (2.09x), 188.38
+  vs 390.82 us at 16B down (2.07x), 481.50 vs 1017.77 us at 671B gate/up (2.11x), 1688.12
+  vs 3539.96 us at 671B down (2.10x). The metric excludes the CuteDSL impl's two `Memcpy
+  DtoD` (`logical_packed_length.clone()` and the `rng_state` copy into the persistent
+  Philox buffer), 4.0-5.2 us of wall time per op that the Triton op does not issue.
+- The 671B gates of the port plan were set at the earlier record's shapes, which are no
+  longer in the table: down `dy (28672, 7168)` 391.43 us against the re-set <= 400 us --
+  PASS, 8.6 us (2.1%) under -- and against the provisional <= 300 us -- FAIL, 1.30x over;
+  the op was 2.05x Triton 3.8's 800.95 us and the kernel 2.06x (379.6 vs 783.3 us).
+  Gate/up `dy (8192, 2048)` 46.33 us against the reported <= 44 us -- FAIL, 2.3 us (5.3%)
+  over; 1.87x Triton (kernel 36.3 vs 74.4 us). At that gate/up shape the kernel was
+  36.3 us, under the gate on its own, and the glue 10.0 us, 22% of the op: the miss is the
+  glue, the two int8-sign `torch.mul` at ~5 us each, as for the amax twin. At the recipe
+  token counts the glue is 2% of the 671B gate/up op (12.1 of 493.5 us) and 1% at 671B
+  down, so the 2.10x of both 671B rows is the kernel's (2.11x and 2.10x kernel-only).
+- At 671B down the op moves 2936 MB at 1727.9 GB/s, 21.8% of the 7936 GB/s peak (the kernel
+  alone 1739 GB/s): SM-bound, not memory-bound. The steady state from the two 671B rows (108
+  and 378 tiles on the busiest CTA, kernel-only 481.5 and 1688.1 us) is 4.47 us = 5.4k cycles
+  per 128x128 tile at the 1200 MHz application clock (ncu on the earlier record's 671B down
+  launch, `dy (28672, 7168)`: 5.3k SM-active cycles per tile) against the 1024-cycle UMMA
+  floor -- the tensor pipe is 19% active. The first version of this epilogue -- 12 warps, one
+  warp per TMEM quadrant per
   chain running all 8 blocks of its lane as ~1850 straight-line SASS per chain -- took
   11.1k cycles per tile, Triton's ~11k, i.e. parity, and ncu showed the reason: issue slots
   active 36.5%, 6.85 warp-cycles per issued instruction of which 3.27 (48%) were
@@ -196,12 +215,12 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   1). Both kernels are SM-bound, so the ratio, not the absolute time, is the clock-portable
   number.
 - On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL column is
-  1.01-1.06x of the values above (20.63 / 20.63 / 34.40 / 47.41 / 47.37 / 415.81 us, medians
-  of three passes; REG 96, 3527 SASS, the same UMMA/LDTM/store/math counts, 6% slower at
-  671B down). The Triton column is Triton 3.8.0, the toolchain of record: Triton 3.6.0's own
+  0.99-1.02x of the values above (20.21 / 20.19 / 145.45 / 202.91 / 497.96 / 1717.28 us,
+  medians of three passes; REG 96, 3527 SASS, the same UMMA/LDTM/store/math counts, 1% slower
+  at 671B down). The Triton column is Triton 3.8.0, the toolchain of record: Triton 3.6.0's own
   MS-EDEN scale bytes, rowwise and columnwise, differ from 3.8.0's by one E4M3 step at ~1e-6
   of the blocks (the codes agree), so the bitwise sentence above is against Triton 3.8.0; the
-  baseline table's Triton 3.6.0 rows for this op are 50.54 / 84.62 / 84.60 / 865.93 us.
+  baseline table's Triton 3.6.0 rows for this op are 309.63 / 436.25 / 1114.48 / 3868.53 us.
 - `cuobjdump -res-usage` of the compiled kernel: REG 96, STACK 0, SHARED 1024 (static),
   LOCAL 0 at 640 threads (20 warps: MMA, TMA, two idle, 8 + 8 epilogue), launch-bounded to
   one CTA per SM with no `setmaxnreg` -- 96 x 640 = 61440 of the SM's 65536 registers, no
@@ -509,7 +528,7 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_col_cast_requantize
 
 ### group_row_cast_col_rht_amax (`cutedsl_group_rht_amax` vs `triton_group_rht_amax`, `dynamic_rht=True`)
 
-The V2 forward activation amax: one pass over the packed activation `x = (E * tokens, hidden)`
+The V2 forward activation amax: one pass over the packed activation `x = (E * tokens, dim)`
 returns, per expert, the raw rowwise amax `max|x_g|` and the columnwise amax of
 `|x_g.t() @ R|`, a 128-point randomized Hadamard transform along the tokens with the live
 wgrad sign buffer (`sign_tensor`, `dynamic_rht=True`; the static RHT-16 path of the same op
@@ -517,7 +536,7 @@ is unchanged). The CuteDSL kernel loads every 128x128 tile into shared memory on
 feeds it to two consumer groups: one tcgen05 UMMA chain (8 UMMAs against the resident
 `R^T` operand, the col chain of `group_row_rht_col_rht_amax`) whose accumulator four warps
 reduce from TMEM, and eight row warps that read the same bytes through a plain
-`(hidden, token, stage)` view and reduce the raw amax -- the RHT-16 kernels' two-consumer
+`(dim, token, stage)` view and reduce the raw amax -- the RHT-16 kernels' two-consumer
 stage. The two backends produce bitwise identical amaxes (`torch.equal` on both outputs at
 every shape below, 64 groups, empty groups, spare capacity rows and int8 / bfloat16 / float32
 sign buffers). Bandwidth counts the bfloat16 read of `x`; the `2E` scalar outputs are not
@@ -527,38 +546,42 @@ counted.
 python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_amax
 ```
 
-| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+| model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 14.63 | 18.92 | 1.29x | 35.8 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 14.64 | 18.92 | 1.29x | 35.8 |
 | debugmodel | down (w2) | 4 | 256 | 256 | 14.63 | 18.88 | 1.29x | 35.8 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 18.59 | 36.20 | 1.95x | 1240.9 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 18.59 | 36.21 | 1.95x | 1241.1 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 38.75 | 118.33 | 3.05x | 3030.4 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 38.65 | 118.57 | 3.07x | 3038.3 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 2048 | 55.39 | 194.21 | 3.51x | 3634.8 |
+| 16B | down (w2) | 4 | 12288 | 1408 | 42.51 | 136.31 | 3.21x | 3256.0 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 7168 | 392.54 | 1648.42 | 4.20x | 4786.9 |
+| 671B | down (w2) | 4 | 32768 | 2048 | 121.94 | 485.77 | 3.98x | 4402.9 |
 
 - Op time includes the same torch glue on both backends -- one sign-to-matrix build and two
-  `torch.zeros` fills -- 8.9-10.4 us for CuteDSL and 9.9-11.8 us for Triton. At 671B gate/up,
-  `x (8192, 7168)`: CuteDSL `torch.mul(h128, sign[None, :])` 6.40 us (the int8 sign operand
-  puts it on ATen's casting `gpu_kernel_impl`) + two fills 3.95 us; Triton
-  `get_dynamic_rht_matrix` 4.94 us + its int8->bfloat16 copy 2.88 us + two fills 3.93 us.
-  Kernel-only (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 9.51 vs
-  26.53 us at 16B gate/up (2.79x), 28.26 vs 109.54 us at 671B gate/up (3.88x), 28.19 vs
-  107.15 us at 671B down (3.80x). The metric excludes the 2.01-2.43 us `Memcpy DtoD` of the
-  CuteDSL impl's `logical_packed_length.clone()`, which the Triton op does not issue.
-- The op gates of the port plan: 16B `x (5632, 2048)` 18.59 us against <= 16 us -- over by
-  2.59 us (16.2%); 671B `x (8192, 7168)` 38.75 us against <= 32 us -- over by 6.75 us (21.1%).
-  At both shapes the kernel alone is under the gate (9.51 and 28.26 us) and the glue is
-  8.9-10.4 us, 27-48% of the op: the miss is the glue, the int8-sign `torch.mul` at
-  5.2-6.4 us plus the two fills at 3.7-4.0 us. Flipping the sign bits of the cached unsigned
-  `H128` in shared memory by the two idle warps would remove the `torch.mul`; the fills are
-  the Triton op's contract (zero-initialised outputs, atomic max).
-- At 671B gate/up the op reads 117 MB at 3030 GB/s, 38.2% of the 7936 GB/s peak; the kernel
-  alone runs at 4155 GB/s, 52.4% (16B gate/up: 2426 GB/s kernel-only). Per tile, derived
-  from the 671B kernel-only times over 3584 tiles on 152 CTAs after a ~5.7 us fixed floor
-  (the debug-model row less its glue): ~0.95 us, ~1150 cycles at 1200 MHz -- above both the
-  753-cycle HBM share of a 32 KB tile and the ~550 cycles of the 8-UMMA chain, so the row
-  warps' shared-memory pass (4 x 16-wide reads per thread) and the two-consumer stage
-  recycle are what to profile next; the design's 750-900-cycle forecast was not reached.
+  `torch.zeros` fills -- 9.0-11.4 us for CuteDSL and 9.7-12.8 us for Triton. At 671B gate/up,
+  `x (131072, 7168)`: CuteDSL `torch.mul(h128, sign[None, :])` 6.84 us (the int8 sign
+  operand puts it on ATen's casting `gpu_kernel_impl`) + two fills 4.58 us; Triton
+  `get_dynamic_rht_matrix` 5.06 us + its int8->bfloat16 copy 3.03 us + two fills 4.61 us.
+  Kernel-only (profiler self CUDA time of the main kernel), CuteDSL vs Triton: 44.66 vs
+  182.76 us at 16B gate/up (4.09x), 31.96 vs 125.13 us at 16B down (3.91x), 380.85 vs
+  1641.66 us at 671B gate/up (4.31x), 110.94 vs 474.71 us at 671B down (4.28x). The metric
+  excludes the 2.02-2.78 us `Memcpy DtoD` of the CuteDSL impl's
+  `logical_packed_length.clone()`, which the Triton op does not issue.
+- The op gates of the port plan were set at the earlier record's shapes, which are no longer
+  in the table: 16B `x (5632, 2048)` 18.59 us against <= 16 us -- over by 2.59 us (16.2%);
+  671B `x (8192, 7168)` 38.75 us against <= 32 us -- over by 6.75 us (21.1%). At both shapes
+  the kernel alone was under the gate (9.51 and 28.26 us) and the glue 8.9-10.4 us, 27-48%
+  of the op: the miss is the glue, the int8-sign `torch.mul` plus the two fills. At the
+  recipe token counts the same glue is 19% of the 16B gate/up op (10.5 of 55.2 us) and 3%
+  at 671B gate/up (11.4 of 392.3 us). Flipping the sign bits of the cached unsigned `H128`
+  in shared memory by the two idle warps would remove the `torch.mul`; the fills are the
+  Triton op's contract (zero-initialised outputs, atomic max).
+- At 671B gate/up the op reads 1879 MB at 4786.9 GB/s, 60.3% of the 7936 GB/s peak; the
+  kernel alone runs at 4934 GB/s, 62.2% (16B gate/up: 4508 GB/s kernel-only). Per tile,
+  derived from the 671B kernel-only times over 57344 and 16384 tiles on 152 CTAs after the
+  5.72 us fixed floor (the debug-model row less its glue): 0.97-0.99 us, ~1170-1190 cycles
+  at 1200 MHz -- above both the 753-cycle HBM share of a 32 KB tile and the ~550 cycles of
+  the 8-UMMA chain, so the row warps' shared-memory pass (4 x 16-wide reads per thread) and
+  the two-consumer stage recycle are what to profile next; the design's 750-900-cycle
+  forecast was not reached.
 - On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL kernel
   compiles and passes every single-backend test (oracle, in-place resample, padded rows); the
   Triton op does not compile there (`TritonNvidiaGPUOptimizeTMemLayoutsPass`, as in the
@@ -578,7 +601,7 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_amax
 ### group_row_cast_col_rht_quantize (`cutedsl_group_rht_quantize_row_col` vs `triton_group_rht_quantize_row_col`, `dynamic_rht=True`)
 
 The V2 forward activation quantize: one pass over the packed activation
-`x = (E * tokens, hidden)` emits both NVFP4 operands -- the raw rows of `x_g` and the columns
+`x = (E * tokens, dim)` emits both NVFP4 operands -- the raw rows of `x_g` and the columns
 of `x_g.t() @ R` (the 128-point randomized Hadamard transform along the tokens, live wgrad
 signs) -- as RTNE FP4 codes with E4M3 block scales against the group's two amaxes from
 `group_rht_amax`. The CuteDSL kernel is the amax kernel's mainloop (one TMA load per 128x128
@@ -599,37 +622,39 @@ the recipe default and the baseline table's rows.
 python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_quantize
 ```
 
-| model | projection | E | tokens | hidden | cutedsl_us | triton_us | speedup | cutedsl_gbps |
+| model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 12.69 | 14.89 | 1.17x | 64.6 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 12.56 | 15.00 | 1.19x | 65.2 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 21.17 | 31.07 | 1.47x | 1703.1 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 20.68 | 30.93 | 1.50x | 1742.7 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 64.10 | 113.33 | 1.77x | 2862.6 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 65.31 | 113.21 | 1.73x | 2809.6 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 12.70 | 14.90 | 1.17x | 64.5 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 12.56 | 14.99 | 1.19x | 65.2 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 2048 | 103.24 | 184.91 | 1.79x | 3046.9 |
+| 16B | down (w2) | 4 | 12288 | 1408 | 74.00 | 131.66 | 1.78x | 2922.6 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 7168 | 812.62 | 1602.74 | 1.97x | 3613.0 |
+| 671B | down (w2) | 4 | 32768 | 2048 | 242.88 | 466.62 | 1.92x | 3453.8 |
 
 - Op time includes the same torch glue on both backends -- the sign-to-matrix build, no
-  fills -- 5.2-6.4 us for CuteDSL (`torch.mul(h128, sign[None, :])`, the int8 sign operand on
-  ATen's casting `gpu_kernel_impl`) and 6.1-8.1 us for Triton (`get_dynamic_rht_matrix`
-  3.5-5.1 us plus its int8->bfloat16 copy 2.6-3.0 us). Kernel-only (profiler self CUDA time
-  of the main kernel), CuteDSL vs Triton: 15.98 vs 24.93 us at 16B gate/up (1.56x), 57.20 vs
-  105.53 us at 671B gate/up (1.84x), 58.86 vs 105.05 us at 671B down (1.78x). The metric
-  excludes the 2.01-2.05 us `Memcpy DtoD` of the CuteDSL impl's
-  `logical_packed_length.clone()`, which the Triton op does not issue.
-- The op gates of the port plan: 16B gate/up `x (5632, 2048)` 21.17 us against <= 21 us --
-  over by 0.17 us (0.8%); 16B down `x (8192, 1408)` 20.68 us -- under by 0.32 us; 671B
-  gate/up `x (8192, 7168)` 64.10 us against <= 55 us -- over by 9.10 us (16.5%); 671B down
+  fills -- 5.2-6.9 us for CuteDSL (`torch.mul(h128, sign[None, :])`, the int8 sign operand on
+  ATen's casting `gpu_kernel_impl`) and 5.9-8.3 us for Triton (`get_dynamic_rht_matrix`
+  3.5-5.2 us plus its int8->bfloat16 copy 2.4-3.2 us). Kernel-only (profiler self CUDA time
+  of the main kernel), CuteDSL vs Triton: 96.45 vs 176.43 us at 16B gate/up (1.83x), 67.40
+  vs 123.72 us at 16B down (1.84x), 805.70 vs 1595.22 us at 671B gate/up (1.98x), 235.59 vs
+  457.76 us at 671B down (1.94x). The metric excludes the 2.02-2.43 us `Memcpy DtoD` of the
+  CuteDSL impl's `logical_packed_length.clone()`, which the Triton op does not issue.
+- The op gates of the port plan were set at the earlier record's shapes, which are no longer
+  in the table: 16B gate/up `x (5632, 2048)` 21.17 us against <= 21 us -- over by 0.17 us
+  (0.8%); 16B down `x (8192, 1408)` 20.68 us -- under by 0.32 us; 671B gate/up
+  `x (8192, 7168)` 64.10 us against <= 55 us -- over by 9.10 us (16.5%); 671B down
   `x (28672, 2048)` 65.31 us -- over by 10.31 us (18.7%). At 16B the kernel alone (15.98 us)
-  is under the gate and the 5.2 us `torch.mul` is the miss; at 671B the kernel alone
-  (57.2-58.9 us) misses the gate by 4-7% on its own. Per tile, derived from the 671B
-  kernel-only times over 3584 tiles on 152 CTAs after a ~7.4 us floor (the debug-model row
-  less its glue): ~2.1 us, ~2500 cycles at 1200 MHz against the design's 1.2-1.5k forecast --
-  the epilogues bound the kernel (eight col warps quantizing four blocks per lane from
-  TMEM, eight row warps quantizing 4 x 16 elements per thread from shared memory), not the
-  8-UMMA chain or HBM; that is the next lever.
-- At 671B gate/up the op moves 183 MB (the bfloat16 read plus 1.125 bytes per element of
-  codes and scales) at 2863 GB/s, 36.1% of the 7936 GB/s peak; the kernel alone runs at
-  3208 GB/s, 40.4%.
+  was under the gate and the 5.2 us `torch.mul` the miss; at 671B the kernel alone
+  (57.2-58.9 us) missed the gate by 4-7% on its own. At the recipe token counts the glue is
+  1-9% of the op and the kernel-only ratio, 1.83-1.98x, is the table's. Per tile, derived
+  from the 671B kernel-only times over 57344 and 16384 tiles on 152 CTAs after the 7.64 us
+  floor (the debug-model row less its glue): ~2.1 us, ~2530 cycles at 1200 MHz (2560-2600 at
+  16B) against the design's 1.2-1.5k forecast -- the epilogues bound the kernel (eight col
+  warps quantizing four blocks per lane from TMEM, eight row warps quantizing 4 x 16 elements
+  per thread from shared memory), not the 8-UMMA chain or HBM; that is the next lever.
+- At 671B gate/up the op moves 2936 MB (the bfloat16 read plus 1.125 bytes per element of
+  codes and scales) at 3613 GB/s, 45.5% of the 7936 GB/s peak; the kernel alone runs at
+  3644 GB/s, 45.9%.
 - On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL kernel
   compiles and all four outputs stay bitwise equal to Triton 3.6.0's at the eleven smoke
   shapes, exact and fast, with both backends fed the CuteDSL amaxes (Triton 3.6.0 does not
@@ -648,12 +673,14 @@ The targets for the remaining ports: the five V2 ops (`row_cast_quantize`,
 `row_cast_col_rht_amax` / `_quantize` at RHT-128, `row_rht_col_rht_amax` /
 `_quantize_ms_eden`) and the four V1_REQUANT columnwise requantizers
 (`col_cast_requant_amax` / `_requantize`, `col_rht_requant_amax` / `_requantize`), one
-launch per kernel over the local expert stack at `E = 4`, fed the inputs the recipe
-builds: 128-aligned uniform token groups with cumulative row-end offsets for the
-token-jagged ops, the `(E, N, K)` weight stack for the expert-uniform ones, and the packed
-`row_fp4_w` / `row_sf_w` plus the matching `*_requant_amax` output for the requantizers.
-Tokens per expert equal the weight row count, as in `bench_group_rht_quantize_row_col`.
-The script that produced this table is not checked in; the table is the record.
+launch per kernel over the local expert stack at `E = 4`, fed the inputs the recipe builds: 128-aligned uniform token groups with cumulative row-end offsets
+for the token-jagged ops, the `(E, M, N)` weight stack for the expert-uniform ones, and the
+packed `row_fp4_w` / `row_sf_w` plus the matching `*_requant_amax` output for the
+requantizers. The weight rows are the record of a script that is not checked in. The
+activation rows (`x`, `dy`) were re-measured with the four checked-in activation benches
+at the recipe token counts of the methodology (medians of three passes, GPU 3, 1200 MHz
+local cap; Triton 3.6.0 in the C1 container of the same node); the earlier record for
+those rows used tokens per expert equal to the weight row count and square `dy` blocks.
 
 - Op time, not kernel-only time: the RHT-128 ops build their rotation matrix in torch
   (`get_dynamic_rht_matrix`, 6-9 us at this clock) and the amax ops zero-fill their output
@@ -664,12 +691,14 @@ The script that produced this table is not checked in; the table is the record.
   (`TritonNvidiaGPUOptimizeTMemLayoutsPass`: `parent layout must have at least rank >= 2`),
   so those two rows are Triton 3.8 only, and in the 3.6 column the quantizers downstream
   of them were fed amaxes computed in torch with the same RHT-128 chunking.
-- `row_cast_col_rht_quantize` runs with `use_fast_math=True`, the recipe default. Its
-  `rs` row at RHT-128 is synthetic: the recipe's stochastic-rounding path is the
-  V1_REQUANT backward at RHT-16.
+- `row_cast_col_rht_quantize` runs with `use_fast_math=True`, the recipe default. The
+  earlier record's synthetic `rs` rows for it (the recipe's stochastic-rounding path is the
+  V1_REQUANT backward at RHT-16) were dropped with the shape change: the checked-in bench
+  does not produce them and the CuteDSL op refuses stochastic rounding on this path.
 
-`w` is the weight `(E, N, K)`, `x` the packed activation `(E * tokens, K)` and `dy` the
-packed gradient `(E * tokens, N)`; `tokens` per expert equals `N`.
+`w` is the weight `(E, M, N)` -- `M` rows, `N` columns, the wrappers' vocabulary; the recipe
+calls the same stack `(E, N, K)` -- `x` the packed activation `(E * tokens, N)` and `dy`
+the packed gradient `(E * tokens, M)`, with the per-model `tokens` of the methodology.
 
 | model | projection | kernel | input | rounding | Triton 3.6.0 us | Triton 3.8.0 us | GB/s (3.8) | pct_peak (3.8) |
 |---|---|---|---|---|---:|---:|---:|---:|
@@ -678,46 +707,42 @@ packed gradient `(E * tokens, N)`; `tokens` per expert equals `N`.
 | 16B | gate/up (w1/w3) | col_cast_requantize | w (4, 1408, 2048) | rtne | 82.39 | 56.19 | 230.9 | 2.91 |
 | 16B | gate/up (w1/w3) | col_rht_requant_amax | w (4, 1408, 2048) | - | 25.93 | 25.82 | 251.3 | 3.17 |
 | 16B | gate/up (w1/w3) | col_rht_requantize | w (4, 1408, 2048) | rtne | 27.04 | 28.09 | 462.0 | 5.82 |
-| 16B | gate/up (w1/w3) | row_cast_col_rht_amax | x (5632, 2048) | - | n/a | 35.93 | 642.0 | 8.09 |
-| 16B | gate/up (w1/w3) | row_cast_col_rht_quantize | x (5632, 2048) | rtne | 33.07 | 30.74 | 1172.7 | 14.78 |
-| 16B | gate/up (w1/w3) | row_cast_col_rht_quantize | x (5632, 2048) | rs | 70.35 | 59.60 | 604.8 | 7.62 |
-| 16B | gate/up (w1/w3) | row_rht_col_rht_amax | dy (5632, 1408) | - | n/a | 35.59 | 445.6 | 5.61 |
-| 16B | gate/up (w1/w3) | row_rht_col_rht_quantize_ms_eden | dy (5632, 1408) | ms_eden | 50.54 | 51.39 | 482.2 | 6.08 |
+| 16B | gate/up (w1/w3) | row_cast_col_rht_amax | x (49152, 2048) | - | n/a | 194.21 | 1036.7 | 13.06 |
+| 16B | gate/up (w1/w3) | row_cast_col_rht_quantize | x (49152, 2048) | rtne | 210.76 | 184.91 | 1701.2 | 21.44 |
+| 16B | gate/up (w1/w3) | row_rht_col_rht_amax | dy (49152, 1408) | - | n/a | 163.76 | 845.2 | 10.65 |
+| 16B | gate/up (w1/w3) | row_rht_col_rht_quantize_ms_eden | dy (49152, 1408) | ms_eden | 309.63 | 289.51 | 747.0 | 9.41 |
 | 16B | down (w2) | row_cast_quantize | w (4, 2048, 1408) | rtne | 11.96 | 11.71 | 2523.1 | 31.79 |
 | 16B | down (w2) | col_cast_requant_amax | w (4, 2048, 1408) | - | 13.69 | 11.65 | 557.1 | 7.02 |
 | 16B | down (w2) | col_cast_requantize | w (4, 2048, 1408) | rtne | 82.26 | 56.13 | 231.2 | 2.91 |
 | 16B | down (w2) | col_rht_requant_amax | w (4, 2048, 1408) | - | 25.77 | 25.69 | 252.5 | 3.18 |
 | 16B | down (w2) | col_rht_requantize | w (4, 2048, 1408) | rtne | 26.91 | 28.10 | 461.8 | 5.82 |
-| 16B | down (w2) | row_cast_col_rht_amax | x (8192, 1408) | - | n/a | 35.90 | 642.6 | 8.10 |
-| 16B | down (w2) | row_cast_col_rht_quantize | x (8192, 1408) | rtne | 33.03 | 30.67 | 1175.2 | 14.81 |
-| 16B | down (w2) | row_cast_col_rht_quantize | x (8192, 1408) | rs | 70.65 | 59.60 | 604.8 | 7.62 |
-| 16B | down (w2) | row_rht_col_rht_amax | dy (8192, 2048) | - | n/a | 54.33 | 617.6 | 7.78 |
-| 16B | down (w2) | row_rht_col_rht_quantize_ms_eden | dy (8192, 2048) | ms_eden | 84.62 | 86.60 | 605.4 | 7.63 |
+| 16B | down (w2) | row_cast_col_rht_amax | x (49152, 1408) | - | n/a | 136.31 | 1015.4 | 12.79 |
+| 16B | down (w2) | row_cast_col_rht_quantize | x (49152, 1408) | rtne | 149.12 | 131.66 | 1642.7 | 20.70 |
+| 16B | down (w2) | row_rht_col_rht_amax | dy (49152, 2048) | - | n/a | 227.81 | 883.8 | 11.14 |
+| 16B | down (w2) | row_rht_col_rht_quantize_ms_eden | dy (49152, 2048) | ms_eden | 436.25 | 406.08 | 774.7 | 9.76 |
 | 671B | gate/up (w1/w3) | row_cast_quantize | w (4, 2048, 7168) | rtne | 54.84 | 52.21 | 2881.8 | 36.31 |
 | 671B | gate/up (w1/w3) | col_cast_requant_amax | w (4, 2048, 7168) | - | 47.56 | 38.19 | 865.0 | 10.90 |
 | 671B | gate/up (w1/w3) | col_cast_requantize | w (4, 2048, 7168) | rtne | 390.59 | 265.34 | 249.0 | 3.14 |
 | 671B | gate/up (w1/w3) | col_rht_requant_amax | w (4, 2048, 7168) | - | 77.86 | 79.42 | 415.9 | 5.24 |
 | 671B | gate/up (w1/w3) | col_rht_requantize | w (4, 2048, 7168) | rtne | 90.33 | 105.54 | 626.0 | 7.89 |
-| 671B | gate/up (w1/w3) | row_cast_col_rht_amax | x (8192, 7168) | - | n/a | 119.12 | 985.9 | 12.42 |
-| 671B | gate/up (w1/w3) | row_cast_col_rht_quantize | x (8192, 7168) | rtne | 128.54 | 112.92 | 1625.0 | 20.48 |
-| 671B | gate/up (w1/w3) | row_cast_col_rht_quantize | x (8192, 7168) | rs | 286.14 | 246.95 | 743.1 | 9.36 |
-| 671B | gate/up (w1/w3) | row_rht_col_rht_amax | dy (8192, 2048) | - | n/a | 54.45 | 616.3 | 7.77 |
-| 671B | gate/up (w1/w3) | row_rht_col_rht_quantize_ms_eden | dy (8192, 2048) | ms_eden | 84.60 | 86.66 | 605.0 | 7.62 |
+| 671B | gate/up (w1/w3) | row_cast_col_rht_amax | x (131072, 7168) | - | n/a | 1648.42 | 1139.9 | 14.36 |
+| 671B | gate/up (w1/w3) | row_cast_col_rht_quantize | x (131072, 7168) | rtne | 1866.77 | 1602.74 | 1831.9 | 23.08 |
+| 671B | gate/up (w1/w3) | row_rht_col_rht_amax | dy (131072, 2048) | - | n/a | 575.00 | 933.7 | 11.77 |
+| 671B | gate/up (w1/w3) | row_rht_col_rht_quantize_ms_eden | dy (131072, 2048) | ms_eden | 1114.48 | 1034.84 | 810.6 | 10.21 |
 | 671B | down (w2) | row_cast_quantize | w (4, 7168, 2048) | rtne | 54.99 | 52.35 | 2874.3 | 36.22 |
 | 671B | down (w2) | col_cast_requant_amax | w (4, 7168, 2048) | - | 47.59 | 38.18 | 865.2 | 10.90 |
 | 671B | down (w2) | col_cast_requantize | w (4, 7168, 2048) | rtne | 390.08 | 266.77 | 247.6 | 3.12 |
 | 671B | down (w2) | col_rht_requant_amax | w (4, 7168, 2048) | - | 77.92 | 79.40 | 416.0 | 5.24 |
 | 671B | down (w2) | col_rht_requantize | w (4, 7168, 2048) | rtne | 90.54 | 106.01 | 623.2 | 7.85 |
-| 671B | down (w2) | row_cast_col_rht_amax | x (28672, 2048) | - | n/a | 119.37 | 983.8 | 12.40 |
-| 671B | down (w2) | row_cast_col_rht_quantize | x (28672, 2048) | rtne | 127.63 | 112.59 | 1629.9 | 20.54 |
-| 671B | down (w2) | row_cast_col_rht_quantize | x (28672, 2048) | rs | 284.94 | 248.34 | 738.9 | 9.31 |
-| 671B | down (w2) | row_rht_col_rht_amax | dy (28672, 7168) | - | n/a | 440.12 | 933.9 | 11.77 |
-| 671B | down (w2) | row_rht_col_rht_quantize_ms_eden | dy (28672, 7168) | ms_eden | 865.93 | 801.36 | 801.5 | 10.10 |
+| 671B | down (w2) | row_cast_col_rht_amax | x (131072, 2048) | - | n/a | 485.77 | 1105.2 | 13.93 |
+| 671B | down (w2) | row_cast_col_rht_quantize | x (131072, 2048) | rtne | 537.75 | 466.62 | 1797.7 | 22.65 |
+| 671B | down (w2) | row_rht_col_rht_amax | dy (131072, 7168) | - | n/a | 1935.77 | 970.7 | 12.23 |
+| 671B | down (w2) | row_rht_col_rht_quantize_ms_eden | dy (131072, 7168) | ms_eden | 3868.53 | 3564.01 | 823.8 | 10.38 |
 
 `row_cast_quantize` is the only one of the nine near bandwidth (31-36% of peak; the
 CuteDSL port above reaches 59%). The no-transform `col_cast_requantize` runs 3-4x slower
 than its RHT twin `col_rht_requantize` at 2-3% of peak: the compiled kernel holds 254
 registers and 64 KB of shared memory and materialises its 128x128 tile three times (once
 per layout conversion), so it is neither memory- nor occupancy-bound; that is the largest
-headroom of the nine. The RHT-128 activation and gradient kernels sit at 8-20% of peak,
-with 6-9 us of each op spent building the rotation matrix in torch.
+headroom of the nine. The RHT-128 activation and gradient kernels sit at 9-23% of peak,
+with 6-9 us of each op spent building each rotation matrix in torch.

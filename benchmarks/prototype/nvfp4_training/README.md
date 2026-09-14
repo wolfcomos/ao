@@ -297,6 +297,8 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_quantize_2d
 The debug model is 256x256 at `E = 4` — sixteen 128x128 tiles, which cannot fill the
 GPU. CuteDSL loses there because its persistent CLC scheduler has nothing to amortize;
 that is the expected shape of the curve, not a regression.
+Both benches build the activation as `(E * M, N)` with `M` the weight row count, 4.6-16x
+below the recipe's per-expert token counts in `deepseek_v3_shapes.py`.
 
 #### Grouped Hadamard Amax (`cutedsl_group_rht_amax` vs `triton_group_rht_amax`)
 
