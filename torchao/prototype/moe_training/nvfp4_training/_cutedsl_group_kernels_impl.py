@@ -68,8 +68,10 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_fake_tensor
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import blackwell_helpers as sm100_utils
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
@@ -89,7 +91,6 @@ from ._cutedsl_kernels_impl import (
     _bf16round_f32x8,
     _cvt_e2m1x8_to_f32,
     _cvt_rn_e2m1x8_f32,
-    _dequant_e2m1x8_bf16x2x4,
     _div_full_f32,
     _div_rn_f32,
     _e4m3x2_to_f16x2,
@@ -101,6 +102,7 @@ from ._cutedsl_kernels_impl import (
     _max_f32,
     _min_f32,
     _mul_clamp_f32x8,
+    _pack16_rn_from_enc,
     _quant16,
     _rcp_rn_f32,
     _round_rht_amax,
@@ -2395,11 +2397,12 @@ def _dot16_tree_rn(a, b):
     return even + odd
 
 
-def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec):
-    """``_enc_from_amax`` at the MS-EDEN ceiling, returning the stored E4M3 scale widened to
-    f32 (the correction multiplies that value, not the byte). ``rcp.rn`` is the same
-    correctly rounded reciprocal as ``div.rn`` without the division's slow-path fixups."""
-    pvscale = _min_f32(amax * enc_over_fp4max, cutlass.Float32(EDEN_BLOCK_SCALE_MAX))
+def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec, cap):
+    """``_enc_from_amax`` at the ceiling ``cap`` (the MS-EDEN one or ``FP8_E4M3_MAX``),
+    returning the stored E4M3 scale as its byte and widened to f32 (the MS-EDEN correction
+    multiplies that value, not the byte). ``rcp.rn`` is the same correctly rounded
+    reciprocal as ``div.rn`` without the division's slow-path fixups."""
+    pvscale = _min_f32(amax * enc_over_fp4max, cap)
     pv_f32 = cute.make_rmem_tensor((4,), cutlass.Float32)
     for i in range(4):
         pv_f32[i] = pvscale
@@ -2409,7 +2412,7 @@ def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec):
     pv_back.store(pv_f8.load().to(cutlass.Float32))
     sf8 = pv_back[0]
     enc = _min_f32(_rcp_rn_f32(sf8 * dec), cutlass.Float32(FP32_MAX))
-    return enc, sf8
+    return enc, pv_f8[0], sf8
 
 
 def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
@@ -2437,7 +2440,9 @@ def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
         vals[15],
         zero,
     )
-    enc, sf8 = _ms_eden_enc_from_amax(_abs_amax16(e), enc_over_fp4max, dec)
+    enc, _, sf8 = _ms_eden_enc_from_amax(
+        _abs_amax16(e), enc_over_fp4max, dec, cutlass.Float32(EDEN_BLOCK_SCALE_MAX)
+    )
     v = _mul_clamp_f32x8(*e[0:8], enc) + _mul_clamp_f32x8(*e[8:16], enc)
     w0 = _cvt_rn_e2m1x8_f32(*v[0:8])
     w1 = _cvt_rn_e2m1x8_f32(*v[8:16])
@@ -3197,6 +3202,10 @@ RHT128_COLRHT_PROD_THREADS = 32 * (
 RHT128_COLRHT_EPI_WARPS = RHT128_COLRHT_EPI_WARP_END - RHT128_COLRHT_EPI_WARP_BEGIN
 RHT128_COLRHT_A_STAGE_BYTES = RHT128_DIM * RHT128_DIM * 2
 RHT128_COLRHT_ACC_ZERO_BAR = 3
+# The producers stage each tile's codes and scale words in shared memory through
+# ``cp.async``, ``RHT128_COLRHT_LOAD_STAGES - 1`` tiles ahead of the decode.
+RHT128_COLRHT_LOAD_STAGES = 4
+RHT128_COLRHT_LOAD_TILE_BYTES = RHT128_COLRHT_PROD_THREADS * (32 + 4)
 # The requantize class runs eight epilogue warps (1-8), two per TMEM quadrant, each
 # taking four of its lanes' eight blocks -- the MS-EDEN class's layout, for the same
 # reason: a lane's RTNE block chain is latency-bound with one warp per scheduler.
@@ -3220,14 +3229,45 @@ def _rht128_colrht_tile(t, tiles_per_expert, tiles_n):
     return e, pid_m, pid_n
 
 
+@dsl_user_op
+def _cp_async_16(dst: cutlass.Uint32, src: cutlass.Int64, *, loc=None, ip=None):
+    """One 16-byte ``cp.async`` (L2-cached, L1-bypassing) from global byte address
+    ``src`` to shared byte address ``dst``, both 16-byte aligned; joins the thread's
+    open commit group."""
+    llvm.inline_asm(
+        None,
+        [dst.ir_value(loc=loc, ip=ip), src.ir_value(loc=loc, ip=ip)],
+        "cp.async.cg.shared.global [$0], [$1], 16;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _cp_async_4(dst: cutlass.Uint32, src: cutlass.Int64, *, loc=None, ip=None):
+    """One 4-byte ``cp.async`` from global byte address ``src`` to shared byte address
+    ``dst``; joins the thread's open commit group."""
+    llvm.inline_asm(
+        None,
+        [dst.ir_value(loc=loc, ip=ip), src.ir_value(loc=loc, ip=ip)],
+        "cp.async.ca.shared.global [$0], [$1], 4;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def _rht128_colrht_prefetch(
-    mCodes, mSF, pre_lo, pre_hi, pre_sf, e, pid_m, pid_n, M, N, m, h
+    mCodes, mSF, dst_codes, dst_sf, e, pid_m, pid_n, M, N, m, h
 ):
-    """Load producer thread ``(m, h)``'s 32 B of codes and its scale word of tile
-    ``(e, pid_m, pid_n)`` into the prefetch registers: two 16 B loads from the code row
-    and one u32 of the swizzled scale atom ``2 * pid_n + h`` (row ``m``'s word is
-    ``(m % 32) * 4 + m // 32``). Plain function: traced inline by the producer, with
-    64-bit expert bases for the codes."""
+    """``cp.async`` producer thread ``(m, h)``'s 32 B of codes and its scale word of tile
+    ``(e, pid_m, pid_n)`` into its bytes of a staging slot (one commit group): two 16 B
+    copies from the code row and one u32 of the swizzled scale atom ``2 * pid_n + h``
+    (row ``m``'s word is ``(m % 32) * 4 + m // 32``). Plain function: traced inline by the
+    producer, with 64-bit expert bases."""
     word = (
         cutlass.Int64(e) * cutlass.Int64(M)
         + cutlass.Int64(pid_m * cutlass.Int32(RHT128_DIM) + m)
@@ -3235,45 +3275,132 @@ def _rht128_colrht_prefetch(
         pid_n * cutlass.Int32(16) + h * cutlass.Int32(8)
     )
     addr = mCodes.iterator.toint() + word * cutlass.Int64(4)
-    g_lo = cute.make_tensor(
-        cute.make_ptr(cutlass.Uint32, addr, cute.AddressSpace.gmem, assumed_align=16),
-        cute.make_layout((4,)),
-    )
-    g_hi = cute.make_tensor(
-        cute.make_ptr(
-            cutlass.Uint32,
-            addr + cutlass.Int64(16),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        cute.make_layout((4,)),
-    )
-    pre_lo.store(g_lo.load())
-    pre_hi.store(g_hi.load())
+    _cp_async_16(dst_codes, addr)
+    _cp_async_16(dst_codes + cutlass.Uint32(16), addr + cutlass.Int64(16))
     atom = (
         cutlass.Int64(e) * cutlass.Int64(M // cutlass.Int32(RHT128_DIM))
         + cutlass.Int64(pid_m)
     ) * cutlass.Int64(N // cutlass.Int32(64)) + cutlass.Int64(
         pid_n * cutlass.Int32(2) + h
     )
-    # Scale words are indexed in 32 bits as in ``_store_grouped_col_sf_u32``: the flat
-    # buffer holds E * M * N / 64 words, Int32 for any stack under 2^37 elements.
-    pre_sf[0] = mSF[
-        cutlass.Int32(atom * cutlass.Int64(128))
-        + (m % cutlass.Int32(32)) * cutlass.Int32(4)
-        + m // cutlass.Int32(32)
-    ]
+    _cp_async_4(
+        dst_sf,
+        mSF.iterator.toint()
+        + (
+            atom * cutlass.Int64(128)
+            + cutlass.Int64(
+                (m % cutlass.Int32(32)) * cutlass.Int32(4) + m // cutlass.Int32(32)
+            )
+        )
+        * cutlass.Int64(4),
+    )
+    cute.arch.cp_async_commit_group()
 
 
-def _rht128_colrht_put_word(word, sf, gds_m, valid, zero_m, st4, off):
+def _rht128_colrht_next_tile(e, pid_m, pid_n, tiles_m, tiles_n, more):
+    """``(e, pid_m, pid_n)`` of the next tile (``pid_n`` fastest, expert-major), or the
+    same tile when ``more`` is false: loads past a chunk's last tile re-load it rather
+    than branching."""
+    pn = pid_n + cutlass.Int32(1)
+    wrap_n = pn == tiles_n
+    pn = cutlass.Int32(cutlass.select_(wrap_n, cutlass.Int32(0), pn))
+    pm = pid_m + cutlass.Int32(
+        cutlass.select_(wrap_n, cutlass.Int32(1), cutlass.Int32(0))
+    )
+    wrap_m = pm == tiles_m
+    pm = cutlass.Int32(cutlass.select_(wrap_m, cutlass.Int32(0), pm))
+    en = e + cutlass.Int32(cutlass.select_(wrap_m, cutlass.Int32(1), cutlass.Int32(0)))
+    return (
+        cutlass.Int32(cutlass.select_(more, en, e)),
+        cutlass.Int32(cutlass.select_(more, pm, pid_m)),
+        cutlass.Int32(cutlass.select_(more, pn, pid_n)),
+    )
+
+
+@dsl_user_op
+def _rht128_colrht_dequant_word(
+    word: cutlass.Uint32,
+    sf: cutlass.Float32,
+    gds: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """``_dequant_e2m1x8_bf16x2x4`` with its sixteen ``mul.rn.f32`` as eight ``mul.f32x2``
+    (per lane the same correctly rounded product, as the epilogue's packs): exact e2m1
+    decode, the exact product by the block scale, the one rounding by the decode scale,
+    ``cvt.rn.bf16x2.f32``. Word k holds elements ``2k`` (low half) and ``2k + 1``."""
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [
+            word.ir_value(loc=loc, ip=ip),
+            sf.ir_value(loc=loc, ip=ip),
+            gds.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            ".reg .b32 p0, p1, p2, p3;\n"
+            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
+            ".reg .f32 q0, q1, q2, q3, q4, q5, q6, q7;\n"
+            ".reg .b64 s2, g2, r01, r23, r45, r67;\n"
+            "mov.b32 {b0, b1, b2, b3}, $4;\n"
+            "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
+            "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
+            "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
+            "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "mov.b32 {l0, h0}, p0;\n"
+            "mov.b32 {l1, h1}, p1;\n"
+            "mov.b32 {l2, h2}, p2;\n"
+            "mov.b32 {l3, h3}, p3;\n"
+            "cvt.f32.f16 q0, l0;\n"
+            "cvt.f32.f16 q1, h0;\n"
+            "cvt.f32.f16 q2, l1;\n"
+            "cvt.f32.f16 q3, h1;\n"
+            "cvt.f32.f16 q4, l2;\n"
+            "cvt.f32.f16 q5, h2;\n"
+            "cvt.f32.f16 q6, l3;\n"
+            "cvt.f32.f16 q7, h3;\n"
+            "mov.b64 s2, {$5, $5};\n"
+            "mov.b64 g2, {$6, $6};\n"
+            "mov.b64 r01, {q0, q1};\n"
+            "mov.b64 r23, {q2, q3};\n"
+            "mov.b64 r45, {q4, q5};\n"
+            "mov.b64 r67, {q6, q7};\n"
+            "mul.f32x2 r01, r01, s2;\n"
+            "mul.f32x2 r23, r23, s2;\n"
+            "mul.f32x2 r45, r45, s2;\n"
+            "mul.f32x2 r67, r67, s2;\n"
+            "mul.f32x2 r01, r01, g2;\n"
+            "mul.f32x2 r23, r23, g2;\n"
+            "mul.f32x2 r45, r45, g2;\n"
+            "mul.f32x2 r67, r67, g2;\n"
+            "mov.b64 {q0, q1}, r01;\n"
+            "mov.b64 {q2, q3}, r23;\n"
+            "mov.b64 {q4, q5}, r45;\n"
+            "mov.b64 {q6, q7}, r67;\n"
+            "cvt.rn.bf16x2.f32 $0, q1, q0;\n"
+            "cvt.rn.bf16x2.f32 $1, q3, q2;\n"
+            "cvt.rn.bf16x2.f32 $2, q5, q4;\n"
+            "cvt.rn.bf16x2.f32 $3, q7, q6;\n"
+            "}"
+        ),
+        "=r,=r,=r,=r,r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [k], loc=loc, ip=ip))
+        for k in range(4)
+    )
+
+
+def _rht128_colrht_put_word(word, sf, gds_m, st4, off):
     """Dequantize one code word (eight columns of the tile row) and store its four
-    bf16x2 words as one 16 B chunk at swizzled stage byte offset ``off``; an invalid
-    expert amax stores the sign-folded zero instead. Plain function, traced inline."""
-    v0, v1, v2, v3 = _dequant_e2m1x8_bf16x2x4(word, sf, gds_m)
-    st4[0] = cutlass.Uint32(cutlass.select_(valid, v0, zero_m))
-    st4[1] = cutlass.Uint32(cutlass.select_(valid, v1, zero_m))
-    st4[2] = cutlass.Uint32(cutlass.select_(valid, v2, zero_m))
-    st4[3] = cutlass.Uint32(cutlass.select_(valid, v3, zero_m))
+    bf16x2 words as one 16 B chunk at swizzled stage byte offset ``off``. Plain
+    function, traced inline."""
+    st4[0], st4[1], st4[2], st4[3] = _rht128_colrht_dequant_word(word, sf, gds_m)
     cute.make_tensor(
         cute.make_ptr(cutlass.Uint32, off, cute.AddressSpace.smem, assumed_align=16),
         cute.make_layout((4,)),
@@ -3287,6 +3414,7 @@ def _rht128_dequant_a_producer(
     amax_t,
     sign_t,
     a_base,
+    stg_base,
     ab_pipeline,
     t_begin,
     n_my,
@@ -3302,10 +3430,11 @@ def _rht128_dequant_a_producer(
     Thread ``p`` owns weight row ``m = p % 128`` (the contracted index) and half
     ``h = p // 128`` of its columns: code words ``8h .. 8h + 7`` (16 B each in the tile
     row) and the one u32 of scale atom ``2 * pid_n + h`` that holds their four E4M3
-    scales. The codes and scale word of the NEXT tile are loaded into registers one tile
-    ahead, so the DRAM round trip overlaps the current tile's decode.
+    scales. The codes and scale word of a tile are ``cp.async``-staged in shared memory
+    ``RHT128_COLRHT_LOAD_STAGES - 1`` tiles ahead (this thread's 36 B of each slot), so
+    the DRAM round trip overlaps several tiles' decode without rotating registers.
 
-    Numerics are the Triton reconstruction's, op for op (``_dequant_e2m1x8_bf16x2x4``),
+    Numerics are the Triton reconstruction's, op for op (``_rht128_colrht_dequant_word``),
     with the sign vector folded into the per-row decode scale ``gds_m = s_m * gds`` (an
     exact sign flip) and an invalid (NaN/inf) expert amax filling the row with the
     sign-folded zero ``s_m * (+0)``: every A element is Triton's times ``s_m``, so every
@@ -3314,9 +3443,8 @@ def _rht128_dequant_a_producer(
 
     Each code word becomes one 16 B store at the closed-form swizzled offset
     ``2048 * (m // 8) + 128 * (m % 8) + 1024 * h + 16 * (k ^ (m % 8))`` of a 1 KB-aligned
-    stage. The word loop is rolled two ways (four words per pass) to keep the body inside
-    the instruction cache; tile coordinates advance incrementally and the per-expert row
-    constants are refreshed only when the expert changes.
+    stage; tile coordinates advance incrementally and the per-expert row constants are
+    refreshed only when the expert changes.
     """
     m = p % cutlass.Int32(RHT128_DIM)
     h = p // cutlass.Int32(RHT128_DIM)
@@ -3331,53 +3459,55 @@ def _rht128_dequant_a_producer(
 
     pre_lo = cute.make_rmem_tensor((4,), cutlass.Uint32)
     pre_hi = cute.make_rmem_tensor((4,), cutlass.Uint32)
-    pre_sf = cute.make_rmem_tensor((1,), cutlass.Uint32)
     st4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
+    # This thread's bytes of a staging slot: 32 B of codes, then its scale word.
+    my_codes = stg_base + cutlass.Uint32(p) * cutlass.Uint32(32)
+    my_sf = (
+        stg_base
+        + cutlass.Uint32(RHT128_COLRHT_PROD_THREADS * 32)
+        + cutlass.Uint32(p) * cutlass.Uint32(4)
+    )
 
     ab_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Producer, RHT128_COLRHT_STAGES
     )
     tiles_m = tiles_per_expert // tiles_n
     # Tile coordinates advance incrementally (pid_n fastest, expert-major): the only
-    # integer divisions are the chunk's first tile's.
+    # integer divisions are the chunk's first tile's. The load coordinates run
+    # ``RHT128_COLRHT_LOAD_STAGES - 1`` tiles ahead of the decode's.
     e, pid_m, pid_n = _rht128_colrht_tile(t_begin, tiles_per_expert, tiles_n)
-    _rht128_colrht_prefetch(
-        mCodes, mSF, pre_lo, pre_hi, pre_sf, e, pid_m, pid_n, M, N, m, h
-    )
+    e_l = e
+    pm_l = pid_m
+    pn_l = pid_n
+    for d in cutlass.range_constexpr(RHT128_COLRHT_LOAD_STAGES - 1):
+        off_d = cutlass.Uint32(d * RHT128_COLRHT_LOAD_TILE_BYTES)
+        _rht128_colrht_prefetch(
+            mCodes, mSF, my_codes + off_d, my_sf + off_d, e_l, pm_l, pn_l, M, N, m, h
+        )
+        e_l, pm_l, pn_l = _rht128_colrht_next_tile(
+            e_l, pm_l, pn_l, tiles_m, tiles_n, cutlass.Int32(d + 1) < n_my
+        )
     neg = sign_t[m] < cutlass.Int8(0)
     # Per-expert row constants, refreshed on an expert change only.
     e_cur = cutlass.Int32(-1)
     valid = cutlass.Int32(0)
     gds_m = cutlass.Float32(0.0)
     zero_m = cutlass.Uint32(0)
+    # Slot loaded / decoded this iteration: a load reuses the slot decoded last time.
+    s_load = cutlass.Int32(RHT128_COLRHT_LOAD_STAGES - 1)
+    s_read = cutlass.Int32(0)
     for i in cutlass.range(n_my, unroll=1):
-        c0 = pre_lo[0]
-        c1 = pre_lo[1]
-        c2 = pre_lo[2]
-        c3 = pre_lo[3]
-        c4 = pre_hi[0]
-        c5 = pre_hi[1]
-        c6 = pre_hi[2]
-        c7 = pre_hi[3]
-        sfw = pre_sf[0]
-        # One tile ahead; the last tile re-loads itself rather than branching.
-        pn = pid_n + cutlass.Int32(1)
-        wrap_n = pn == tiles_n
-        pn = cutlass.Int32(cutlass.select_(wrap_n, cutlass.Int32(0), pn))
-        pm = pid_m + cutlass.Int32(
-            cutlass.select_(wrap_n, cutlass.Int32(1), cutlass.Int32(0))
-        )
-        wrap_m = pm == tiles_m
-        pm = cutlass.Int32(cutlass.select_(wrap_m, cutlass.Int32(0), pm))
-        en = e + cutlass.Int32(
-            cutlass.select_(wrap_m, cutlass.Int32(1), cutlass.Int32(0))
-        )
-        more = i + cutlass.Int32(1) < n_my
-        pn = cutlass.Int32(cutlass.select_(more, pn, pid_n))
-        pm = cutlass.Int32(cutlass.select_(more, pm, pid_m))
-        en = cutlass.Int32(cutlass.select_(more, en, e))
+        off_l = cutlass.Uint32(s_load) * cutlass.Uint32(RHT128_COLRHT_LOAD_TILE_BYTES)
         _rht128_colrht_prefetch(
-            mCodes, mSF, pre_lo, pre_hi, pre_sf, en, pm, pn, M, N, m, h
+            mCodes, mSF, my_codes + off_l, my_sf + off_l, e_l, pm_l, pn_l, M, N, m, h
+        )
+        e_l, pm_l, pn_l = _rht128_colrht_next_tile(
+            e_l,
+            pm_l,
+            pn_l,
+            tiles_m,
+            tiles_n,
+            i + cutlass.Int32(RHT128_COLRHT_LOAD_STAGES) < n_my,
         )
 
         if e != e_cur:
@@ -3393,63 +3523,95 @@ def _rht128_dequant_a_producer(
                 cutlass.select_(neg, cutlass.Uint32(0x80008000), cutlass.Uint32(0))
             )
             e_cur = e
-        valid_b = valid != cutlass.Int32(0)
+
+        # Tile i's copies have landed once only the newer groups may be pending.
+        cute.arch.cp_async_wait_group(RHT128_COLRHT_LOAD_STAGES - 1)
+        off_r = cutlass.Uint32(s_read) * cutlass.Uint32(RHT128_COLRHT_LOAD_TILE_BYTES)
+        pre_lo.store(
+            cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint32,
+                    my_codes + off_r,
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((4,)),
+            ).load()
+        )
+        pre_hi.store(
+            cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint32,
+                    my_codes + off_r + cutlass.Uint32(16),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((4,)),
+            ).load()
+        )
+        sfw = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Uint32, my_sf + off_r, cute.AddressSpace.smem, assumed_align=4
+            ),
+            cute.make_layout((1,)),
+        )[0]
+        c0 = pre_lo[0]
+        c1 = pre_lo[1]
+        c2 = pre_lo[2]
+        c3 = pre_lo[3]
+        c4 = pre_hi[0]
+        c5 = pre_hi[1]
+        c6 = pre_hi[2]
+        c7 = pre_hi[3]
 
         ab_pipeline.producer_acquire(ab_state)
         stage_off = row_off + ab_state.index * cutlass.Int32(
             RHT128_COLRHT_A_STAGE_BYTES
         )
-        for j in cutlass.range(2, unroll=1):
-            first = j == cutlass.Int32(0)
-            sfp = _e4m3x2_to_f16x2(
-                cutlass.Uint32(cutlass.select_(first, sfw, sfw >> cutlass.Uint32(16)))
-            )
-            sf_ab = _f16lo_to_f32(sfp)
-            sf_cd = _f16hi_to_f32(sfp)
-            k0 = j * cutlass.Int32(4)
-            _rht128_colrht_put_word(
-                cutlass.Uint32(cutlass.select_(first, c0, c4)),
-                sf_ab,
-                gds_m,
-                valid_b,
-                zero_m,
-                st4,
-                stage_off + cutlass.Int32(16) * (k0 ^ x),
-            )
-            _rht128_colrht_put_word(
-                cutlass.Uint32(cutlass.select_(first, c1, c5)),
-                sf_ab,
-                gds_m,
-                valid_b,
-                zero_m,
-                st4,
-                stage_off + cutlass.Int32(16) * ((k0 + cutlass.Int32(1)) ^ x),
-            )
-            _rht128_colrht_put_word(
-                cutlass.Uint32(cutlass.select_(first, c2, c6)),
-                sf_cd,
-                gds_m,
-                valid_b,
-                zero_m,
-                st4,
-                stage_off + cutlass.Int32(16) * ((k0 + cutlass.Int32(2)) ^ x),
-            )
-            _rht128_colrht_put_word(
-                cutlass.Uint32(cutlass.select_(first, c3, c7)),
-                sf_cd,
-                gds_m,
-                valid_b,
-                zero_m,
-                st4,
-                stage_off + cutlass.Int32(16) * ((k0 + cutlass.Int32(3)) ^ x),
-            )
+        if valid != cutlass.Int32(0):
+            for j in cutlass.range_constexpr(2):
+                sfp = _e4m3x2_to_f16x2(sfw >> cutlass.Uint32(16 * j))
+                sf_ab = _f16lo_to_f32(sfp)
+                sf_cd = _f16hi_to_f32(sfp)
+                words = (c0, c1, c2, c3) if j == 0 else (c4, c5, c6, c7)
+                for k in cutlass.range_constexpr(4):
+                    _rht128_colrht_put_word(
+                        words[k],
+                        sf_ab if k < 2 else sf_cd,
+                        gds_m,
+                        st4,
+                        stage_off + cutlass.Int32(16) * (cutlass.Int32(4 * j + k) ^ x),
+                    )
+        else:
+            # An invalid expert amax: the row is the sign-folded zero in every word.
+            for k in cutlass.range_constexpr(4):
+                st4[k] = zero_m
+            for k in cutlass.range_constexpr(8):
+                cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint32,
+                        stage_off + cutlass.Int32(16) * (cutlass.Int32(k) ^ x),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((4,)),
+                ).store(st4.load())
         # Generic-proxy stores -> visible to the UMMA (async proxy) before the arrive.
         cute.arch.fence_proxy("async.shared", space="cta")
         ab_pipeline.producer_commit(ab_state)
         ab_state.advance()
-        e = en
-        pid_m = pm
-        pid_n = pn
+        s_load = s_read
+        s_read = cutlass.Int32(
+            cutlass.select_(
+                s_read + cutlass.Int32(1) == cutlass.Int32(RHT128_COLRHT_LOAD_STAGES),
+                cutlass.Int32(0),
+                s_read + cutlass.Int32(1),
+            )
+        )
+        e, pid_m, pid_n = _rht128_colrht_next_tile(
+            e, pid_m, pid_n, tiles_m, tiles_n, i + cutlass.Int32(1) < n_my
+        )
+    cute.arch.cp_async_wait_group(0)
     ab_pipeline.producer_tail(ab_state)
 
 
@@ -3545,18 +3707,45 @@ def _rht128_tile_requantize(acc, tidx, u_base, enc_over_fp4max, dec, row_addr, r
     tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
     thr_copy = tiled_copy_t2r.get_slice(tidx)
     tTR_tAcc = thr_copy.partition_S(tAcc_epi)
-    tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
     rCodes = cute.make_rmem_tensor(
         (2 * RHT128_COLRHT_REQ_BLOCKS_PER_WARP,), cutlass.Uint32
     )
+    # The next block's TMEM load is in flight while this block's chain runs: ptxas
+    # serialises the loads otherwise (each chain's reciprocal slow path is a
+    # reconvergence region), and more than two live fragments spill around it.
+    tTR_rAcc = [
+        cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32) for _ in range(2)
+    ]
+    cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u_base)], tTR_rAcc[0])
+    zero = cutlass.Float32(0.0)
     for j in cutlass.range_constexpr(RHT128_COLRHT_REQ_BLOCKS_PER_WARP):
-        u = u_base + cutlass.Int32(j)
-        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
-        vals = tTR_rAcc.load().reshape((16,))
-        w0, w1, pvscale_fp8 = _quant16(vals, enc_over_fp4max, dec, rht_acc=True)
-        rCodes[2 * j] = w0
-        rCodes[2 * j + 1] = w1
-        rSF[j] = pvscale_fp8
+        if cutlass.const_expr(j + 1 < RHT128_COLRHT_REQ_BLOCKS_PER_WARP):
+            u = u_base + cutlass.Int32(j + 1)
+            cute.copy(
+                tiled_copy_t2r,
+                tTR_tAcc[(None, None, None, 0, u)],
+                tTR_rAcc[(j + 1) % 2],
+            )
+        vals = tTR_rAcc[j % 2].load().reshape((16,))
+        # The bf16-exact values serve both the block amax and the encode multiply, as
+        # in ``_ms_eden_block16``.
+        e = _bf16round_f32x8(
+            vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7], zero
+        ) + _bf16round_f32x8(
+            vals[8],
+            vals[9],
+            vals[10],
+            vals[11],
+            vals[12],
+            vals[13],
+            vals[14],
+            vals[15],
+            zero,
+        )
+        enc, rSF[j], _ = _ms_eden_enc_from_amax(
+            _abs_amax16(e), enc_over_fp4max, dec, cutlass.Float32(FP8_E4M3_MAX)
+        )
+        rCodes[2 * j], rCodes[2 * j + 1] = _pack16_rn_from_enc(e, enc)
     cute.arch.fence_view_async_tmem_load()
     _rht128_zero_acc(acc, tidx, u_base)
     cute.arch.fence_view_async_tmem_store()
@@ -3598,9 +3787,17 @@ def _rht128_colrht_requantize_epilogue(
     rSF = cute.make_rmem_tensor(
         (RHT128_COLRHT_REQ_BLOCKS_PER_WARP,), cutlass.Float8E4M3FN
     )
+    tiles_m = tiles_per_expert // tiles_n
+    # Tile coordinates advance incrementally and the expert's scale scalars are refreshed
+    # on an expert change only, as in the producer.
+    e, pid_m, pid_n = _rht128_colrht_tile(t_begin, tiles_per_expert, tiles_n)
+    e_cur = cutlass.Int32(-1)
+    dec = cutlass.Float32(0.0)
+    enc_over_fp4max = cutlass.Float32(0.0)
     for i in cutlass.range(t_end - t_begin, unroll=1):
-        e, pid_m, pid_n = _rht128_colrht_tile(t_begin + i, tiles_per_expert, tiles_n)
-        _, dec, enc_over_fp4max = _global_scale(amax_t[e])
+        if e != e_cur:
+            _, dec, enc_over_fp4max = _global_scale(amax_t[e])
+            e_cur = e
         n_glob = pid_n * cutlass.Int32(RHT128_DIM) + tidx
         row_addr = (
             codes_base
@@ -3629,6 +3826,9 @@ def _rht128_colrht_requantize_epilogue(
             n_glob,
             pid_m * cutlass.Int32(RHT128_DIM // 16) + u_base,
             m_blocks64,
+        )
+        e, pid_m, pid_n = _rht128_colrht_next_tile(
+            e, pid_m, pid_n, tiles_m, tiles_n, i + cutlass.Int32(1) < t_end - t_begin
         )
 
 
@@ -3821,6 +4021,12 @@ class _Tcgen05GroupColRhtRequantAmax:
         sBcol = smem.allocate_tensor(
             cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
         )
+        # Staging ring of the producers' codes and scale words (``cp.async`` targets).
+        raw_stg = smem.allocate_array(
+            cutlass.Uint32,
+            RHT128_COLRHT_LOAD_STAGES * RHT128_COLRHT_LOAD_TILE_BYTES // 4,
+            byte_alignment=16,
+        )
 
         cta_layout = cute.make_layout((1,))
         thr_col = tiled_mma_col.get_slice(0)
@@ -3912,6 +4118,7 @@ class _Tcgen05GroupColRhtRequantAmax:
                 mAmax,
                 mSign,
                 raw_a.toint(),
+                cutlass.Uint32(raw_stg.toint()),
                 ab_pipeline,
                 t_begin,
                 n_my,
@@ -4124,6 +4331,12 @@ class _Tcgen05GroupColRhtRequantize:
         sBcol = smem.allocate_tensor(
             cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
         )
+        # Staging ring of the producers' codes and scale words (``cp.async`` targets).
+        raw_stg = smem.allocate_array(
+            cutlass.Uint32,
+            RHT128_COLRHT_LOAD_STAGES * RHT128_COLRHT_LOAD_TILE_BYTES // 4,
+            byte_alignment=16,
+        )
 
         cta_layout = cute.make_layout((1,))
         thr_col = tiled_mma_col.get_slice(0)
@@ -4236,6 +4449,7 @@ class _Tcgen05GroupColRhtRequantize:
                 mAmax,
                 mSign,
                 raw_a.toint(),
+                cutlass.Uint32(raw_stg.toint()),
                 ab_pipeline,
                 t_begin,
                 n_my,
