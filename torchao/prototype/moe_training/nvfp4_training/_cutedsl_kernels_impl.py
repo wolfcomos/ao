@@ -3781,18 +3781,20 @@ def _cutedsl_group_col_cast_requant_amax_impl(
 # ---------------------------------------------------------------------------
 # Columnwise requantize of the packed rowwise weight (§11.7) -- CUDA-core SMEM transpose
 # ---------------------------------------------------------------------------
-# 128 threads per 128x128 tile: thread ``m`` rebuilds weight row ``m`` (64 B of codes as
-# four 16 B loads plus its two scale words) into a padded bf16 SMEM tile; after the
-# barrier thread ``t`` quantizes the two output rows ``2 * (t % 64)``, ``+ 1`` over
-# blocks ``4 * (t // 64) .. + 3``, reading the tile down its columns.
+# 128 threads per 128x128 tile: lane ``l`` of warp ``w`` rebuilds the 16 B piece
+# ``l // 8`` of weight rows ``32j + 8w + l % 8`` (four 16 B code loads plus one 16 B load
+# of the rows' scale words) into a padded bf16 SMEM tile; after the barrier thread ``t``
+# quantizes the four output rows ``4 * (t // 4) .. + 3`` over blocks ``2 * (t % 4)``,
+# ``+ 1``, reading the tile down its columns.
 REQUANTIZE_THREADS = M_TILE
 # Row pitch of the SMEM tile in u32 words: 128 bf16 columns are 64 words, padded to 68 so
-# the eight 16 B row stores of one store phase land on disjoint banks (68 % 32 == 4) and
-# a warp's 32 consecutive column words stay conflict-free.
+# the eight 16 B row stores of one store phase land on disjoint banks (68 % 32 == 4). The
+# words of row ``m`` are XOR-swizzled by ``16 * (m // 64) + (m // 32) % 2`` so the four
+# lanes that gather one column word from the four 32-row groups hit disjoint banks too.
 REQUANTIZE_PITCH_WORDS = M_TILE // 2 + 4
 # 34 KB of SMEM per CTA (no pipeline stages): the grid is sized for this many resident
-# CTAs per SM.
-REQUANTIZE_CTAS_PER_SM = 4
+# CTAs per SM, and the launch bound caps the registers so they all fit.
+REQUANTIZE_CTAS_PER_SM = 5
 
 
 class _Requantize:
@@ -3800,16 +3802,20 @@ class _Requantize:
 
     Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, y, e)`` walks the row blocks ``y, y + GRID_Y,
     ...`` of column tile ``cn`` of expert ``e``, so both per-expert scales are
-    loop-invariant. Per tile the CTA first rebuilds ``W_qdq`` row by row into SMEM --
-    thread ``m`` decodes its 16 code words with ``_dequant_e2m1x8_bf16x2x4`` (the Triton
-    reconstruction op for op, including the ``+0`` of a NaN / inf expert amax) and
-    stores each as one 16 B chunk of the padded row -- then, after the barrier, reads
-    the tile down its columns: thread ``t`` owns output rows ``n = 2 * (t % 64)``, ``+ 1``
-    (the low and high bf16 of one column word) and blocks ``4 * (t // 64) .. + 3`` along
-    ``m``, quantizes each 1x16 block with the plain ``_quant16`` (the values are already
-    bf16-exact, so no round-through) and stores the two 32 B code runs as ``st.global.v4``
-    and the four scale bytes per row in the §11.1 swizzle. No MMA: the transpose is a
-    plain SMEM gather, so ``-0`` codes survive as Triton's ``tl.trans`` keeps them.
+    loop-invariant. Per tile the CTA first rebuilds ``W_qdq`` into SMEM with a lane map
+    like ``_RequantAmax``'s (lane ``l`` of warp ``w`` owns 16 B piece ``l // 8`` of rows
+    ``32j + 8w + l % 8``: a warp's code load covers 8 rows x 64 B, its scale load the
+    rows' four consecutive words) -- each thread decodes its 16 code words with
+    ``_dequant_e2m1x8_bf16x2x4`` (the Triton reconstruction op for op, including the
+    ``+0`` of a NaN / inf expert amax) and stores each as one 16 B chunk of the padded
+    row -- then, after the barrier, reads the tile down its columns: thread ``t`` owns
+    output rows ``n = 4 * (t // 4) .. + 3`` (the low and high bf16 of two adjacent column
+    words) and blocks ``2 * (t % 4)``, ``+ 1`` along ``m``, quantizes each 1x16 block with
+    the plain ``_quant16`` (the values are already bf16-exact, so no round-through) and
+    stores each row's 16 B code run as ``st.global.v4`` -- the four lanes of a row fill
+    its 64 B -- and its two adjacent scale bytes of the §11.1 swizzle as one 16-bit store.
+    No MMA: the transpose is a plain SMEM gather, so ``-0`` codes survive as Triton's
+    ``tl.trans`` keeps them.
     """
 
     @cute.jit
@@ -3833,6 +3839,7 @@ class _Requantize:
             grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
             block=(REQUANTIZE_THREADS, 1, 1),
             stream=stream,
+            min_blocks_per_mp=REQUANTIZE_CTAS_PER_SM,
         )
 
     @cute.kernel
@@ -3858,167 +3865,188 @@ class _Requantize:
         tile_base = tile.toint()
         pitch_bytes = cutlass.Int32(4 * REQUANTIZE_PITCH_WORDS)
 
-        # --- producer: thread m rebuilds weight row m of the tile ---------------------
-        m = tidx
-        # Codes: row (e*M + rb*128 + m), bytes cn*64 .. +63 -- 16 B aligned because
-        # N % 128 == 0 makes the row pitch a multiple of 64 B. Scales: the two words
-        # (m % 32) * 4 + m // 32 of atoms (e*M//128 + rb) * (N//64) + 2*cn, +1 (the
-        # swizzle of the rowwise cast above), 512 B apart.
+        # --- producer: lane l of warp w rebuilds piece l // 8 of rows 32j + 8w + l % 8 --
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx % cutlass.Int32(32)
+        piece = lane // cutlass.Int32(8)  # 16 B piece of the 64 B row segment
+        row_lo = warp_idx * cutlass.Int32(8) + lane % cutlass.Int32(8)  # m % 32
+        # The two blocks of a piece are bytes 2*(p % 2), +1 of the row's scale word.
+        sf_shift = (piece % cutlass.Int32(2)) * cutlass.Uint32(16)
+        # Codes: row (e*M + rb*128 + 32j + row_lo), bytes cn*64 + 16*piece -- 16 B aligned
+        # because N % 128 == 0 makes the row pitch a multiple of 64 B. Scales: atom
+        # (e*M//128 + rb) * (N//64) + 2*cn + piece//2, words row_lo*4 .. +3 (= rows
+        # 32j + row_lo, j = 0..3; the swizzle of the rowwise cast above).
         row_bytes = cutlass.Int64(N // cutlass.Int32(2))
         row_block_bytes = row_bytes * cutlass.Int64(M_TILE)
+        row32_bytes = row_bytes * cutlass.Int64(32)
         sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
         codes_base = (
             mCodes.iterator.toint()
-            + cutlass.Int64(e * m_blocks * cutlass.Int32(M_TILE) + m) * row_bytes
-            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2))
+            + cutlass.Int64(e * m_blocks * cutlass.Int32(M_TILE) + row_lo) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2) + piece * cutlass.Int32(16))
         )
         sf_base = (
             mSF.iterator.toint()
             + cutlass.Int64(e * m_blocks) * cutlass.Int64(sf_rb_bytes)
             + cutlass.Int64(
-                cn * cutlass.Int32(2 * SF_BLK)
-                + (m % cutlass.Int32(32)) * cutlass.Int32(16)
-                + (m // cutlass.Int32(32)) * cutlass.Int32(4)
+                (cn * cutlass.Int32(2) + piece // cutlass.Int32(2))
+                * cutlass.Int32(SF_BLK)
+                + row_lo * cutlass.Int32(16)
             )
         )
-        row_off = tile_base + m * pitch_bytes
+        # Row 32j + row_lo, chunks 4*piece .. +3; word p of row m lives at word
+        # p ^ (16 * (m // 64) + (m // 32) % 2) -- the chunk moves by 64 B for the upper
+        # 64 rows and the words of a pair swap for odd 32-row groups (the swizzle the
+        # column gather below relies on).
+        row_off = tile_base + row_lo * pitch_bytes
         amax_e = amax_t[e]
         _, gds, _ = _global_scale(amax_e)
         # A NaN or inf global_amax reconstructs to +0, as Triton's tl.where does.
         valid = _abs_f32(amax_e) < cutlass.Float32(float("inf"))
         st4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
 
-        # --- epilogue: thread t quantizes output rows 2j, 2j+1 over blocks 4hb .. 4hb+3 --
-        j = tidx % cutlass.Int32(64)
-        hb = tidx // cutlass.Int32(64)
+        # --- epilogue: thread t quantizes output rows 4j .. 4j+3 over blocks 2q, 2q+1 ----
+        q = tidx % cutlass.Int32(4)
+        j = tidx // cutlass.Int32(4)
         _, dec, enc_over_fp4max = _global_scale(amax_out_t[e])
-        n_glob = cn * cutlass.Int32(M_TILE) + cutlass.Int32(2) * j
+        n_glob = cn * cutlass.Int32(M_TILE) + cutlass.Int32(4) * j
         out_row_bytes = cutlass.Int64(m_blocks * cutlass.Int32(M_TILE // 2))
-        # Output row n_glob of expert e, bytes rb*64 + hb*32 .. +31: 16 B aligned (64 B
-        # code rows). Row n_glob + 1 is one row pitch further.
+        # Output row n_glob of expert e, bytes rb*64 + q*16 .. +15: 16 B aligned (64 B
+        # code rows). Row n_glob + r is r row pitches further.
         out_base = (
             mColFP4.iterator.toint()
             + (cutlass.Int64(e) * cutlass.Int64(N) + cutlass.Int64(n_glob))
             * out_row_bytes
-            + cutlass.Int64(hb * cutlass.Int32(32))
+            + cutlass.Int64(q * cutlass.Int32(16))
         )
         # swizzled SF[r, c] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4] of the expert's
-        # (N//128, M//64, 32, 16) tile; here r = n_glob (+1 is the next 16 B line) and
-        # c = rb*8 + 4*hb + b, so the atom is 2*rb + hb and the byte within the row is b.
+        # (N//128, M//64, 32, 16) tile; here r = n_glob (+r is the r-th next 16 B line)
+        # and c = rb*8 + 2*q + h, so the atom is 2*rb + q//2 and the two bytes within the
+        # row are 2*(q%2), +1.
         sf_rows = m_blocks * cutlass.Int32(2 * SF_BLK)  # SF bytes per 128 rows
-        sf_out_base = (
+        sf_out_base = mColSF.iterator.toint() + cutlass.Int64(
             (e * (N // cutlass.Int32(M_TILE)) + cn) * sf_rows
-            + hb * cutlass.Int32(SF_BLK)
-            + ((cutlass.Int32(2) * j) % cutlass.Int32(32)) * cutlass.Int32(16)
-            + ((cutlass.Int32(2) * j) // cutlass.Int32(32)) * cutlass.Int32(4)
+            + (q // cutlass.Int32(2)) * cutlass.Int32(SF_BLK)
+            + ((cutlass.Int32(4) * j) % cutlass.Int32(32)) * cutlass.Int32(16)
+            + ((cutlass.Int32(4) * j) // cutlass.Int32(32)) * cutlass.Int32(4)
+            + (q % cutlass.Int32(2)) * cutlass.Int32(2)
         )
+        # Column words 2j, 2j+1 of rows 32q .. 32q+31 at their swizzled place: the pair
+        # at 8 B run (8j) ^ 64*(q//2), its two words swapped when q is odd.
         col_base = (
-            tile_base + hb * (pitch_bytes * cutlass.Int32(64)) + j * cutlass.Int32(4)
+            tile_base
+            + q * (pitch_bytes * cutlass.Int32(32))
+            + ((j * cutlass.Int32(8)) ^ ((q // cutlass.Int32(2)) * cutlass.Int32(64)))
         )
+        word_swap = (q % cutlass.Int32(2)) * cutlass.Int32(4)
         blk_lo = cute.make_rmem_tensor((16,), cutlass.Float32)
         blk_hi = cute.make_rmem_tensor((16,), cutlass.Float32)
-        codes_lo = cute.make_rmem_tensor((8,), cutlass.Uint32)
-        codes_hi = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        codes = cute.make_rmem_tensor((4, 4), cutlass.Uint32)
+        sfs = cute.make_rmem_tensor((8,), cutlass.Float8E4M3FN)
 
         for rb in cutlass.range(by, m_blocks, GRID_Y):
             tile_codes = codes_base + cutlass.Int64(rb) * row_block_bytes
-            tile_sf = sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes)
-            for h in cutlass.range_constexpr(2):
-                sfw = cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.Uint32,
-                        tile_sf + cutlass.Int64(h * SF_BLK),
-                        cute.AddressSpace.gmem,
-                        assumed_align=4,
-                    ),
-                    cute.make_layout((1,)),
-                )[0]
-                # 16 B piece 2h + k holds blocks 4h + 2k, +1: scale bytes 2k, 2k + 1.
-                for k in cutlass.range_constexpr(2):
-                    piece = cute.make_tensor(
+            rows = []
+            for jr in cutlass.range_constexpr(4):
+                codes_ptr = cute.make_ptr(
+                    cutlass.Uint32,
+                    tile_codes + cutlass.Int64(jr) * row32_bytes,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                rows.append(cute.make_tensor(codes_ptr, cute.make_layout((4,))).load())
+            sf_ptr = cute.make_ptr(
+                cutlass.Uint32,
+                sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            sf_words = cute.make_tensor(sf_ptr, cute.make_layout((4,))).load()
+            for jr in cutlass.range_constexpr(4):
+                sf2 = _e4m3x2_to_f16x2(sf_words[jr] >> sf_shift)
+                sf_even = _f16lo_to_f32(sf2)
+                sf_odd = _f16hi_to_f32(sf2)
+                # Chunk 4*piece + w of row 32jr + row_lo.
+                for w in cutlass.range_constexpr(4):
+                    v0, v1, v2, v3 = _dequant_e2m1x8_bf16x2x4(
+                        rows[jr][w], sf_even if w < 2 else sf_odd, gds
+                    )
+                    if jr % 2 == 1:
+                        v0, v1, v2, v3 = v1, v0, v3, v2
+                    st4[0] = cutlass.Uint32(
+                        cutlass.select_(valid, v0, cutlass.Uint32(0))
+                    )
+                    st4[1] = cutlass.Uint32(
+                        cutlass.select_(valid, v1, cutlass.Uint32(0))
+                    )
+                    st4[2] = cutlass.Uint32(
+                        cutlass.select_(valid, v2, cutlass.Uint32(0))
+                    )
+                    st4[3] = cutlass.Uint32(
+                        cutlass.select_(valid, v3, cutlass.Uint32(0))
+                    )
+                    cute.make_tensor(
                         cute.make_ptr(
                             cutlass.Uint32,
-                            tile_codes + cutlass.Int64(16 * (2 * h + k)),
-                            cute.AddressSpace.gmem,
+                            row_off
+                            + cutlass.Int32(32 * jr) * pitch_bytes
+                            + (
+                                (piece * cutlass.Int32(64) + cutlass.Int32(16 * w))
+                                ^ cutlass.Int32(64 * (jr // 2))
+                            ),
+                            cute.AddressSpace.smem,
                             assumed_align=16,
                         ),
                         cute.make_layout((4,)),
-                    ).load()
-                    sf2 = _e4m3x2_to_f16x2(sfw >> cutlass.Uint32(16 * k))
-                    sf_even = _f16lo_to_f32(sf2)
-                    sf_odd = _f16hi_to_f32(sf2)
-                    for w in cutlass.range_constexpr(4):  # code word q = 8h + 4k + w
-                        v0, v1, v2, v3 = _dequant_e2m1x8_bf16x2x4(
-                            piece[w], sf_even if w < 2 else sf_odd, gds
-                        )
-                        st4[0] = cutlass.Uint32(
-                            cutlass.select_(valid, v0, cutlass.Uint32(0))
-                        )
-                        st4[1] = cutlass.Uint32(
-                            cutlass.select_(valid, v1, cutlass.Uint32(0))
-                        )
-                        st4[2] = cutlass.Uint32(
-                            cutlass.select_(valid, v2, cutlass.Uint32(0))
-                        )
-                        st4[3] = cutlass.Uint32(
-                            cutlass.select_(valid, v3, cutlass.Uint32(0))
-                        )
-                        cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Uint32,
-                                row_off + cutlass.Int32(16 * (8 * h + 4 * k + w)),
-                                cute.AddressSpace.smem,
-                                assumed_align=16,
-                            ),
-                            cute.make_layout((4,)),
-                        ).store(st4.load())
+                    ).store(st4.load())
             cute.arch.sync_threads()
 
-            # Block 4hb + b: rows m = 16 * (4hb + b) .. + 15 down the thread's column word.
-            for b in cutlass.range_constexpr(4):
-                col = cute.make_tensor(
+            # Block 2q + h: rows m = 32q + 16h .. + 15 down column word 2j + a, whose low
+            # and high bf16 are output rows 4j + 2a, +1.
+            for h in cutlass.range_constexpr(2):
+                for a in cutlass.range_constexpr(2):
+                    col = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            col_base
+                            + cutlass.Int32(16 * h) * pitch_bytes
+                            + (word_swap if a == 0 else cutlass.Int32(4) - word_swap),
+                            cute.AddressSpace.smem,
+                            assumed_align=4,
+                        ),
+                        cute.make_layout((16,), stride=(REQUANTIZE_PITCH_WORDS,)),
+                    ).load()
+                    for i in cutlass.range_constexpr(16):
+                        blk_lo[i] = _bf16lo_to_f32(col[i])
+                        blk_hi[i] = _bf16hi_to_f32(col[i])
+                    w0, w1, sf_lo = _quant16(blk_lo, enc_over_fp4max, dec)
+                    codes[2 * a, 2 * h] = w0
+                    codes[2 * a, 2 * h + 1] = w1
+                    w0, w1, sf_hi = _quant16(blk_hi, enc_over_fp4max, dec)
+                    codes[2 * a + 1, 2 * h] = w0
+                    codes[2 * a + 1, 2 * h + 1] = w1
+                    sfs[4 * a + h] = sf_lo
+                    sfs[4 * a + 2 + h] = sf_hi
+            out = out_base + cutlass.Int64(rb) * cutlass.Int64(M_TILE // 2)
+            sf_out = sf_out_base + cutlass.Int64(rb * cutlass.Int32(2 * SF_BLK))
+            sf_pairs = cute.recast_tensor(sfs, cutlass.Uint16)
+            for r in cutlass.range_constexpr(4):
+                _st_global_v4_u32(
+                    out + cutlass.Int64(r) * out_row_bytes,
+                    codes[r, 0],
+                    codes[r, 1],
+                    codes[r, 2],
+                    codes[r, 3],
+                )
+                cute.make_tensor(
                     cute.make_ptr(
-                        cutlass.Uint32,
-                        col_base + cutlass.Int32(16 * b) * pitch_bytes,
-                        cute.AddressSpace.smem,
-                        assumed_align=4,
+                        cutlass.Uint16,
+                        sf_out + cutlass.Int64(16 * r),
+                        cute.AddressSpace.gmem,
+                        assumed_align=2,
                     ),
-                    cute.make_layout((16,), stride=(REQUANTIZE_PITCH_WORDS,)),
-                ).load()
-                for i in cutlass.range_constexpr(16):
-                    blk_lo[i] = _bf16lo_to_f32(col[i])
-                    blk_hi[i] = _bf16hi_to_f32(col[i])
-                w0, w1, sf_lo = _quant16(blk_lo, enc_over_fp4max, dec)
-                codes_lo[2 * b] = w0
-                codes_lo[2 * b + 1] = w1
-                w0, w1, sf_hi = _quant16(blk_hi, enc_over_fp4max, dec)
-                codes_hi[2 * b] = w0
-                codes_hi[2 * b + 1] = w1
-                sf_out = sf_out_base + rb * cutlass.Int32(2 * SF_BLK) + cutlass.Int32(b)
-                mColSF[sf_out] = sf_lo
-                mColSF[sf_out + cutlass.Int32(16)] = sf_hi
-            out_lo = out_base + cutlass.Int64(rb) * cutlass.Int64(M_TILE // 2)
-            out_hi = out_lo + out_row_bytes
-            _st_global_v4_u32(
-                out_lo, codes_lo[0], codes_lo[1], codes_lo[2], codes_lo[3]
-            )
-            _st_global_v4_u32(
-                out_lo + cutlass.Int64(16),
-                codes_lo[4],
-                codes_lo[5],
-                codes_lo[6],
-                codes_lo[7],
-            )
-            _st_global_v4_u32(
-                out_hi, codes_hi[0], codes_hi[1], codes_hi[2], codes_hi[3]
-            )
-            _st_global_v4_u32(
-                out_hi + cutlass.Int64(16),
-                codes_hi[4],
-                codes_hi[5],
-                codes_hi[6],
-                codes_hi[7],
-            )
+                    cute.make_layout((1,)),
+                )[0] = sf_pairs[r]
             # The tile is reused by the next row block once every column read is done.
             cute.arch.sync_threads()
 
