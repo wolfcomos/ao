@@ -316,7 +316,10 @@ def _assert_signs_agree_across_ranks(model: nn.Module) -> None:
 
 
 def _test_nvfp4_mlp_fsdp2_smoke(
-    distributed_env: DeviceMesh, *, recipe: NVFP4Recipe
+    distributed_env: DeviceMesh,
+    *,
+    recipe: NVFP4Recipe,
+    kernel_preference: KernelPreference = KernelPreference.TRITON,
 ) -> None:
     """FSDP2 without TP, driving the resample cadence the way a trainer must.
 
@@ -332,7 +335,14 @@ def _test_nvfp4_mlp_fsdp2_smoke(
     # V2 needs M, K and N all divisible by 128, against 16 for the V1 recipes.
     M, K, H = 512, 256, 512
 
-    model = NVFP4MLP(K, H, device=device, dtype=torch.bfloat16, recipe=recipe)
+    model = NVFP4MLP(
+        K,
+        H,
+        device=device,
+        dtype=torch.bfloat16,
+        kernel_preference=kernel_preference,
+        recipe=recipe,
+    )
     model = fully_shard(model, mesh=dp_mesh)
     optim = torch.optim.SGD(model.parameters(), lr=1e-2)
 
@@ -378,6 +388,26 @@ def _test_nvfp4_mlp_fsdp2_smoke(
 
 @pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
+@pytest.mark.parametrize(
+    "kernel_preference",
+    [
+        pytest.param(KernelPreference.TRITON, id="triton"),
+        pytest.param(
+            KernelPreference.CUTEDSL,
+            marks=pytest.mark.skipif(
+                not cutedsl_nvfp4_kernels_available(),
+                reason="requires SM100 + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl, apache-tvm-ffi)",
+            ),
+            id="cutedsl",
+        ),
+    ],
+)
 @pytest.mark.parametrize("recipe", [NVFP4Recipe.V1_REQUANT, NVFP4Recipe.V2])
-def test_nvfp4_mlp_fsdp2_smoke(distributed_env: DeviceMesh, recipe: NVFP4Recipe):
-    _test_nvfp4_mlp_fsdp2_smoke(distributed_env, recipe=recipe)
+def test_nvfp4_mlp_fsdp2_smoke(
+    distributed_env: DeviceMesh,
+    recipe: NVFP4Recipe,
+    kernel_preference: KernelPreference,
+):
+    _test_nvfp4_mlp_fsdp2_smoke(
+        distributed_env, recipe=recipe, kernel_preference=kernel_preference
+    )

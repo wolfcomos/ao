@@ -35,13 +35,24 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_cutedsl import (
+    cutedsl_group_col_cast_requant_amax,
+    cutedsl_group_col_cast_requantize,
+)
 from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_triton import (
     triton_group_col_cast_requant_amax,
     triton_group_col_cast_requantize,
 )
+from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_cutedsl import (
+    cutedsl_group_col_rht_requant_amax,
+    cutedsl_group_col_rht_requantize,
+)
 from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_triton import (
     triton_group_col_rht_requant_amax,
     triton_group_col_rht_requantize,
+)
+from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
+    cutedsl_group_rht_amax,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton import (
     triton_group_rht_amax,
@@ -49,14 +60,26 @@ from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton im
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     VARYING_FIRST_DIM,
 )
+from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
+    cutedsl_group_rht_quantize_row_col,
+)
 from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
     triton_group_rht_quantize_row_col,
+)
+from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
+    cutedsl_group_row_cast_quantize,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
     triton_group_row_cast_quantize,
 )
+from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_cutedsl import (
+    cutedsl_group_row_rht_col_rht_amax,
+)
 from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_triton import (
     triton_group_row_rht_col_rht_amax,
+)
+from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_cutedsl import (
+    cutedsl_group_row_rht_col_rht_quantize_ms_eden,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_triton import (
     triton_group_row_rht_col_rht_quantize_ms_eden,
@@ -64,11 +87,15 @@ from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantiz
 from torchao.prototype.moe_training.nvfp4_training.group_weight_amax_triton import (
     triton_group_weight_amax,
 )
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
+    _resolve_use_cutedsl,
+)
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
     EDEN_NUMERATOR,
     NVFP4_CAST_NUMERATOR,
     _amax_to_scale,
 )
+from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
 _ALIGNMENT = 128
 _SCALE_RECIPE = [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise]
@@ -133,7 +160,7 @@ def _check_shapes(M: int, K: int, N: int) -> None:
         )
 
 
-def _quantize_weight_rowwise(weight: torch.Tensor):
+def _quantize_weight_rowwise(weight: torch.Tensor, use_cutedsl: bool):
     """§11.1 at ``num_experts = 1``. Returns ``(row_fp4_w, row_sf_w, amax_w)``.
 
     All three are kept in their grouped ``(1, ...)`` form: the requantization ops in
@@ -142,7 +169,12 @@ def _quantize_weight_rowwise(weight: torch.Tensor):
     """
     weight_3d = weight.unsqueeze(0)
     amax_w = triton_group_weight_amax(weight_3d, 1)
-    row_fp4_w, row_sf_w = triton_group_row_cast_quantize(weight_3d, amax_w, 1)
+    group_row_cast_quantize = (
+        cutedsl_group_row_cast_quantize
+        if use_cutedsl
+        else triton_group_row_cast_quantize
+    )
+    row_fp4_w, row_sf_w = group_row_cast_quantize(weight_3d, amax_w, 1)
     return row_fp4_w, row_sf_w, amax_w
 
 
@@ -184,6 +216,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
         wgrad_rht: torch.Tensor,
         dgrad_rht: torch.Tensor,
         sr_seed: torch.Tensor,
+        use_cutedsl: bool = False,
         use_fast_math: bool = True,
     ):
         M = input_hp.shape[-2]
@@ -195,13 +228,21 @@ class _NVFP4LinearV2(torch.autograd.Function):
         input_2d = input_hp.reshape(-1, K).contiguous()
         M = input_2d.shape[0]
         offsets = _degenerate_group_args(M, str(input_2d.device))
+        group_rht_amax = (
+            cutedsl_group_rht_amax if use_cutedsl else triton_group_rht_amax
+        )
+        group_rht_quantize_row_col = (
+            cutedsl_group_rht_quantize_row_col
+            if use_cutedsl
+            else triton_group_rht_quantize_row_col
+        )
 
         # §11.8 then §11.9: amax first so the columnwise bound is taken post-RHT.
         # Same ops as V1_REQUANT below, driven at RHT-128 with a resampled sign
         # buffer instead of RHT-16 with a static tuple -- hence dynamic_rht, which
         # keeps the per-launch product out of get_rht_matrix's by-value cache.
         # Both operands are RTNE here: V2's stochastic rounding lives in MS-EDEN.
-        amax_rht_x_t, amax_x = triton_group_rht_amax(
+        amax_rht_x_t, amax_x = group_rht_amax(
             input_2d,
             [],
             offsets,
@@ -218,7 +259,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
             row_sf_x,
             col_fp4_rht_x_t,
             col_sf_rht_x_t,
-        ) = triton_group_rht_quantize_row_col(
+        ) = group_rht_quantize_row_col(
             input_2d,
             [],
             offsets,
@@ -236,7 +277,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
             dynamic_rht=True,
         )
 
-        row_fp4_w, row_sf_w, amax_w = _quantize_weight_rowwise(weight_hp)
+        row_fp4_w, row_sf_w, amax_w = _quantize_weight_rowwise(weight_hp, use_cutedsl)
 
         # §12. Both operands are plain casts, so both carry numerator 2688. This is
         # the one GEMM where the numerators match, which is why a numerator bug shows
@@ -266,6 +307,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
         )
         ctx.input_orig_shape = input_hp.shape
         ctx.has_bias = bias is not None
+        ctx.use_cutedsl = use_cutedsl
         ctx.use_fast_math = use_fast_math
         return output
 
@@ -287,10 +329,30 @@ class _NVFP4LinearV2(torch.autograd.Function):
         dy_2d = grad_output.reshape(-1, N)
         M = dy_2d.shape[0]
         offsets = _degenerate_group_args(M, str(dy_2d.device))
+        group_row_rht_col_rht_amax = (
+            cutedsl_group_row_rht_col_rht_amax
+            if ctx.use_cutedsl
+            else triton_group_row_rht_col_rht_amax
+        )
+        group_row_rht_col_rht_quantize_ms_eden = (
+            cutedsl_group_row_rht_col_rht_quantize_ms_eden
+            if ctx.use_cutedsl
+            else triton_group_row_rht_col_rht_quantize_ms_eden
+        )
+        group_col_rht_requant_amax = (
+            cutedsl_group_col_rht_requant_amax
+            if ctx.use_cutedsl
+            else triton_group_col_rht_requant_amax
+        )
+        group_col_rht_requantize = (
+            cutedsl_group_col_rht_requantize
+            if ctx.use_cutedsl
+            else triton_group_col_rht_requantize
+        )
 
         # §11.2 -> §11.3. dgrad_rht rotates the row axis, wgrad_rht the transposed
         # one; swapping them is silent and yields a wrong gradient.
-        amax_rht_dy, amax_rht_dy_t = triton_group_row_rht_col_rht_amax(
+        amax_rht_dy, amax_rht_dy_t = group_row_rht_col_rht_amax(
             dy_2d, dgrad_rht, wgrad_rht, offsets, 1, M, N, VARYING_FIRST_DIM, offsets
         )
         (
@@ -298,7 +360,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
             row_sf_rht_dy,
             col_fp4_rht_dy_t,
             col_sf_rht_dy_t,
-        ) = triton_group_row_rht_col_rht_quantize_ms_eden(
+        ) = group_row_rht_col_rht_quantize_ms_eden(
             dy_2d,
             amax_rht_dy,
             amax_rht_dy_t,
@@ -315,10 +377,10 @@ class _NVFP4LinearV2(torch.autograd.Function):
 
         # §11.4 -> §11.5: rebuild w.t() from the packed forward weight, rotated by
         # R_n so it cancels against dy's rotation in the dgrad GEMM.
-        amax_rht_w_qdq_t = triton_group_col_rht_requant_amax(
+        amax_rht_w_qdq_t = group_col_rht_requant_amax(
             row_fp4_w, row_sf_w, amax_w, dgrad_rht, 1
         )
-        col_fp4_rht_w_t, col_sf_rht_w_t = triton_group_col_rht_requantize(
+        col_fp4_rht_w_t, col_sf_rht_w_t = group_col_rht_requantize(
             row_fp4_w, row_sf_w, amax_w, amax_rht_w_qdq_t, dgrad_rht, 1
         )
 
@@ -349,8 +411,9 @@ class _NVFP4LinearV2(torch.autograd.Function):
             if ctx.has_bias
             else None
         )
-        # input_hp, weight_hp, bias, wgrad_rht, dgrad_rht, sr_seed, use_fast_math
-        return grad_input, grad_weight, grad_bias, None, None, None, None
+        # input_hp, weight_hp, bias, wgrad_rht, dgrad_rht, sr_seed, use_cutedsl,
+        # use_fast_math
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
 @torch._dynamo.allow_in_graph
@@ -376,6 +439,7 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         sign_vector: tuple,
         sr_seed: torch.Tensor,
+        use_cutedsl: bool = False,
         use_fast_math: bool = True,
     ):
         sign_vector = tuple(sign_vector)
@@ -389,8 +453,16 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         M = input_2d.shape[0]
         offsets = _degenerate_group_args(M, str(input_2d.device))
         sv = list(sign_vector)
+        group_rht_amax = (
+            cutedsl_group_rht_amax if use_cutedsl else triton_group_rht_amax
+        )
+        group_rht_quantize_row_col = (
+            cutedsl_group_rht_quantize_row_col
+            if use_cutedsl
+            else triton_group_rht_quantize_row_col
+        )
 
-        amax_rht_x_t, amax_x = triton_group_rht_amax(
+        amax_rht_x_t, amax_x = group_rht_amax(
             input_2d,
             sv,
             offsets,
@@ -405,7 +477,7 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
             row_sf_x,
             col_fp4_rht_x_t,
             col_sf_rht_x_t,
-        ) = triton_group_rht_quantize_row_col(
+        ) = group_rht_quantize_row_col(
             input_2d,
             sv,
             offsets,
@@ -421,7 +493,7 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
             use_fast_math,
         )
 
-        row_fp4_w, row_sf_w, amax_w = _quantize_weight_rowwise(weight_hp)
+        row_fp4_w, row_sf_w, amax_w = _quantize_weight_rowwise(weight_hp, use_cutedsl)
 
         output = _nvfp4_fp4_matmul(
             row_fp4_x,
@@ -447,6 +519,7 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         ctx.input_orig_shape = input_hp.shape
         ctx.has_bias = bias is not None
         ctx.sign_vector = sign_vector
+        ctx.use_cutedsl = use_cutedsl
         ctx.use_fast_math = use_fast_math
         return output
 
@@ -467,8 +540,26 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         M = dy_2d.shape[0]
         offsets = _degenerate_group_args(M, str(dy_2d.device))
         sv = list(ctx.sign_vector)
+        group_rht_amax = (
+            cutedsl_group_rht_amax if ctx.use_cutedsl else triton_group_rht_amax
+        )
+        group_rht_quantize_row_col = (
+            cutedsl_group_rht_quantize_row_col
+            if ctx.use_cutedsl
+            else triton_group_rht_quantize_row_col
+        )
+        group_col_cast_requant_amax = (
+            cutedsl_group_col_cast_requant_amax
+            if ctx.use_cutedsl
+            else triton_group_col_cast_requant_amax
+        )
+        group_col_cast_requantize = (
+            cutedsl_group_col_cast_requantize
+            if ctx.use_cutedsl
+            else triton_group_col_cast_requantize
+        )
 
-        amax_rht_dy_t, amax_dy = triton_group_rht_amax(
+        amax_rht_dy_t, amax_dy = group_rht_amax(
             dy_2d,
             sv,
             offsets,
@@ -483,7 +574,7 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
             row_sf_dy,
             col_fp4_rht_dy_t,
             col_sf_rht_dy_t,
-        ) = triton_group_rht_quantize_row_col(
+        ) = group_rht_quantize_row_col(
             dy_2d,
             sv,
             offsets,
@@ -500,10 +591,8 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         )
 
         # §11.6 -> §11.7: rebuild w.t() from the packed forward weight, unrotated.
-        amax_w_qdq_t = triton_group_col_cast_requant_amax(
-            row_fp4_w, row_sf_w, amax_w, 1
-        )
-        col_fp4_w_t, col_sf_w_t = triton_group_col_cast_requantize(
+        amax_w_qdq_t = group_col_cast_requant_amax(row_fp4_w, row_sf_w, amax_w, 1)
+        col_fp4_w_t, col_sf_w_t = group_col_cast_requantize(
             row_fp4_w, row_sf_w, amax_w, amax_w_qdq_t, 1
         )
 
@@ -533,8 +622,8 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
             if ctx.has_bias
             else None
         )
-        # input_hp, weight_hp, bias, sign_vector, sr_seed, use_fast_math
-        return grad_input, grad_weight, grad_bias, None, None, None
+        # input_hp, weight_hp, bias, sign_vector, sr_seed, use_cutedsl, use_fast_math
+        return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
 def nvfp4_linear_v2(
@@ -545,6 +634,7 @@ def nvfp4_linear_v2(
     wgrad_rht: torch.Tensor,
     dgrad_rht: torch.Tensor,
     sr_seed: torch.Tensor,
+    kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
 ) -> torch.Tensor:
     """``input @ weight.t() + bias`` under the V2 recipe.
@@ -556,13 +646,26 @@ def nvfp4_linear_v2(
         wgrad_rht: ``(128,)`` int8 sign buffer, resampled per accumulation microbatch.
         dgrad_rht: ``(128,)`` int8 sign buffer, resampled per optimizer step.
         sr_seed: one-element int64 CUDA tensor, the Philox key for MS-EDEN.
+        kernel_preference: Backend for the quantize and amax ops, AUTO (default),
+            TRITON, or CUTEDSL. AUTO takes CuteDSL when the runtime allows and falls
+            back to Triton otherwise; CUTEDSL is the same choice made loudly, raising
+            rather than falling back. The weight amax is Triton on every path -- it
+            has no CuteDSL twin.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
 
     Both sign buffers must be the module-owned tensors that
     ``resample_nvfp4_rht_signs`` updates in place, not fresh allocations.
     """
+    use_cutedsl = _resolve_use_cutedsl(kernel_preference)
     return _NVFP4LinearV2.apply(
-        input_hp, weight_hp, bias, wgrad_rht, dgrad_rht, sr_seed, use_fast_math
+        input_hp,
+        weight_hp,
+        bias,
+        wgrad_rht,
+        dgrad_rht,
+        sr_seed,
+        use_cutedsl,
+        use_fast_math,
     )
 
 
@@ -573,6 +676,7 @@ def nvfp4_linear_v1_requant(
     *,
     sign_vector,
     sr_seed: torch.Tensor,
+    kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
 ) -> torch.Tensor:
     """``input @ weight.t() + bias`` under the V1_REQUANT recipe.
@@ -584,8 +688,20 @@ def nvfp4_linear_v1_requant(
         sign_vector: static 16-element {-1, +1} tuple. Fixed for the whole run, so it
             resolves through the sign-keyed ``get_rht_matrix`` cache -- one entry.
         sr_seed: one-element int64 CUDA tensor, the Philox key for stochastic rounding.
+        kernel_preference: Backend for the quantize and amax ops, AUTO (default),
+            TRITON, or CUTEDSL. AUTO takes CuteDSL when the runtime allows and falls
+            back to Triton otherwise; CUTEDSL is the same choice made loudly, raising
+            rather than falling back. The weight amax is Triton on every path -- it
+            has no CuteDSL twin.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
     """
+    use_cutedsl = _resolve_use_cutedsl(kernel_preference)
     return _NVFP4LinearV1Requant.apply(
-        input_hp, weight_hp, bias, tuple(sign_vector), sr_seed, use_fast_math
+        input_hp,
+        weight_hp,
+        bias,
+        tuple(sign_vector),
+        sr_seed,
+        use_cutedsl,
+        use_fast_math,
     )

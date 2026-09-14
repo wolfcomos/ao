@@ -102,7 +102,7 @@ class NVFP4TrainingConfig(AOBaseConfig):
             produced before the other two existed.
 
             V1: RHT-16, stochastic rounding, 2D 16x16 weight quantize. The only
-                recipe with a tensor-parallel path and a CuteDSL backend.
+                recipe with a tensor-parallel path.
             V1_REQUANT: V1 with the 2D weight quantize replaced by a 1D 1x16
                 quantize plus lazy columnwise requantization in backward. Halves
                 the saved weight bytes and reaches forward/dgrad consistency by
@@ -115,16 +115,16 @@ class NVFP4TrainingConfig(AOBaseConfig):
                 initial draw, which is correct but forfeits the variance reduction
                 resampling buys.
 
-            V1_REQUANT and V2 are Triton-only and single-GPU only for now:
-            ``kernel_preference`` is ignored and ``process_group`` raises.
-        kernel_preference: Backend for quantization kernels. V1 only.
+            V1_REQUANT and V2 are single-GPU only for now: ``process_group`` raises.
+        kernel_preference: Backend for quantization kernels.
             AUTO: CuteDSL where its runtime allows, Triton otherwise. Both backends
                 accept the same shapes, on the tensor-parallel path as on the single-GPU
                 one, so the choice is availability alone and there is nothing for AUTO
                 to fall back on shape-wise.
             TRITON: Pure-Triton RHT + stochastic rounding path.
-            CUTEDSL: CuteDSL kernels for the full quantize path (amax, forward
-                RTNE quantize, SR backward quantize, and 2D weight quantize).
+            CUTEDSL: CuteDSL kernels for the full quantize path (every amax and
+                quantize op the recipe runs except the weight amax, which is Triton
+                on every path).
                 Requires SM100; in_features divisible by 128 and out_features
                 by 128. Under tensor parallel the same constraints apply to each
                 per-rank shard, and the per-rank M shard must be divisible by 128.
@@ -141,6 +141,9 @@ class NVFP4TrainingConfig(AOBaseConfig):
             grouped paths alike** -- both draw through ``philox4_all``. SR runs in the
             backward pass, so the same seed on a node without the CuteDSL runtime
             yields different gradients -- statistically equivalent, not bitwise equal.
+            That applies to V1 and V1_REQUANT, which round ``dy`` stochastically through
+            the RHT quantize; V2's MS-EDEN draws the same stream on both backends, so a
+            fixed RNG state gives bitwise-equal V2 gradients on either.
             Pin kernel_preference explicitly for runs that must reproduce bitwise
             across machines.
         process_group: Optional ProcessGroup for tensor-parallel TP.
@@ -277,6 +280,7 @@ class NVFP4Linear(nn.Linear):
                     wgrad_rht=self._rht_sign_vector,
                     dgrad_rht=self._dgrad_rht_sign_vector,
                     sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
                     use_fast_math=self.use_fast_math,
                 )
             return nvfp4_linear_v1_requant(
@@ -285,6 +289,7 @@ class NVFP4Linear(nn.Linear):
                 self.bias,
                 sign_vector=self.rht_sign_vector,
                 sr_seed=self._sr_seed,
+                kernel_preference=self.kernel_preference,
                 use_fast_math=self.use_fast_math,
             )
         if self.process_group is not None and self.kernel_preference in (
