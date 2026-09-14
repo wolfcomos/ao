@@ -405,14 +405,20 @@ emitted -- returns, per expert, `max|bf16(W_qdq)|`, the amax of the dequantized 
 transpose does not change the set of elements). The CuteDSL kernel is a streaming
 CUDA-core reduction with no MMA, TMA or pipeline SMEM: 128 threads per 128x128 tile read
 the 8 KB of codes as 16 B vectors and the two 512 B scale atoms as one 16 B word run per
-thread, take each 1x16 block's largest magnitude code with bit masks (never a per-nibble
-decode), multiply it by the block scale -- exact in f32 -- and reduce the exact products;
-the multiply by the per-expert decode scale and the one bfloat16 rounding happen once per
-CTA, which equals Triton's per-element rounding because `x -> bf16(x * dec)` is monotone
-on `x >= 0`. A NaN or inf expert amax reports 0.0 as Triton's does. The two backends
-produce bitwise identical amaxes (`torch.equal` at every shape below, with the tensor's
-own amax and an over-bounding one). Bandwidth counts the packed FP4 codes and swizzled
-scales read, 0.5625 bytes per weight element, plus the `(E,)` amax written.
+thread. A fast pass tests each 1x16 block for a magnitude-7 code (five ALU ops on the two
+code words) and keeps the packed-f16 max of the block scales of the tiles whose blocks
+all have one -- such a block's largest code is exactly 6.0, so its product is `6 * |sf|`
+and the max over such blocks is `6 * max |sf|` exactly; every block a normal e4m3 scale
+came from is one. A tile with a block lacking a 7 is dropped from that max and a warp
+vote sends the warp through a second, exact pass -- each block's largest magnitude code
+with bit masks (never a per-nibble decode) times its block scale, exact in f32 -- over
+every tile of the CTA (zero trips on quantizer-produced weights). The multiply by the
+per-expert decode scale and the one bfloat16 rounding happen once per CTA, which equals
+Triton's per-element rounding because `x -> bf16(x * dec)` is monotone on `x >= 0`.
+A NaN or inf expert amax reports 0.0 as Triton's does. The two backends produce bitwise
+identical amaxes (`torch.equal` at every shape below, with the tensor's own amax and an
+over-bounding one). Bandwidth counts the packed FP4 codes and swizzled scales read,
+0.5625 bytes per weight element, plus the `(E,)` amax written.
 
 ```bash
 python -m benchmarks.prototype.nvfp4_training.bench_group_col_cast_requant_amax
@@ -420,44 +426,51 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_col_cast_requant_amax
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 4.87 | 6.06 | 1.24x | 30.3 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 4.86 | 6.22 | 1.28x | 30.3 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 6.19 | 11.76 | 1.90x | 1048.7 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 6.17 | 11.72 | 1.90x | 1052.1 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 14.44 | 38.13 | 2.64x | 2287.2 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 14.24 | 38.12 | 2.68x | 2320.2 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 4.73 | 6.48 | 1.37x | 31.2 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 4.73 | 6.49 | 1.37x | 31.2 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 5.56 | 11.98 | 2.15x | 1166.5 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 5.53 | 11.93 | 2.16x | 1172.6 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 8.52 | 38.35 | 4.50x | 3875.4 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 8.21 | 38.35 | 4.67x | 4021.2 |
 
 - Op time includes the one `torch.zeros((E,))` fill both backends issue per call,
-  1.74-1.78 us (CuteDSL) and 1.74-1.77 us (Triton) at this clock; two device launches per
-  call on each side, no memcpy. Kernel-only (profiler self CUDA time of the main kernel),
-  CuteDSL vs Triton: 3.11 vs 4.39 us at the debug model (1.41x), 4.43 vs 10.04 us at 16B
-  gate/up (2.27x), 4.42 vs 10.01 us at 16B down (2.26x), 12.68 vs 36.41 us at 671B gate/up
-  (2.87x), 12.45 vs 36.39 us at 671B down (2.92x).
-- The port plan's gates (§1.6 / M1), op time <= 8 us at 16B: 6.19 / 6.17 us -- PASS (0.77x
-  of the budget); <= 12 us at 671B: 14.44 / 14.24 us -- FAIL, 2.44 / 2.24 us (1.20x /
-  1.19x) over. The fill is 12.1-12.4% of the 671B op and the kernel alone (12.68 / 12.45
-  us) is over the gate on its own by 0.68 / 0.45 us, so the miss is the fill plus a little
-  of the kernel; kernel-only is reported alongside as the plan asks.
-- At 671B the op reads 33.0 MB at 2287-2320 GB/s, 28.8-29.2% of the 7936 GB/s peak (the
-  kernel alone 2605-2653 GB/s, 32.8-33.4%); at 16B 6.49 MB at 1049-1052 GB/s (13.2-13.3%;
-  the kernel alone 1466 GB/s, 18.5%), where the fill (28% of the op) and the launch floor
-  dominate. Debug model to 16B to 671B the kernel scales 3.1 -> 4.4 -> 12.6 us for 0.15 ->
-  6.5 -> 33.0 MB: the debug row is the fixed floor and the incremental rate between the
-  two large rows is 3215-3306 GB/s (40.5-41.7% of peak).
+  1.78-1.98 us at this clock; two device launches per call on each side, no memcpy.
+  Kernel-only (op time less the fill), CuteDSL vs Triton: 2.93 vs 4.61 us at the debug
+  model (1.57x), 3.61 vs 10.03 us at 16B gate/up (2.78x), 3.58 vs 9.98 us at 16B down
+  (2.79x), 6.56 vs 36.38 us at 671B gate/up (5.55x), 6.28 vs 36.40 us at 671B down
+  (5.80x).
+- The port plan's gates (§1.6 / M1), op time <= 8 us at 16B: 5.56 / 5.53 us -- PASS; <= 12
+  us at 671B: 8.52 / 8.21 us -- PASS. Against the >= 3000 GB/s per-kernel target the 671B
+  rows pass at this clock (3875 / 4021 GB/s) and the 16B rows do not (1167 / 1173 GB/s):
+  6.49 MB against a 1.85 us launch floor plus the 1.78-1.98 us fill cannot meet the 2.16
+  us such a rate needs, at any SM clock.
+- At 671B the op reads 33.0 MB at 3875-4021 GB/s, 48.8-50.7% of the 7936 GB/s peak (the
+  kernel alone 5035-5260 GB/s, 63.4-66.3%; less its ~1.85 us launch floor it streams at
+  ~7.0-7.5 TB/s); at 16B 6.49 MB at 1167-1173 GB/s (14.7-14.8%; the kernel alone 1798-1813
+  GB/s), where the fill (35% of the op) and the launch floor dominate: one tile per CTA,
+  one exposed DRAM round trip. The fast pass is what moved the kernel from the ALU pipe
+  (the per-block nibble search) to the memory side; its time is input-dependent only for
+  bytes the quantizer never emits: a warp that meets a block without a magnitude-7 code
+  runs the exact pass over its CTA's tiles as well, uniform random code and scale bytes
+  cost 17.1-17.5 us at 671B and a 0.1 % mix of such blocks 16.6-16.9 us (still 2.2-2.3x
+  Triton). SM application clock 1200 MHz, as every table in this file.
 - On the CUDA 13.4 / nvidia-cutlass-dsl 4.6.0 / Triton 3.6.0 toolchain the CuteDSL column
-  is 0.99-1.01x of the values above (4.91 / 4.90 / 6.16 / 6.18 / 14.43 / 14.25 us, one
-  pass; REG 33 and the same 480 SASS on both DSLs) and Triton 3.6.0 is 1.04-1.25x slower
-  on this op (6.50 / 6.49 / 13.39 / 13.39 / 47.49 / 47.50 us, as the baseline table
-  records), so the twin is 1.32-3.33x there. The amaxes are bitwise equal to Triton
-  3.6.0's as well (`torch.equal` at every shape above and on the smoke sets).
+  is 0.95-1.01x of the values above (4.51 / 4.52 / 5.59 / 5.54 / 8.51 / 8.22 us, one pass;
+  REG 33 and the same SASS count on both DSLs) and Triton 3.6.0 is slower on this op (6.68
+  / 6.49 / 13.60 / 13.59 / 47.70 / 47.72 us), so the twin is 1.44-5.80x there. The amaxes
+  are bitwise equal to Triton 3.6.0's as well (`torch.equal` at every shape above and on
+  the smoke sets).
 - `cuobjdump -res-usage` of the compiled kernel: REG 33, STACK 0, SHARED 1024 (static; the
-  four-word warp-max scratch), LOCAL 0 at 128 threads. Its 480 SASS hold 5 `LDG.E.128` + 1
-  `LDG.E` (the four code pieces, the scale words, the expert amax), 9 `FMUL`, 7 `FMNMX`, 5
-  `SHFL`, one `STS` / `LDS.128` / `BAR.SYNC` (the cross-warp max) and no `LDL` / `STL`,
-  `HMMA` or `UTCHMMA`; the 22 `FFMA`, 3 `MUFU.RCP` + 1 `MUFU.RSQ`, 2 `FCHK` and 8 `.FTZ`
-  are the `div.rn` expansion of `_global_scale`, as Triton's `tl.div_rn`. A NaN scale byte
-  (0x7f / 0xff, which §11.1 never emits) is NaN in both backends with a different payload
-  (0x7fff0000 here, 0x7fc00000 in Triton).
+  four-word warp-max scratch), LOCAL 0 at 128 threads. Its 576 SASS hold 10 `LDG.E.128` +
+  1 `LDG.E` (the four code pieces and the scale words of each pass, the expert amax), 11
+  `FMUL`, 13 `FMNMX`-class and 3 packed `HMNMX2`/`VHMNMX.NAN` maxes, 5 `VIMNMX`-class
+  unsigned mins (the block tests), one `VOTE.ANY`, 5 `SHFL`, one `STS` / `LDS.128` /
+  `BAR.SYNC` (the cross-warp max) and no `LDL` / `STL`, `HMMA` or `UTCHMMA`; the fast-pass
+  loop (its branch target through its back-branch) is 86 instructions with all five loads
+  at its top and none predicated, the exact pass's loop 224; the 22 `FFMA`, 3 `MUFU.RCP` +
+  1 `MUFU.RSQ`, 2 `FCHK` and 8 `.FTZ` are the `div.rn` expansion of `_global_scale`, as
+  Triton's `tl.div_rn`. A NaN scale byte (0x7f / 0xff, which §11.1 never emits) is NaN in
+  both backends with a different payload (0x7fff0000 here, 0x7fc00000 in Triton).
 
 ### group_col_cast_requantize (`cutedsl_group_col_cast_requantize` vs `triton_group_col_cast_requantize`)
 

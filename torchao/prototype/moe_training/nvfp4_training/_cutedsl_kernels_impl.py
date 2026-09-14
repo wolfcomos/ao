@@ -812,6 +812,24 @@ def _f16hi_to_f32(p: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
 
 
 @dsl_user_op
+def _max_f16x2(
+    a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
+    """Packed f16x2 max of two ``f16x2`` words; NaN-propagating like ``_max_f32``."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "max.NaN.f16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _dequant_e2m1x8_bf16x2x4(
     word: cutlass.Uint32,
     sf: cutlass.Float32,
@@ -3497,7 +3515,8 @@ REQUANT_AMAX_WARPS = REQUANT_AMAX_THREADS // 32
 # Latency hiding comes from resident CTAs rather than in-thread unrolling: the kernel
 # holds few registers and no pipeline SMEM, so the grid is sized for this many CTAs per
 # SM (spread over the column-tile and expert grid dimensions).
-REQUANT_AMAX_CTAS_PER_SM = 16
+# The register file admits 12 resident CTAs; 8 keeps the grid to one wave.
+REQUANT_AMAX_CTAS_PER_SM = 8
 
 
 def _block_max_magnitude(w0, w1):
@@ -3543,6 +3562,41 @@ def _block_max_magnitude(w0, w1):
     return cutlass.Float32(cutlass.select_(any2, hi, lo))
 
 
+def _block_has_max_magnitude(w0, w1):
+    """Nonzero iff some nibble of the 1x16 block (code words ``w0``, ``w1``) has the
+    largest E2M1 magnitude field, 7 (= 6.0).
+
+    ``(w & 0x7777...) + 0x1111...`` carries into bit 3 of exactly those nibbles whose
+    three magnitude bits are all set (7 + 1 = 8; a nibble never carries out), so the
+    OR of the two words masked to the bit-3 positions is nonzero iff the block holds a
+    7. The sign bits (nibble bit 3) are masked off first and never enter.
+    """
+    m7 = cutlass.Uint32(0x77777777)
+    one = cutlass.Uint32(0x11111111)
+    b8 = cutlass.Uint32(0x88888888)
+    a0 = (w0 & m7) + one
+    a1 = (w1 & m7) + one
+    return (a0 | a1) & b8
+
+
+def _load_requant_tile(tile_codes, row32_bytes, tile_sf):
+    """A thread's share of one 128x128 tile: its four 16 B code pieces (rows
+    ``32j + row_lo``, each as four u32) and the one 16 B load of its four scale words."""
+    rows = []
+    for j in range(4):
+        codes_ptr = cute.make_ptr(
+            cutlass.Uint32,
+            tile_codes + cutlass.Int64(j) * row32_bytes,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        rows.append(cute.make_tensor(codes_ptr, cute.make_layout((4,))).load())
+    sf_ptr = cute.make_ptr(
+        cutlass.Uint32, tile_sf, cute.AddressSpace.gmem, assumed_align=16
+    )
+    return rows, cute.make_tensor(sf_ptr, cute.make_layout((4,))).load()
+
+
 class _RequantAmax:
     """Per-expert amax of the dequantized forward weight (§11.6), streaming.
 
@@ -3577,6 +3631,27 @@ class _RequantAmax:
       which the quantizer never emits) propagates to a NaN in both backends, with
       different payloads (``max.NaN``'s canonical NaN here, ``float("nan")`` in
       Triton).
+
+    Fast pass, then an exact pass only where needed (what makes it stream at the
+    memory floor instead of the ALU pipe):
+
+    * A block that holds a magnitude-7 nibble has ``q == 6.0`` exactly, so its
+      product is ``6 * |sf|`` and, ``6 * e4m3`` being exact and monotone in
+      ``|sf|``, ``max_b q_b * |sf_b| == 6 * max_b |sf_b|`` over any set of such
+      blocks. Every block whose scale is a normal e4m3 is such a block (the block
+      scale is ``RTNE_e4m3(amax_block * enc / 6)``, so the block amax lands in
+      ``[5.65, 6.4] * sf`` and rounds to 6.0), i.e. 100 % of real quantized weights.
+    * Pass 1 therefore only tests each block for a 7 (five ALU ops) and keeps the
+      f16x2 max of the thread's ``|sf|`` bytes -- but drops the whole tile from that
+      max when any of its blocks fails the test, and remembers the failure. No
+      per-block search, no branch: ptxas turns any per-tile branch here into
+      predicated straight-line code (measured on three formulations), which is why
+      the exact search is a separate loop.
+    * Pass 2 re-reads every tile of the CTA with the exact per-block search when a
+      warp vote says some lane dropped a tile. Max is idempotent, so re-reducing the
+      tiles that were fine is harmless; the dropped tiles are fully recovered. Zero
+      trips on real weights; a warp that meets a block without a 7 (an all-zero
+      block, hand-made bytes) costs pass 1 plus the old kernel (about +25 %).
     """
 
     @cute.jit
@@ -3649,36 +3724,68 @@ class _RequantAmax:
             )
         )
 
-        run_max = cutlass.Float32(0.0)
+        zero = cutlass.Uint32(0)
+        sf_mask = cutlass.Uint32(0x7F7F)  # the two e4m3 sign bits
+
+        # Pass 1: f16x2 max of |sf| over the tiles whose blocks all hold a 7; a tile
+        # with a block lacking one is dropped here and flagged for pass 2.
+        sf_max = cutlass.Uint32(0)  # f16x2 (0.0, 0.0)
+        tiles_ok = cutlass.Uint32(0xFFFFFFFF)  # min over tiles: 0 iff one was dropped
         for rb in cutlass.range(by, m_blocks, GRID_Y):
-            tile_codes = codes_base + cutlass.Int64(rb) * row_block_bytes
-            rows = []
-            for j in cutlass.range_constexpr(4):
-                codes_ptr = cute.make_ptr(
-                    cutlass.Uint32,
-                    tile_codes + cutlass.Int64(j) * row32_bytes,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                rows.append(cute.make_tensor(codes_ptr, cute.make_layout((4,))).load())
-            sf_ptr = cute.make_ptr(
-                cutlass.Uint32,
+            rows, sf_words = _load_requant_tile(
+                codes_base + cutlass.Int64(rb) * row_block_bytes,
+                row32_bytes,
                 sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
             )
-            sf_words = cute.make_tensor(sf_ptr, cute.make_layout((4,))).load()
+
+            # min over the eight blocks: 0 iff some block has no magnitude-7 nibble. The
+            # seed is the first block's test, never a constant: ``cutlass.min`` of a
+            # Python-side Uint32 constant and a dynamic value is emitted as a SIGNED min
+            # (``min(0xFFFFFFFF, x)`` -> ``min.s32(-1, x)`` = -1 for every x without bit
+            # 31), which would silently drop that block's test.
+            tile_ok = _block_has_max_magnitude(rows[0][0], rows[0][1])
+            tile_ok = cutlass.min(
+                tile_ok, _block_has_max_magnitude(rows[0][2], rows[0][3])
+            )
+            for j in cutlass.range_constexpr(1, 4):
+                tile_ok = cutlass.min(
+                    tile_ok, _block_has_max_magnitude(rows[j][0], rows[j][1])
+                )
+                tile_ok = cutlass.min(
+                    tile_ok, _block_has_max_magnitude(rows[j][2], rows[j][3])
+                )
+            m = _e4m3x2_to_f16x2((sf_words[0] >> sf_shift) & sf_mask)
+            for j in cutlass.range_constexpr(1, 4):
+                m = _max_f16x2(m, _e4m3x2_to_f16x2((sf_words[j] >> sf_shift) & sf_mask))
+            m = cutlass.Uint32(cutlass.select_(tile_ok != zero, m, zero))
+            sf_max = _max_f16x2(sf_max, m)
+            tiles_ok = cutlass.min(tiles_ok, tile_ok)
+
+        # Pass 2: the exact per-block search over every tile of the CTA, for warps
+        # in which some lane dropped a tile (zero trips otherwise).
+        rescan = cute.arch.vote_any_sync(tiles_ok == zero)
+        rb_start = cutlass.Int32(cutlass.select_(rescan, by, m_blocks))
+        run_max = cutlass.Float32(0.0)
+        for rb in cutlass.range(rb_start, m_blocks, GRID_Y):
+            rows, sf_words = _load_requant_tile(
+                codes_base + cutlass.Int64(rb) * row_block_bytes,
+                row32_bytes,
+                sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
+            )
 
             for j in cutlass.range_constexpr(4):
                 # |sf| for the piece's two blocks: e4m3 sign is bit 7 of each byte
                 # (NaN 0xff stays NaN as 0x7f).
-                sf2 = _e4m3x2_to_f16x2(
-                    (sf_words[j] >> sf_shift) & cutlass.Uint32(0x7F7F)
-                )
+                sf2 = _e4m3x2_to_f16x2((sf_words[j] >> sf_shift) & sf_mask)
                 q_even = _block_max_magnitude(rows[j][0], rows[j][1])
                 q_odd = _block_max_magnitude(rows[j][2], rows[j][3])
                 run_max = _max_f32(run_max, q_even * _f16lo_to_f32(sf2))  # exact
                 run_max = _max_f32(run_max, q_odd * _f16hi_to_f32(sf2))
+
+        # 6 * |sf| is exact (<= 3 + 2 significant bits) and monotone: the products
+        # of every block pass 1 kept, without forming them.
+        run_max = _max_f32(run_max, cutlass.Float32(6.0) * _f16lo_to_f32(sf_max))
+        run_max = _max_f32(run_max, cutlass.Float32(6.0) * _f16hi_to_f32(sf_max))
 
         for offset in range(5):
             run_max = _max_f32(

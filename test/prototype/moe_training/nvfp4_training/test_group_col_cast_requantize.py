@@ -493,3 +493,32 @@ def test_cutedsl_degenerate_experts_match_triton():
     assert_codes_bitwise(c_codes, t_codes, "codes")
     assert torch.equal(c_scales.view(torch.uint8), t_scales.view(torch.uint8))
     assert not c_codes[1:].any()
+
+
+@_needs_kernel
+@_skip_no_cutedsl
+@pytest.mark.parametrize("j", range(4), ids=lambda j: f"rows{32 * j}")
+@pytest.mark.parametrize("parity", [0, 1], ids=["even", "odd"])
+@torch.no_grad()
+def test_cutedsl_amax_tests_every_block_slot_of_a_thread(j, parity):
+    """Hand-made bytes: every nibble is the magnitude-7 code (q = 6) with unit scales,
+    except one block whose codes are magnitude 3 and whose scale byte is the largest
+    e4m3 (448) -- the block the kernel's fast pass would price as 6 * 448 instead of
+    3 * 448. It is placed in each of the eight block slots a thread owns (row group
+    ``j``, even / odd block of its 16 B piece), so each slot's test stands alone with no
+    other block able to mask a miss; the untouched expert pins the all-7 value."""
+    E, M, N = 2, 256, 256
+    codes = torch.full((E, M, N // 2), 0x77, dtype=torch.uint8, device="cuda")
+    sb = torch.full(
+        (E, M // 128, N // 64, 32, 16), 0x38, dtype=torch.uint8, device="cuda"
+    )
+    row = 32 * j + 8 * 2 + 7 // 4  # warp 2, lane 7 of the second row tile of expert 1
+    blk = 2 * (7 % 4) + parity
+    codes[1, 128 + row, blk * 8 : blk * 8 + 8] = 0x55
+    sb[1, 1, blk // 4, row % 32, (row // 32) * 4 + blk % 4] = 0x7E
+    scales = sb.view(torch.float8_e4m3fn)
+    amax = torch.full((E,), 2688.0, device="cuda")  # decode scale exactly 1
+    t_amax = _amax("triton", codes, scales, amax, E)
+    c_amax = _amax("cutedsl", codes, scales, amax, E)
+    assert torch.equal(c_amax, t_amax)
+    assert c_amax.tolist() == [6.0, 3.0 * 448.0]
