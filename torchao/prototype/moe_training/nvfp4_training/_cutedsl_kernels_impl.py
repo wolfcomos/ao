@@ -3295,7 +3295,6 @@ def _cutedsl_group_weight_quantize_2d_impl(
 # Rowwise 1x16 weight cast (no RHT, RTNE) -- plain CUDA-core streaming kernel
 # ---------------------------------------------------------------------------
 ROW_CAST_THREADS = 128  # 16 rows x 8 blocks of 16 columns per CTA step
-ROW_CAST_CTAS_PER_SM = 8  # resident CTAs per SM the y-grid is sized for
 
 
 class _RowCastQuantize:
@@ -3381,41 +3380,56 @@ class _RowCastQuantize:
             a_blk = a_base + cutlass.Int64(rb) * (row_bytes * cutlass.Int64(M_TILE))
             q_blk = q_base + cutlass.Int64(rb) * (code_pitch * cutlass.Int64(M_TILE))
             sf_blk = sf_base + rb * sf_rb_bytes
-            for s in cutlass.range_constexpr(M_TILE // 16):  # r_loc = 16*s + r_slab
-                a_addr = a_blk + cutlass.Int64(16 * s) * row_bytes
-                # Two 16-B vector loads = the 16 bf16 of one 1x16 block, as packed u32 pairs.
-                v0 = cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.Uint32, a_addr, cute.AddressSpace.gmem, assumed_align=16
-                    ),
-                    cute.make_layout((4,)),
-                ).load()
-                v1 = cute.make_tensor(
-                    cute.make_ptr(
-                        cutlass.Uint32,
-                        a_addr + cutlass.Int64(16),
+            # The eight steps go as two batches of four whose loads are all issued
+            # before the batch's first quantize, so a thread has half the row block
+            # (128 B per thread) in flight and pays two global round trips per row block
+            # instead of eight.
+            for h in cutlass.range_constexpr(2):
+                words = []
+                # r_loc = 16*s + r_slab
+                for s in cutlass.range_constexpr(4 * h, 4 * h + 4):
+                    a_addr = a_blk + cutlass.Int64(16 * s) * row_bytes
+                    # Two 16-B vector loads = the 16 bf16 of one 1x16 block, as packed u32 pairs.
+                    v0 = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            a_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4,)),
+                    ).load()
+                    v1 = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            a_addr + cutlass.Int64(16),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4,)),
+                    ).load()
+                    words.append((v0, v1))
+                for s in cutlass.range_constexpr(4 * h, 4 * h + 4):
+                    v0, v1 = words[s - 4 * h]
+                    for j in cutlass.range_constexpr(4):
+                        blk[2 * j] = _bf16lo_to_f32(v0[j])
+                        blk[2 * j + 1] = _bf16hi_to_f32(v0[j])
+                        blk[8 + 2 * j] = _bf16lo_to_f32(v1[j])
+                        blk[8 + 2 * j + 1] = _bf16hi_to_f32(v1[j])
+                    w0, w1, sf = _quant16(blk, enc_over_fp4max, dec)
+                    q_ptr = cute.make_ptr(
+                        cutlass.Uint64,
+                        q_blk + cutlass.Int64(16 * s) * code_pitch,
                         cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    ),
-                    cute.make_layout((4,)),
-                ).load()
-                for j in cutlass.range_constexpr(4):
-                    blk[2 * j] = _bf16lo_to_f32(v0[j])
-                    blk[2 * j + 1] = _bf16hi_to_f32(v0[j])
-                    blk[8 + 2 * j] = _bf16lo_to_f32(v1[j])
-                    blk[8 + 2 * j + 1] = _bf16hi_to_f32(v1[j])
-                w0, w1, sf = _quant16(blk, enc_over_fp4max, dec)
-                q_ptr = cute.make_ptr(
-                    cutlass.Uint64,
-                    q_blk + cutlass.Int64(16 * s) * code_pitch,
-                    cute.AddressSpace.gmem,
-                    assumed_align=8,
-                )
-                cute.make_tensor(q_ptr, cute.make_layout((1,)))[0] = cutlass.Uint64(
-                    w0
-                ) | (cutlass.Uint64(w1) << 32)
-                # r_loc % 32 = 16*(s % 2) + r_slab (in sf_base), r_loc // 32 = s // 2
-                mRowSF[sf_blk + cutlass.Int32((16 * (s % 2)) * 16 + (s // 2) * 4)] = sf
+                        assumed_align=8,
+                    )
+                    cute.make_tensor(q_ptr, cute.make_layout((1,)))[0] = cutlass.Uint64(
+                        w0
+                    ) | (cutlass.Uint64(w1) << 32)
+                    # r_loc % 32 = 16*(s % 2) + r_slab (in sf_base), r_loc // 32 = s // 2
+                    mRowSF[
+                        sf_blk + cutlass.Int32((16 * (s % 2)) * 16 + (s // 2) * 4)
+                    ] = sf
 
 
 # Every parameter is required and every caller passes it positionally: an lru_cache key is
@@ -3484,8 +3498,7 @@ def _cutedsl_group_row_cast_quantize_impl(
         return row_fp4.view(torch.uint8), row_sf
 
     m_blocks = M // M_TILE
-    NUM_SMS = _get_num_sms(dev.index)
-    GRID_Y = min(m_blocks, -(-ROW_CAST_CTAS_PER_SM * NUM_SMS // (E * (N // M_TILE))))
+    GRID_Y = m_blocks
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
 
     row_cast = _compile_row_cast_quantize_kernel(dev.index)
