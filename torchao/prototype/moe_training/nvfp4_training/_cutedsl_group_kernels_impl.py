@@ -4958,6 +4958,24 @@ def _rht128_tile_quantize(
     )
 
 
+def _rht128_rowcast_group_words(g, g_end, offsets_t, hidden):
+    """``_store_grouped_col_sf_word``'s per-group constants: the u32 words of the groups
+    before ``g``, the words per 128-row hidden block of ``g``'s swizzled scale tile, and
+    ``g``'s first 16-token column. Plain function, traced inline at a group crossing."""
+    prev = cutlass.select_(g > cutlass.Int32(0), g - cutlass.Int32(1), 0)
+    group_start = cutlass.select_(
+        g > cutlass.Int32(0), offsets_t[prev], cutlass.Int32(0)
+    )
+    prefix_words = cutlass.Int32(
+        cutlass.Int64(hidden) * cutlass.Int64(group_start) // cutlass.Int64(64)
+    )
+    return (
+        prefix_words,
+        (g_end - group_start) * cutlass.Int32(2),
+        group_start // cutlass.Int32(16),
+    )
+
+
 @cute.jit
 def _rht128_rowcast_quantize_epilogue(
     mColFP4,
@@ -4980,29 +4998,37 @@ def _rht128_rowcast_quantize_epilogue(
     warp takes blocks ``u_base .. u_base + 3`` of its lanes.
 
     Tiles are enumerated hidden-fastest, so ``token`` is non-decreasing and the group
-    cache is ``_rht128_amax_epilogue``'s; a crossing reloads the group's two-level scale.
+    cache is ``_rht128_amax_epilogue``'s; a crossing reloads the group's two-level scale
+    and the constants of its swizzled scale tile (``_store_grouped_col_sf_word``'s
+    arithmetic, with the per-group and per-lane terms hoisted out of the tile loop).
+    Tile coordinates advance incrementally.
     """
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
     )
-    g = _group_idx(
-        (t_begin // tiles_in_m) * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors
-    )
+    tile_n = t_begin // tiles_in_m
+    tile_m = t_begin - tile_n * tiles_in_m
+    g = _group_idx(tile_n * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors)
     g_end = offsets_t[g]
     _, dec, enc_over_fp4max = _global_scale(col_amax_t[g])
+    prefix_words, words_per_hidden_block, c_local_base = _rht128_rowcast_group_words(
+        g, g_end, offsets_t, hidden
+    )
+    lane_word = (tidx % cutlass.Int32(32)) * cutlass.Int32(4) + tidx // cutlass.Int32(
+        32
+    )
     rSF = cute.make_rmem_tensor(
         (RHT128_ROWCAST_QUANT_BLOCKS_PER_WARP,), cutlass.Float8E4M3FN
     )
     for i in cutlass.range(t_end - t_begin, unroll=1):
-        t = t_begin + i
-        tile_n = t // tiles_in_m
-        tile_m = t - tile_n * tiles_in_m
         token = tile_n * cutlass.Int32(TOKEN_TILE)
         if token >= g_end:
             g = _group_idx(token, offsets_t, num_tensors)
             g_end = offsets_t[g]
             _, dec, enc_over_fp4max = _global_scale(col_amax_t[g])
-        h_global = tile_m * cutlass.Int32(M_TILE) + tidx
+            prefix_words, words_per_hidden_block, c_local_base = (
+                _rht128_rowcast_group_words(g, g_end, offsets_t, hidden)
+            )
         gCol = cute.local_tile(mColFP4, (M_TILE, TOKEN_TILE // 8), (tile_m, tile_n))
         acc_pipeline.consumer_wait(acc_state)
         _rht128_tile_quantize(
@@ -5018,15 +5044,81 @@ def _rht128_rowcast_quantize_epilogue(
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()
-        _store_grouped_col_sf_word(
-            mColSF,
-            rSF,
-            h_global,
-            tile_n * cutlass.Int32(RHT128_DIM // 16) + u_base,
-            g,
-            offsets_t,
-            hidden,
+        c_local = tile_n * cutlass.Int32(RHT128_DIM // 16) + u_base - c_local_base
+        mColSF[
+            prefix_words
+            + tile_m * words_per_hidden_block
+            + (c_local // cutlass.Int32(4)) * cutlass.Int32(128)
+            + lane_word
+        ] = cute.recast_tensor(rSF, cutlass.Uint32)[0]
+        tile_m = tile_m + cutlass.Int32(1)
+        wrap = tile_m == tiles_in_m
+        tile_m = cutlass.Int32(cutlass.select_(wrap, cutlass.Int32(0), tile_m))
+        tile_n = tile_n + cutlass.Int32(
+            cutlass.select_(wrap, cutlass.Int32(1), cutlass.Int32(0))
         )
+
+
+@cute.jit
+def _rht128_rowcast_sign_b(b_base, b_mbar, sign_t, u):
+    """Sign the resident unsigned ``H128`` stage into ``R^T`` in place once the TMA behind
+    ``b_mbar`` has landed: col thread ``u`` of 256 flips bit 15 of every bfloat16 in K chunk
+    ``u % 16`` (tokens ``8 * (u % 16) ..``) of rows ``8 * (u // 16) ..`` whose token sign is
+    negative -- ``torch.mul(h128, signs[None, :])`` byte for byte, since negating a bfloat16
+    is exact for ``+-1`` signs. Every chunk is rewritten through the generic proxy and fenced
+    for the UMMA; the caller's ``acc_zero_barrier`` hands the stage to the MMA warp.
+
+    A 16-byte chunk of the K-major SW128 stage sits at ``row + 16 * (chunk ^ (row >> 7) % 8)``
+    with ``row = b_base + 16384 * (k // 64) + 1024 * (n // 8) + 128 * (n % 8)``: the TMA
+    swizzle is keyed on the absolute shared-memory address, so a stage that is not 1 KB
+    aligned rotates the chunk order (probed, not assumed).
+    """
+    kc = u % cutlass.Int32(16)
+    k0 = kc * cutlass.Int32(8)
+    mask = cute.make_rmem_tensor((4,), cutlass.Uint32)
+    for j in cutlass.range_constexpr(4):
+        lo = sign_t[k0 + cutlass.Int32(2 * j)] < cutlass.Int8(0)
+        hi = sign_t[k0 + cutlass.Int32(2 * j + 1)] < cutlass.Int8(0)
+        mask[j] = cutlass.Uint32(
+            cutlass.select_(lo, cutlass.Uint32(0x8000), cutlass.Uint32(0))
+        ) | cutlass.Uint32(
+            cutlass.select_(hi, cutlass.Uint32(0x80000000), cutlass.Uint32(0))
+        )
+    row0 = (
+        b_base
+        + cutlass.Int32(16384) * (kc // cutlass.Int32(8))
+        + cutlass.Int32(1024) * (u // cutlass.Int32(16))
+    )
+    c = kc % cutlass.Int32(8)
+    chunks = []
+    words = []
+    for i in cutlass.range_constexpr(8):
+        row = row0 + cutlass.Int32(128 * i)
+        chunks.append(
+            cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint32,
+                    row
+                    + cutlass.Int32(16)
+                    * (c ^ ((row >> cutlass.Int32(7)) & cutlass.Int32(7))),
+                    cute.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((4,)),
+            )
+        )
+        words.append(cute.make_rmem_tensor((4,), cutlass.Uint32))
+    cute.arch.mbarrier_wait(b_mbar, 0)
+    # All eight loads in flight before the first flip: the stage is on the MMA warp's
+    # critical path once per CTA.
+    for i in cutlass.range_constexpr(8):
+        words[i].store(chunks[i].load())
+    for i in cutlass.range_constexpr(8):
+        for j in cutlass.range_constexpr(4):
+            words[i][j] = words[i][j] ^ mask[j]
+        chunks[i].store(words[i].load())
+    # Generic-proxy stores -> visible to the UMMA (async proxy) before the barrier.
+    cute.arch.fence_proxy("async.shared", space="cta")
 
 
 class _Tcgen05GroupRowCastColRhtQuantize:
@@ -5035,12 +5127,15 @@ class _Tcgen05GroupRowCastColRhtQuantize:
 
     Standalone (no ``_GroupRhtMainloop``): the mainloop is ``_Tcgen05GroupRowCastColRhtAmax``'s
     -- every 128x128 tile is TMA'd once, feeds one UMMA chain against the resident
-    host-built K-major ``R^T`` tile and is read raw by the row warps through the plain
-    ``(hidden, token, stage)`` view. The accumulator is quantized from TMEM under the
-    requantize kernel's discipline: the epilogue zero-fills its chunks and every UMMA
-    accumulates, so an exact-zero column sum keeps Triton's ``+0``. Static persistent
-    grid: CTA ``b`` owns the contiguous tile chunk ``_static_tile_range``, tiles below
-    ``logical_packed_length`` only, hidden-fastest. Twenty warps
+    K-major ``R^T`` tile and is read raw by the row warps through the plain
+    ``(hidden, token, stage)`` view. ``R^T`` is the unsigned ``H128`` TMA'd once and
+    signed in shared memory by the col warps (``_rht128_rowcast_sign_b``) inside their
+    zero-fill handshake with the MMA warp, so the op issues no torch glue. The
+    accumulator is quantized from TMEM under the requantize kernel's discipline: the
+    epilogue zero-fills its chunks and every UMMA accumulates, so an exact-zero column
+    sum keeps Triton's ``+0``. Static persistent grid: CTA ``b`` owns the contiguous tile
+    chunk ``_static_tile_range``, tiles below ``logical_packed_length`` only,
+    hidden-fastest. Twenty warps
     (``RHT128_ROWCAST_QUANT_*``): eight col warps, two per TMEM quadrant, eight row warps.
     """
 
@@ -5051,7 +5146,8 @@ class _Tcgen05GroupRowCastColRhtQuantize:
     def __call__(
         self,
         mA: cute.Tensor,  # A.t().unsqueeze(-1): (hidden, tokens, 1)
-        mB: cute.Tensor,  # R^T (128 j, 128 k, 1), col chain (wgrad signs)
+        mB: cute.Tensor,  # H128 (128 j, 128 k, 1); signed in SMEM into the col chain's R^T
+        mSign: cute.Tensor,  # (128,) int8 token signs (wgrad)
         mColFP4: cute.Tensor,  # (hidden, tokens // 8) u32 columnwise codes
         mColSF: cute.Tensor,  # flat u32 concatenation of per-group swizzled scales
         mRowFP4: cute.Tensor,  # (tokens, hidden // 16) u64: the row code pair per store
@@ -5134,6 +5230,7 @@ class _Tcgen05GroupRowCastColRhtQuantize:
             tma_tensor_a,
             tma_atom_b,
             tma_tensor_b,
+            mSign,
             mColFP4,
             mColSF,
             mRowFP4,
@@ -5162,6 +5259,7 @@ class _Tcgen05GroupRowCastColRhtQuantize:
         mA: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB: cute.Tensor,
+        mSign: cute.Tensor,
         mColFP4: cute.Tensor,
         mColSF: cute.Tensor,
         mRowFP4: cute.Tensor,
@@ -5266,8 +5364,12 @@ class _Tcgen05GroupRowCastColRhtQuantize:
         )
         sA = cute.make_tensor(swz_ptr, a_smem_layout_staged.outer)
         sA_clean = cute.make_tensor(swz_ptr, a_clean_layout.outer)
-        sB = smem.allocate_tensor(
-            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        raw_b = smem.allocate_array(
+            cutlass.BFloat16, cute.cosize(b_smem_layout.outer), byte_alignment=128
+        )
+        sB = cute.make_tensor(
+            cute.recast_ptr(raw_b, b_smem_layout.inner, dtype=cutlass.BFloat16),
+            b_smem_layout.outer,
         )
 
         cta_layout = cute.make_layout((1,))
@@ -5312,10 +5414,9 @@ class _Tcgen05GroupRowCastColRhtQuantize:
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, RHT128_ROWCAST_MAINLOOP_STAGES
             )
+            tile_n = t_begin // tiles_in_m
+            tile_m = t_begin - tile_n * tiles_in_m
             for i in cutlass.range(n_my, unroll=1):
-                t = t_begin + i
-                tile_n = t // tiles_in_m
-                tile_m = t - tile_n * tiles_in_m
                 ab_pipeline.producer_acquire(ab_producer_state)
                 cute.copy(
                     tma_atom_a,
@@ -5324,6 +5425,12 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                     tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                 )
                 ab_producer_state.advance()
+                tile_m = tile_m + cutlass.Int32(1)
+                wrap = tile_m == tiles_in_m
+                tile_m = cutlass.Int32(cutlass.select_(wrap, cutlass.Int32(0), tile_m))
+                tile_n = tile_n + cutlass.Int32(
+                    cutlass.select_(wrap, cutlass.Int32(1), cutlass.Int32(0))
+                )
             ab_pipeline.producer_tail(ab_producer_state)
 
         # ==================== MMA warp ====================
@@ -5333,7 +5440,6 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                 tmem.retrieve_ptr(cutlass.Float32), acc_fake_layout
             )
             acc_zero_barrier.arrive_and_wait()
-            cute.arch.mbarrier_wait(storage.b_mbar.ptr, 0)
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, RHT128_ROWCAST_MAINLOOP_STAGES
             )
@@ -5384,6 +5490,12 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                     u_base,
                 )
             cute.arch.fence_view_async_tmem_store()
+            _rht128_rowcast_sign_b(
+                raw_b.toint(),
+                storage.b_mbar.ptr,
+                mSign,
+                tidx - cutlass.Int32(32 * RHT128_ROWCAST_QUANT_COL_WARP_BEGIN),
+            )
             acc_zero_barrier.arrive_and_wait()
             _rht128_rowcast_quantize_epilogue(
                 mColFP4,
@@ -5412,7 +5524,18 @@ class _Tcgen05GroupRowCastColRhtQuantize:
         ):
             r_local = tidx - RHT128_ROWCAST_QUANT_ROW_WARP_BEGIN * cutlass.Int32(32)
             hb = r_local % cutlass.Int32(ROW_HB)  # 16-hidden block
-            t0 = r_local // cutlass.Int32(ROW_HB)  # token within a pass
+            hb4 = hb // cutlass.Int32(4)
+            # Token within a pass. Lanes hb 4-7 take the neighbouring token: their hidden
+            # atom sits 1 KB above lanes 0-3's on the same swizzle row, so reading the same
+            # token would put a quarter-warp's two 64-byte reads on the same banks; the
+            # neighbouring token's row flips the chunk swizzle and the reads are conflict
+            # free. A permutation of (token, hb) over the lanes -- every block is
+            # quantized once and stored to its own address.
+            t0 = (r_local // cutlass.Int32(ROW_HB)) ^ hb4
+            # The lane's swizzled scale bytes: ``_store_sf_byte``'s ``(r // 128, c // 4,
+            # r % 32, (r % 128 // 32) * 4 + c % 4)`` at ``r = token + 32 p + t0``,
+            # ``c = 8 tile_m + hb`` is ``(tile_n, 2 tile_m + hb // 4, t0, 4 p + hb % 4)``.
+            sf_lane = hb % cutlass.Int32(4)
 
             blk = cute.make_rmem_tensor((16,), cutlass.Float32)
             rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
@@ -5420,17 +5543,12 @@ class _Tcgen05GroupRowCastColRhtQuantize:
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, RHT128_ROWCAST_MAINLOOP_STAGES
             )
-            g = _group_idx(
-                (t_begin // tiles_in_m) * cutlass.Int32(TOKEN_TILE),
-                offsets_t,
-                num_tensors,
-            )
+            tile_n = t_begin // tiles_in_m
+            tile_m = t_begin - tile_n * tiles_in_m
+            g = _group_idx(tile_n * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors)
             g_end = offsets_t[g]
             _, r_dec, r_enc_over_fp4max = _global_scale(row_amax_t[g])
             for i in cutlass.range(n_my, unroll=1):
-                t = t_begin + i
-                tile_n = t // tiles_in_m
-                tile_m = t - tile_n * tiles_in_m
                 token = tile_n * cutlass.Int32(TOKEN_TILE)
                 if token >= g_end:
                     g = _group_idx(token, offsets_t, num_tensors)
@@ -5441,7 +5559,8 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                 stage = ab_consumer_state.index
                 gRow = cute.local_tile(
                     mRowFP4, (TOKEN_TILE, M_TILE // 16), (tile_n, tile_m)
-                )
+                )[(None, hb)]
+                gSF = mRowSF[(tile_n, tile_m * cutlass.Int32(2) + hb4, t0, None)]
                 for p in cutlass.range_constexpr(ROW_PASSES):
                     tok = p * cutlass.Int32(ROW_TOK_PER_PASS) + t0
                     cute.autovec_copy(
@@ -5464,17 +5583,18 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                     rPair[0] = w0
                     rPair[1] = w1
                     pair64 = cute.recast_tensor(rPair, cutlass.Uint64)
-                    gRow[(tok, hb)] = pair64[0]
-                    _store_sf_byte(
-                        mRowSF,
-                        sf,
-                        token + tok,
-                        tile_m * cutlass.Int32(ROW_HB) + hb,
-                    )
+                    gRow[tok] = pair64[0]
+                    gSF[cutlass.Int32(4 * p) + sf_lane] = sf
                 ab_pipeline.consumer_release(
                     ab_consumer_state, pipeline.PipelineOp.AsyncThread
                 )
                 ab_consumer_state.advance()
+                tile_m = tile_m + cutlass.Int32(1)
+                wrap = tile_m == tiles_in_m
+                tile_m = cutlass.Int32(cutlass.select_(wrap, cutlass.Int32(0), tile_m))
+                tile_n = tile_n + cutlass.Int32(
+                    cutlass.select_(wrap, cutlass.Int32(1), cutlass.Int32(0))
+                )
 
 
 @functools.lru_cache(maxsize=None)
@@ -5492,6 +5612,7 @@ def _compile_group_row_cast_col_rht_quantize_kernel(device_idx: int, fast_math: 
         make_fake_tensor(
             cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
         ),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
         make_fake_tensor(
             cutlass.Uint32,
             (h_sym, cute.sym_int(divisibility=TOKEN_TILE // 8)),
@@ -5526,17 +5647,18 @@ def _cutedsl_group_row_cast_col_rht_quantize_impl(
     row_global_amax: torch.Tensor,
     col_global_amax: torch.Tensor,
     num_tensors: int,
-    col_rht_nk: torch.Tensor,
+    wgrad_rht: torch.Tensor,
+    h128: torch.Tensor,
     logical_packed_length: Optional[torch.Tensor] = None,
     use_fast_math: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Grouped RHT-128 columnwise + raw rowwise NVFP4 quantization (RTNE).
 
-    ``A`` is ``(tokens, hidden)`` bfloat16 row-major; ``col_rht_nk`` is the ``(128, 128)``
-    bfloat16 K-major ``R^T`` tile built by the caller from the live sign vector. Returns
-    ``(col_fp4, col_sf, row_fp4, row_sf)`` as ``_cutedsl_group_rht_quantize_row_col_impl``
-    does; rows at or after ``logical_packed_length`` are never read and their outputs are
-    left as allocated.
+    ``A`` is ``(tokens, hidden)`` bfloat16 row-major; ``wgrad_rht`` is the live ``(128,)``
+    int8 sign vector and ``h128`` the unsigned ``(128, 128)`` bfloat16 Hadamard, signed
+    into the K-major ``R^T`` operand on chip. Returns ``(col_fp4, col_sf, row_fp4, row_sf)``
+    as ``_cutedsl_group_rht_quantize_row_col_impl`` does; rows at or after
+    ``logical_packed_length`` are never read and their outputs are left as allocated.
     """
     tokens, hidden = A.shape
     dev = A.device
@@ -5561,7 +5683,8 @@ def _cutedsl_group_row_cast_col_rht_quantize_impl(
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     _compile_group_row_cast_col_rht_quantize_kernel(dev.index, bool(use_fast_math))(
         A.t().unsqueeze(-1),
-        col_rht_nk.unsqueeze(-1),
+        h128.unsqueeze(-1),
+        wgrad_rht,
         col_fp4,
         col_sf.view(torch.uint32).flatten(),
         row_fp4.view(torch.uint64),

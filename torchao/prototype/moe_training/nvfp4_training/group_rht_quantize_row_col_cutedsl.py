@@ -99,12 +99,12 @@ def cutedsl_group_rht_quantize_row_col(
             )
         if not sign_tensor.is_cuda or sign_tensor.device != A.device:
             raise ValueError("sign_tensor must be on the same device as A")
-        # H128 is symmetric, so ``H128 * signs[None, :]`` is ``get_dynamic_rht_matrix(signs).t()``
-        # -- the (N, K) UMMA operand -- without the transpose copy; ``.to`` is a no-op for the
-        # int8 / bfloat16 buffers the recipe passes and only converts other dtypes. Formed per
-        # launch: the sign buffer is a live tensor resampled in place, never a cache key.
-        h128 = get_hadamard_matrix(RHT_SIZE, _device_key(A.device), torch.bfloat16)
-        B = torch.mul(h128, sign_tensor[None, :]).to(torch.bfloat16)
+        # H128 is symmetric, so signing its columns in the kernel's shared-memory copy forms
+        # ``get_dynamic_rht_matrix(signs).t()`` -- the (N, K) UMMA operand -- with no torch
+        # launch. ``.to`` is a no-op for the recipe's int8 buffer and converts bf16 / f32 signs;
+        # the sign buffer is a live tensor resampled in place, never a cache key.
+        B = get_hadamard_matrix(RHT_SIZE, _device_key(A.device), torch.bfloat16)
+        signs = sign_tensor.to(torch.int8).contiguous()
     elif sign_tensor is not None:
         raise ValueError("sign_tensor is only used when dynamic_rht=True")
     else:
@@ -147,6 +147,7 @@ def cutedsl_group_rht_quantize_row_col(
                 row_amax,
                 col_amax,
                 num_tensors,
+                signs,
                 B,
                 logical_packed_length=logical_packed_length,
                 use_fast_math=use_fast_math,
