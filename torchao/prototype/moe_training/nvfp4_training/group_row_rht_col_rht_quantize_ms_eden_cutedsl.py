@@ -85,15 +85,15 @@ def cutedsl_group_row_rht_col_rht_quantize_ms_eden(
         if not sv.is_cuda or sv.device != dy.device:
             raise ValueError(f"{name} must be on the same device as dy")
     # H128 is symmetric, so ``H128 * signs[None, :]`` is ``get_dynamic_rht_matrix(signs).t()``
-    # -- the (N, K) UMMA operand -- without the transpose copy; ``.to`` is a no-op for the
-    # int8 / bfloat16 buffers the recipe passes and only converts other dtypes. Formed per
-    # launch: the sign buffers are live tensors resampled in place, never a cache key.
+    # -- the (N, K) UMMA operand -- without the transpose copy; the kernel forms both from
+    # ``h128`` and the live sign buffers (an exact bf16 sign flip). ``.to`` is a no-op for the
+    # int8 buffers the recipe passes and only converts other dtypes; ``.contiguous`` makes a
+    # strided sign view a plain buffer. Formed per launch: the sign buffers are live tensors
+    # resampled in place, never a cache key.
     h128 = get_hadamard_matrix(RHT_SIZE, _device_key(dy.device), torch.bfloat16)
-    row_rht_nk = torch.mul(h128, dgrad_rht[None, :]).to(torch.bfloat16)
-    col_rht_nk = torch.mul(h128, wgrad_rht[None, :]).to(torch.bfloat16)
     _validate_grouped_hadamard_inputs(
         dy,
-        row_rht_nk,
+        h128,
         offsets,
         num_tensors,
         packed_sequence_length,
@@ -117,8 +117,9 @@ def cutedsl_group_row_rht_col_rht_quantize_ms_eden(
     row_fp4, row_sf, col_fp4, col_sf = (
         _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
             dy,
-            row_rht_nk,
-            col_rht_nk,
+            h128,
+            dgrad_rht.to(torch.int8).contiguous(),
+            wgrad_rht.to(torch.int8).contiguous(),
             row_amax,
             col_amax,
             offsets,

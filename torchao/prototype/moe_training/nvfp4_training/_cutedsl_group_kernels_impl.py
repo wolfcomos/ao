@@ -2490,6 +2490,7 @@ RHT128_MSEDEN_ACC_CONSUMER_WARPS = (
     RHT128_MSEDEN_COL_WARP_END - RHT128_MSEDEN_COL_WARP_BEGIN
 ) + (RHT128_MSEDEN_ROW_WARP_END - RHT128_MSEDEN_ROW_WARP_BEGIN)
 RHT128_MSEDEN_BLOCKS_PER_WARP = (RHT128_DIM // 16) // 2  # 4 of a lane's 8 blocks
+RHT128_MSEDEN_SIGN_BAR = 3  # both chains' sign bytes staged in shared memory
 
 
 def _dot16_tree_rn(a, b):
@@ -2644,6 +2645,28 @@ def _store_grouped_col_sf_word(mSF_u32, rSF, r, c_base, g, offsets_t, hidden):
     ] = cute.recast_tensor(rSF, cutlass.Uint32)[0]
 
 
+def _ms_eden_col_sf_base(g, g_end, offsets_t, hidden, u_base, lane_word):
+    """Group-invariant part of ``_store_grouped_col_sf_word`` for this warp's word: the
+    index of its tile ``(0, 0)`` word and the pitch of one hidden block, so the tile
+    ``(tile_m, tile_n)`` word sits at ``base + tile_m * pitch + tile_n * 256``. Groups
+    are 128-row aligned, so ``group_start // 64`` is exact and the per-tile address
+    needs no division."""
+    prev = cutlass.select_(g > cutlass.Int32(0), g - cutlass.Int32(1), 0)
+    group_start = cutlass.select_(
+        g > cutlass.Int32(0), offsets_t[prev], cutlass.Int32(0)
+    )
+    prefix_words = cutlass.Int32(
+        cutlass.Int64(hidden) * cutlass.Int64(group_start) // cutlass.Int64(64)
+    )
+    base = (
+        prefix_words
+        - (group_start // cutlass.Int32(64)) * cutlass.Int32(128)
+        + u_base * cutlass.Int32(32)
+        + lane_word
+    )
+    return base, (g_end - group_start) * cutlass.Int32(2)
+
+
 @cute.jit
 def _rht128_ms_eden_epilogue(
     chain: cutlass.Constexpr,
@@ -2669,7 +2692,9 @@ def _rht128_ms_eden_epilogue(
     scale instead of flushing. Chain 0 quantizes ``dy.t() @ R_m`` (lane = hidden row,
     blocks along tokens, per-group swizzled scales); chain 1 quantizes ``dy @ R_n``
     (lane = token, blocks along hidden). The chain's second warp group takes blocks
-    4-7 of every lane.
+    4-7 of every lane. Tile coordinates advance incrementally, and each warp's four
+    scale bytes of a lane go out as the one u32 word they form in the 128x4 swizzle
+    atom (``lane_word``: the lane's word within the atom).
     """
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
@@ -2681,6 +2706,8 @@ def _rht128_ms_eden_epilogue(
         (tidx - cutlass.Int32(32 * RHT128_MSEDEN_COL_WARP_BEGIN)) // cutlass.Int32(128)
     ) % cutlass.Int32(2)
     u_base = half * cutlass.Int32(RHT128_MSEDEN_BLOCKS_PER_WARP)
+    lane = r_local % cutlass.Int32(32)
+    lane_word = lane * cutlass.Int32(4) + r_local // cutlass.Int32(32)
     if cutlass.const_expr(chain == 0):
         state = philox_prep(
             cutlass.Uint32(sr_rng_t[0]),
@@ -2696,21 +2723,26 @@ def _rht128_ms_eden_epilogue(
             cutlass.Uint32(sr_rng_t[6]),
         )
         inner_blocks = hidden // cutlass.Int32(16)
-    g = _group_idx(
-        (t_begin // tiles_in_m) * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors
-    )
+    tile_n = t_begin // tiles_in_m
+    tile_m = t_begin - tile_n * tiles_in_m
+    g = _group_idx(tile_n * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors)
     g_end = offsets_t[g]
     _, dec, enc_over_fp4max = _global_scale(amax_t[g], EDEN_BLOCK_SCALE_MAX)
+    if cutlass.const_expr(chain == 0):
+        sf_base, sf_pitch = _ms_eden_col_sf_base(
+            g, g_end, offsets_t, hidden, u_base, lane_word
+        )
     rSF = cute.make_rmem_tensor((RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint8)
     for i in cutlass.range(t_end - t_begin, unroll=1):
-        t = t_begin + i
-        tile_n = t // tiles_in_m
-        tile_m = t - tile_n * tiles_in_m
         token = tile_n * cutlass.Int32(TOKEN_TILE)
         if token >= g_end:
             g = _group_idx(token, offsets_t, num_tensors)
             g_end = offsets_t[g]
             _, dec, enc_over_fp4max = _global_scale(amax_t[g], EDEN_BLOCK_SCALE_MAX)
+            if cutlass.const_expr(chain == 0):
+                sf_base, sf_pitch = _ms_eden_col_sf_base(
+                    g, g_end, offsets_t, hidden, u_base, lane_word
+                )
         if cutlass.const_expr(chain == 0):
             outer = tile_m * cutlass.Int32(M_TILE) + r_local  # hidden row
             inner_tile = tile_n
@@ -2738,13 +2770,108 @@ def _rht128_ms_eden_epilogue(
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()
-        c_base = inner_tile * cutlass.Int32(RHT128_DIM // 16) + u_base
+        sf_word = cute.recast_tensor(rSF, cutlass.Uint32)[0]
         if cutlass.const_expr(chain == 0):
-            _store_grouped_col_sf_word(mSF, rSF, outer, c_base, g, offsets_t, hidden)
+            mSF[sf_base + tile_m * sf_pitch + tile_n * cutlass.Int32(256)] = sf_word
         else:
-            rSF_f8 = cute.recast_tensor(rSF, cutlass.Float8E4M3FN)
-            for j in cutlass.range_constexpr(RHT128_MSEDEN_BLOCKS_PER_WARP):
-                _store_sf_byte(mSF, rSF_f8[j], outer, c_base + cutlass.Int32(j))
+            # ``_store_sf_byte``'s (r // 128, c // 4, r % 32, (r % 128 // 32) * 4 + c % 4)
+            # for the four consecutive columns ``c_base .. c_base + 3``, as one word.
+            mSF[
+                (
+                    tile_n,
+                    tile_m * cutlass.Int32(2) + half,
+                    lane,
+                    r_local // cutlass.Int32(32),
+                )
+            ] = sf_word
+        tile_m = tile_m + cutlass.Int32(1)
+        wrap = tile_m == tiles_in_m
+        tile_m = cutlass.Int32(cutlass.select_(wrap, cutlass.Int32(0), tile_m))
+        tile_n = tile_n + cutlass.Int32(
+            cutlass.select_(wrap, cutlass.Int32(1), cutlass.Int32(0))
+        )
+
+
+def _rht128_build_signed_rht(mH, sign_t, sign_base, b_base, p, sign_barrier):
+    """Thread ``p`` of 256 builds eight 16 B chunks of a resident K-major ``R^T`` tile:
+    chunk ``c = p % 8`` of contracted half ``(p // 8) % 2`` in rows ``j = p // 16 + 16 i``
+    of ``H128``, with bit 15 of every bf16 whose contracted index ``k`` has ``s_k < 0``
+    flipped -- the exact bf16 sign flip ``torch.mul(h128, signs[None, :])`` performs, so
+    the UMMA consumes the same bytes. Consecutive lanes read consecutive chunks of an
+    ``H128`` row, so a warp's load covers four 128 B lines instead of thirty-two.
+
+    A chunk of the 128 B row at ``b_base + 16384 * half + 128 * j`` lands at
+    ``16 * (c ^ ((row >> 7) & 7))``: the SW128 swizzle is a function of the shared-memory
+    address, as the UMMA descriptor applies it. The sign bytes are staged at ``sign_base``:
+    thread ``p`` copies byte ``p % 128`` (one byte load per lane, so the vectors need no
+    alignment in global memory and the two hot sign lines cost one L2 request per warp),
+    the chain barrier publishes them, and the chunk's eight bytes come back as two aligned
+    words; a byte is negative iff its bit 7 is set. The ``H128`` chunks are loaded before
+    the barrier so the two round trips overlap. Plain function, traced inline."""
+    c = p % cutlass.Int32(8)
+    half = (p // cutlass.Int32(8)) % cutlass.Int32(2)
+    j0 = p // cutlass.Int32(16)
+    k = p % cutlass.Int32(RHT128_DIM)
+    s_k = sign_t[k]
+    h_addr = mH.iterator.toint() + cutlass.Int64(
+        j0 * cutlass.Int32(2 * RHT128_DIM) + (p % cutlass.Int32(16)) * cutlass.Int32(16)
+    )
+    h4 = [cute.make_rmem_tensor((4,), cutlass.Uint32) for _ in range(8)]
+    for i in range(8):
+        h4[i].store(
+            cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Uint32,
+                    h_addr + cutlass.Int64(i * 16 * 2 * RHT128_DIM),
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                cute.make_layout((4,)),
+            ).load()
+        )
+    cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Int8, sign_base + k, cute.AddressSpace.smem, assumed_align=1
+        ),
+        cute.make_layout((1,)),
+    )[0] = s_k
+    sign_barrier.arrive_and_wait()
+    signs = cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Uint32,
+            sign_base + half * cutlass.Int32(64) + c * cutlass.Int32(8),
+            cute.AddressSpace.smem,
+            assumed_align=8,
+        ),
+        cute.make_layout((2,)),
+    )
+    mask = cute.make_rmem_tensor((4,), cutlass.Uint32)
+    for i in range(2):
+        s = signs[i]
+        mask[2 * i] = ((s & cutlass.Uint32(0x80)) << cutlass.Uint32(8)) | (
+            (s & cutlass.Uint32(0x8000)) << cutlass.Uint32(16)
+        )
+        mask[2 * i + 1] = ((s & cutlass.Uint32(0x800000)) >> cutlass.Uint32(8)) | (
+            s & cutlass.Uint32(0x80000000)
+        )
+    row_addr = (
+        b_base + half * cutlass.Int32(RHT128_B_BYTES // 2) + j0 * cutlass.Int32(128)
+    )
+    st4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
+    for i in range(8):
+        for w in range(4):
+            st4[w] = h4[i][w] ^ mask[w]
+        row = row_addr + cutlass.Int32(i * 16 * 128)
+        x = (row >> cutlass.Int32(7)) & cutlass.Int32(7)
+        cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Uint32,
+                row + cutlass.Int32(16) * (c ^ x),
+                cute.AddressSpace.smem,
+                assumed_align=16,
+            ),
+            cute.make_layout((4,)),
+        ).store(st4.load())
 
 
 class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
@@ -2752,7 +2879,8 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
 
     Standalone (no ``_GroupRhtMainloop``): the mainloop is ``_Tcgen05GroupRowRhtColRhtAmax``'s
     -- every 128x128 tile is TMA'd once and feeds two UMMA chains against two resident
-    host-built K-major ``R^T`` tiles; the col chain reads the stage MN-major and the row
+    K-major ``R^T`` tiles the epilogue warps build from ``H128`` and the live sign vectors
+    (``_rht128_build_signed_rht``); the col chain reads the stage MN-major and the row
     chain reads the same bytes through a K-major view. Each accumulator is quantized from
     TMEM: RTNE FP4 codes against the group's two-level scale (ceiling 256), then the
     corrected, stochastically rounded E4M3 block scale from Triton's Philox stream. Static
@@ -2766,10 +2894,11 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
     def __call__(
         self,
         mA: cute.Tensor,  # dy.t().unsqueeze(-1): (hidden, tokens, 1)
-        mBrow: cute.Tensor,  # R_n^T (128 j, 128 k, 1), row chain (dgrad signs)
-        mBcol: cute.Tensor,  # R_m^T (128 j, 128 k, 1), col chain (wgrad signs)
+        mH: cute.Tensor,  # H128 (128 j, 128 k) bf16, K-major (symmetric), sign-free
+        row_sign_t: cute.Tensor,  # dgrad_rht (128,) int8: row chain
+        col_sign_t: cute.Tensor,  # wgrad_rht (128,) int8: col chain
         mRowFP4: cute.Tensor,  # (tokens, hidden // 8) u32 rowwise codes
-        mRowSF: cute.Tensor,  # (tokens // 128, hidden // 64, 32, 16) e4m3
+        mRowSF: cute.Tensor,  # (tokens // 128, hidden // 64, 32, 4) u32 view of the e4m3 scales
         mColFP4: cute.Tensor,  # (hidden, tokens // 8) u32 columnwise codes
         mColSF: cute.Tensor,  # flat u32 view of the per-group swizzled e4m3 scales
         row_amax_t: cute.Tensor,  # amax_rht_dy (num_tensors,) f32: row chain
@@ -2836,22 +2965,6 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
         b_smem_layout = tcgen05.tile_to_mma_shape(
             k_atom, cute.append(b_shape, 1), order=(1, 2, 3)
         )
-        tma_atom_b_col, tma_tensor_b_col = cute.nvgpu.make_tiled_tma_atom_B(
-            g2s,
-            mBcol,
-            cute.slice_(b_smem_layout, (None, None, None, 0)),
-            RHT128_CTA_TILE_COL,
-            tiled_mma_col,
-            (1, 1, 1, 1),
-        )
-        tma_atom_b_row, tma_tensor_b_row = cute.nvgpu.make_tiled_tma_atom_B(
-            g2s,
-            mBrow,
-            cute.slice_(b_smem_layout, (None, None, None, 0)),
-            RHT128_CTA_TILE_ROW,
-            tiled_mma_row,
-            (1, 1, 1, 1),
-        )
         cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((1, 1, 1)), (tiled_mma_col.thr_id.shape,)
         )
@@ -2867,10 +2980,9 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             tiled_mma_row,
             tma_atom_a,
             tma_tensor_a,
-            tma_atom_b_col,
-            tma_tensor_b_col,
-            tma_atom_b_row,
-            tma_tensor_b_row,
+            mH,
+            row_sign_t,
+            col_sign_t,
             mRowFP4,
             mRowSF,
             mColFP4,
@@ -2903,10 +3015,9 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
         tiled_mma_row: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA: cute.Tensor,
-        tma_atom_b_col: cute.CopyAtom,
-        mBcol: cute.Tensor,
-        tma_atom_b_row: cute.CopyAtom,
-        mBrow: cute.Tensor,
+        mH: cute.Tensor,
+        row_sign_t: cute.Tensor,
+        col_sign_t: cute.Tensor,
         mRowFP4: cute.Tensor,
         mRowSF: cute.Tensor,
         mColFP4: cute.Tensor,
@@ -2937,8 +3048,6 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
 
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
-            cpasync.prefetch_descriptor(tma_atom_b_col)
-            cpasync.prefetch_descriptor(tma_atom_b_row)
 
         @cute.struct
         class SharedStorage:
@@ -2978,6 +3087,9 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
         tmem_dealloc_barrier = pipeline.NamedBarrier(
             barrier_id=TMEM_DEALLOC_BAR, num_threads=2 * RHT128_MSEDEN_EPI_THREADS
         )
+        sign_barrier = pipeline.NamedBarrier(
+            barrier_id=RHT128_MSEDEN_SIGN_BAR, num_threads=2 * RHT128_MSEDEN_EPI_THREADS
+        )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -2987,7 +3099,9 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
         )
         if warp_idx == TMA_WARP:
             with cute.arch.elect_one():
-                cute.arch.mbarrier_init(storage.b_mbar.ptr, 1)
+                cute.arch.mbarrier_init(
+                    storage.b_mbar.ptr, 2 * RHT128_MSEDEN_EPI_THREADS
+                )
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
         raw_a = smem.allocate_array(
@@ -3003,24 +3117,26 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             cute.recast_ptr(raw_a, a_row_layout_staged.inner, dtype=cutlass.BFloat16),
             a_row_layout_staged.outer,
         )
-        sBcol = smem.allocate_tensor(
-            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        raw_bcol = smem.allocate_array(
+            cutlass.BFloat16, cute.cosize(b_smem_layout.outer), byte_alignment=128
         )
-        sBrow = smem.allocate_tensor(
-            cutlass.BFloat16, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        raw_brow = smem.allocate_array(
+            cutlass.BFloat16, cute.cosize(b_smem_layout.outer), byte_alignment=128
+        )
+        raw_sign = smem.allocate_array(cutlass.Int8, 2 * RHT128_DIM, byte_alignment=16)
+        sBcol = cute.make_tensor(
+            cute.recast_ptr(raw_bcol, b_smem_layout.inner, dtype=cutlass.BFloat16),
+            b_smem_layout.outer,
+        )
+        sBrow = cute.make_tensor(
+            cute.recast_ptr(raw_brow, b_smem_layout.inner, dtype=cutlass.BFloat16),
+            b_smem_layout.outer,
         )
 
         cta_layout = cute.make_layout((1,))
         thr_col = tiled_mma_col.get_slice(0)
-        thr_row = tiled_mma_row.get_slice(0)
         gA = cute.local_tile(
             mA, cute.slice_(RHT128_CTA_TILE_COL, (None, 0, None)), (None, None, None)
-        )
-        gBcol = cute.local_tile(
-            mBcol, cute.slice_(RHT128_CTA_TILE_COL, (0, None, None)), (None, None, None)
-        )
-        gBrow = cute.local_tile(
-            mBrow, cute.slice_(RHT128_CTA_TILE_ROW, (0, None, None)), (None, None, None)
         )
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
@@ -3028,20 +3144,6 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             cta_layout,
             cute.group_modes(sA, 0, 3),
             cute.group_modes(thr_col.partition_A(gA), 0, 3),
-        )
-        tBsBcol, tBgBcol = cpasync.tma_partition(
-            tma_atom_b_col,
-            0,
-            cta_layout,
-            cute.group_modes(sBcol, 0, 3),
-            cute.group_modes(thr_col.partition_B(gBcol), 0, 3),
-        )
-        tBsBrow, tBgBrow = cpasync.tma_partition(
-            tma_atom_b_row,
-            0,
-            cta_layout,
-            cute.group_modes(sBrow, 0, 3),
-            cute.group_modes(thr_row.partition_B(gBrow), 0, 3),
         )
         tCrA_col = tiled_mma_col.make_fragment_A(sA)
         tCrB_col = tiled_mma_col.make_fragment_B(sBcol)
@@ -3052,22 +3154,6 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
 
         # ==================== TMA warp ====================
         if warp_idx == TMA_WARP:
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    storage.b_mbar.ptr, 2 * RHT128_B_BYTES
-                )
-            cute.copy(
-                tma_atom_b_col,
-                tBgBcol[(None, 0, 0, 0)],
-                tBsBcol[(None, 0)],
-                tma_bar_ptr=storage.b_mbar.ptr,
-            )
-            cute.copy(
-                tma_atom_b_row,
-                tBgBrow[(None, 0, 0, 0)],
-                tBsBrow[(None, 0)],
-                tma_bar_ptr=storage.b_mbar.ptr,
-            )
             for i in cutlass.range(n_my, unroll=1):
                 t = t_begin + i
                 tile_n = t // tiles_in_m
@@ -3124,6 +3210,17 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             warp_idx >= RHT128_MSEDEN_COL_WARP_BEGIN
             and warp_idx < RHT128_MSEDEN_COL_WARP_END
         ):
+            _rht128_build_signed_rht(
+                mH,
+                col_sign_t,
+                raw_sign.toint(),
+                raw_bcol.toint(),
+                tidx - cutlass.Int32(32 * RHT128_MSEDEN_COL_WARP_BEGIN),
+                sign_barrier,
+            )
+            # Generic-proxy stores -> visible to the UMMA (async proxy) before the arrive.
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.mbarrier_arrive(storage.b_mbar.ptr)
             tmem.allocate(num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
@@ -3154,6 +3251,16 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             warp_idx >= RHT128_MSEDEN_ROW_WARP_BEGIN
             and warp_idx < RHT128_MSEDEN_ROW_WARP_END
         ):
+            _rht128_build_signed_rht(
+                mH,
+                row_sign_t,
+                raw_sign.toint() + cutlass.Int32(RHT128_DIM),
+                raw_brow.toint(),
+                tidx - cutlass.Int32(32 * RHT128_MSEDEN_ROW_WARP_BEGIN),
+                sign_barrier,
+            )
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.mbarrier_arrive(storage.b_mbar.ptr)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
             tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
@@ -3188,11 +3295,13 @@ def _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(device_idx: int):
         k,
         make_fake_tensor(cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1)),
         make_fake_tensor(
-            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
+            cutlass.BFloat16,
+            (RHT128_DIM, RHT128_DIM),
+            stride=(RHT128_DIM, 1),
+            assumed_align=16,
         ),
-        make_fake_tensor(
-            cutlass.BFloat16, (RHT128_DIM, RHT128_DIM, 1), stride=(RHT128_DIM, 1, 1)
-        ),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
+        make_fake_tensor(cutlass.Int8, (RHT128_DIM,), stride=(1,)),
         # Each epilogue thread stores its warp's four blocks of a lane's 16 code words as
         # two 16-byte ``st.global.v4`` (``_rht128_tile_ms_eden``); assumed_align=16 and the
         # divisibilities record why that is aligned: hidden % 128 makes the rowwise u32
@@ -3205,7 +3314,7 @@ def _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(device_idx: int):
             assumed_align=16,
         ),
         make_fake_tensor(
-            cutlass.Float8E4M3FN, (free(), free(), 32, 16), stride=(free(), 512, 16, 1)
+            cutlass.Uint32, (free(), free(), 32, 4), stride=(free(), 128, 4, 1)
         ),
         make_fake_tensor(
             cutlass.Uint32,
@@ -3230,8 +3339,9 @@ def _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(device_idx: int):
 
 def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
     dy: torch.Tensor,
-    row_rht_nk: torch.Tensor,
-    col_rht_nk: torch.Tensor,
+    h128: torch.Tensor,
+    dgrad_rht: torch.Tensor,
+    wgrad_rht: torch.Tensor,
     amax_rht_dy: torch.Tensor,
     amax_rht_dy_t: torch.Tensor,
     offsets: torch.Tensor,
@@ -3241,6 +3351,9 @@ def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """MS-EDEN quantize of ``dy @ R_n`` (rowwise) and ``dy.t() @ R_m`` (columnwise), per group.
 
+    ``h128`` is the cached sign-free ``(128, 128)`` bfloat16 Hadamard, ``dgrad_rht`` /
+    ``wgrad_rht`` the live ``(128,)`` int8 sign vectors of the row / col chain; the kernel
+    folds the signs into its resident ``R^T`` tiles.
     Returns ``(row_fp4, row_sf, col_fp4, col_sf)`` rowwise first: uint8 code views of the
     u32 buffers and the 4-D swizzled e4m3 scale storage the wrapper returns as 2-D views.
     Rows at or after ``logical_packed_length`` are never read and their outputs are left
@@ -3273,10 +3386,11 @@ def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
     _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(dev.index)(
         dy.t().unsqueeze(-1),
-        row_rht_nk.unsqueeze(-1),
-        col_rht_nk.unsqueeze(-1),
+        h128,
+        dgrad_rht,
+        wgrad_rht,
         row_fp4,
-        row_sf,
+        row_sf.view(torch.uint32),
         col_fp4,
         col_sf.view(torch.uint32).flatten(),
         amax_rht_dy,
