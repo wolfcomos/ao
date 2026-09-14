@@ -8,16 +8,32 @@ environment, so compare numbers within this file only.
 ## Environment and methodology
 
 - NVIDIA GB200, 152 SMs, SM application clock capped at 1200 MHz (`nvidia-smi`
-  applications clock). Absolute times are roughly 1.6x those in `README.md` at equal
-  bandwidth efficiency; ratios between shapes and CuteDSL-vs-Triton speedups are
-  comparable. Peak bandwidth from device properties is 7936 GB/s (the bench scripts'
-  formula); every `pct_peak` below is against it.
+  applications clock; every table in this file, the re-measured ones included, is at this
+  local cap). Absolute times of SM-bound kernels are roughly 1.6x those in `README.md`
+  (the 1965 / 1200 MHz clock ratio); memory-bound rows, such as `row_cast_quantize` at 671B,
+  do not scale with the SM clock. Peak bandwidth 7936 GB/s is memory bus width / 8 x memory
+  clock x 2 from `torch.cuda.get_device_properties` -- the `get_peak_mem_bw_gbps` formula
+  of the sibling `bench_group_rht_quantize_row_col.py` / `bench_quantize_2d.py`; the nine
+  benches here print GB/s only -- as read on the GPU that produced the first tables
+  (7936-bit bus x 4000 MHz; other GB200 GPUs on these nodes report an 8064-bit bus, 8064
+  GB/s, and `README.md`'s environment 7928.1). Every `pct_peak` below is against 7936.
 - Primary toolchain, used for every table: PyTorch 2.14.0a0, CUDA 13.x (pre-release), Triton 3.8.0,
   nvidia-cutlass-dsl 4.8.0.dev0. The Triton 3.6.0 column of the baseline table comes from
   PyTorch 2.14.0a0, CUDA 13.4, Triton 3.6.0, nvidia-cutlass-dsl 4.6.0; every CuteDSL
-  kernel here compiles and is bitwise-checked on both.
+  kernel here compiles and passes its single-backend tests on both. The bitwise claims are
+  against Triton 3.8.0: the two RHT-128 amax twins have no Triton 3.6.0 counterpart and the
+  MS-EDEN scale bytes differ from Triton 3.6.0's at ~1e-6 of blocks -- see each kernel's
+  toolchain bullet. The Triton 3.6.0-toolchain figures in those bullets are single passes
+  unless stated.
 - Device kernel time via `bench_utils.kernel_time_us` (15 warmups / 50 iterations, CUDA
-  self-time, memcpy/memset excluded) -- op time for everything the custom op launches.
+  self-time, memcpy/memset excluded) -- op time for every kernel the custom op launches.
+  The exclusion drops the `logical_packed_length.clone()` (and, for MS-EDEN, the
+  `rng_state` copy) `Memcpy DtoD` of the four activation CuteDSL ops, 2.0-2.4 us (3.9-5.0 us
+  MS-EDEN) per call that the Triton ops do not issue; each of those sections quotes it. The
+  timed loop re-runs one buffer with no L2 flush: rows whose working set is under the
+  137 MB L2 (the weight tables at the debug model and 16B, the 671B `col_*` rows) read
+  partly from cache -- measured up to 10% at 6.5-33 MB and none at >= 117 MB -- so their
+  GB/s is an upper bound, and the two backends do not always lose the same share when cold.
 - `E = 4` local experts (the 671B EP-64 layout; the V2 training runs use 8 local experts at
   ep 32 / ep 8), DeepSeek-V3 shapes from `deepseek_v3_shapes.py`. Weight tables: `w` is
   `(E, M, N)`, `M` rows (out features), `N` columns (in features). Activation tables:
@@ -29,9 +45,11 @@ environment, so compare numbers within this file only.
   with the same batch would give 65536), debugmodel 256 (no such run; 16 tiles at `E = 4`).
   Debug-model rows are 16-tile launch-floor probes on either backend, so their speedup is a
   latency ratio, not a throughput one.
-- Medians of three full script passes. The four activation tables and the baseline's
-  activation rows were re-measured at the recipe token counts on 2026-09-14 (GPU 3 of the
-  same node, 1200 MHz local cap; Triton 3.6.0 in the CUDA 13.4 container on the same GPU).
+- Medians of three full script passes; the same op re-measured on another GPU of the node
+  moves up to ~4% (op-dependent), so read speedups at that precision. The four activation
+  tables and the baseline's activation rows were re-measured at the recipe token counts, and
+  the `row_cast_quantize` table with its own bench, on 2026-09-14 (GPU 3 of the same node,
+  1200 MHz local cap; Triton 3.6.0 in the CUDA 13.4 container on the same GPU).
 
 ## Kernels
 
@@ -52,14 +70,15 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_quantize
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 11.10 | 8.80 | 0.79x | 47.2 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 11.09 | 8.77 | 0.79x | 47.3 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 10.20 | 18.10 | 1.77x | 2261.7 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 9.82 | 18.12 | 1.85x | 2348.3 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 22.95 | 39.91 | 1.74x | 5117.1 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 22.42 | 40.54 | 1.81x | 5237.5 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 5.28 | 4.47 | 0.85x | 127.2 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 5.28 | 4.45 | 0.84x | 127.2 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 7.15 | 11.77 | 1.65x | 4134.4 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 6.94 | 11.72 | 1.69x | 4257.1 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 32.09 | 52.10 | 1.62x | 4688.6 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 31.89 | 52.26 | 1.64x | 4719.0 |
 
-CuteDSL wins 1.6-1.7x at 16B and 671B and loses at the debug model (0.74x). At 671B it
+CuteDSL wins 1.6-1.7x at 16B and 671B and loses at the debug model (0.85x; the Triton cell
+there lands at 3.95 or 4.47 us from one pass to the next, so 0.75-0.85x). At 671B it
 sustains 4.7 TB/s, 59% of peak, against Triton's 2.9 TB/s. Both kernels read `A` with 16-B
 loads and write codes with 8-B stores; the CuteDSL kernel holds 48 registers with no shared
 memory, barriers or shuffles (each thread stores its swizzled scale byte directly), where
@@ -345,7 +364,7 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_col_rht_requantize
   one cell Triton's kernel wins; the op still wins on the glue), 18.02 vs 22.44 us at 16B
   gate/up (1.24x), 17.49 vs 22.48 us at 16B down (1.28x), 61.86 vs 99.26 us at 671B
   gate/up (1.60x), 65.61 vs 99.50 us at 671B down (1.52x).
-- The 671B gate, op time <= 52 us (2x the Triton 3.8.0 baseline): gate/up `w (4, 2048,
+- The 671B gate, op time <= 52 us (half the Triton 3.8.0 baseline, a 2x speedup): gate/up `w (4, 2048,
   7168)` 61.64 us -- FAIL, 9.64 us (1.19x) over; down `w (4, 7168, 2048)` 65.31 us --
   FAIL, 13.31 us (1.26x) over; against the port plan's <= 30 us -- FAIL, 2.05x and 2.18x
   over. The op is its kernel, so both verdicts are the kernel's; it is 1.70x / 1.61x
@@ -669,11 +688,12 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_quant
 
 ## Triton baseline for the nine grouped kernels
 
-The targets for the remaining ports: the five V2 ops (`row_cast_quantize`,
-`row_cast_col_rht_amax` / `_quantize` at RHT-128, `row_rht_col_rht_amax` /
-`_quantize_ms_eden`) and the four V1_REQUANT columnwise requantizers
-(`col_cast_requant_amax` / `_requantize`, `col_rht_requant_amax` / `_requantize`), one
-launch per kernel over the local expert stack at `E = 4`, fed the inputs the recipe builds: 128-aligned uniform token groups with cumulative row-end offsets
+The Triton numbers the nine ports above are measured against: the seven V2 ops
+(`row_cast_quantize` -- shared with V1_REQUANT --, `row_cast_col_rht_amax` / `_quantize`
+at RHT-128, `row_rht_col_rht_amax` / `_quantize_ms_eden`, `col_rht_requant_amax` /
+`_requantize`) and the two V1_REQUANT columnwise requantizers (`col_cast_requant_amax` /
+`_requantize`), one launch per kernel over the local expert stack at `E = 4`, fed the
+inputs the recipe builds: 128-aligned uniform token groups with cumulative row-end offsets
 for the token-jagged ops, the `(E, M, N)` weight stack for the expert-uniform ones, and the
 packed `row_fp4_w` / `row_sf_w` plus the matching `*_requant_amax` output for the
 requantizers. The weight rows are the record of a script that is not checked in. The
