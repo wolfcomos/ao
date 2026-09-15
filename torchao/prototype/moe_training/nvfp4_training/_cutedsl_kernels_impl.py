@@ -1120,6 +1120,46 @@ def _sr_e4m3_byte(
     )
 
 
+@dsl_user_op
+def _cvt_rs_e4m3x4_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    rbits: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Hardware stochastic rounding of four f32 to E4M3, packed as the word the scale
+    store takes: ``v0`` in the low byte .. ``v3`` in the high byte (PTX operand order
+    ``{v3, v2, v1, v0}``).
+
+    A different stochastic stream from ``_sr_e4m3_byte``, not a lowering of it: the high
+    half of ``rbits`` rounds ``v3`` (bit-reversed) and ``v2``, the low half ``v1``
+    (bit-reversed) and ``v0``, 16 random bits per value (``P(up) = floor(frac20 / 16) /
+    2^16`` against the software path's 20-bit ``frac20 / 2^20``). ``satfinite`` clamps at
+    448 under any ``rbits``, NaN stays NaN, signed zero is kept (measured, sm_100a).
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v3.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v0.ir_value(loc=loc, ip=ip),
+                rbits.ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rs.satfinite.e4m3x4.f32 $0, {$1, $2, $3, $4}, $5;",
+            "=r,f,f,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Hadamard matrix
 # ---------------------------------------------------------------------------

@@ -165,7 +165,8 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     # nor the reduction state lands in the graph pool.
     _compile_group_row_rht_col_rht_amax_kernel(idx)
     _get_group_amax_reduce_buffers(idx)
-    _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx)
+    for fast_path in (False, True):
+        _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx, fast_path)
     _compile_group_col_rht_requant_amax_kernel(idx)
     _compile_group_col_rht_requantize_kernel(idx)
     _compile_group_row_cast_col_rht_amax_kernel(idx)

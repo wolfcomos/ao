@@ -41,7 +41,10 @@ each accumulator quantized from TMEM to RTNE FP4 codes plus a corrected,
 stochastically rounded E4M3 block scale drawn from Triton's Philox stream. Its 256
 ceiling is ``EDEN_BLOCK_SCALE_MAX``, imported from the MS-EDEN Triton module (a
 module-level constant defined ahead of that module's Triton guard, so the import is
-Triton-free).
+Triton-free). Its ``FAST_PATH`` variant (``fast_path=True`` on the op) draws one Philox
+counter per 16 scales of a row and rounds the four corrected scales a warp holds with
+one hardware ``cvt.rs.satfinite.e4m3x4.f32``: a different stochastic stream (16 random
+bits per scale, one draw per 16 scales), not the Triton stream.
 
 Two more kernels, ``_Tcgen05GroupColRhtRequantAmax`` and ``_Tcgen05GroupColRhtRequantize``,
 serve the V2 backward weight path: the dequantized weight tile is rebuilt on chip from
@@ -91,6 +94,7 @@ from ._cutedsl_kernels_impl import (
     _bf16round_f32x8,
     _cvt_e2m1x8_to_f32,
     _cvt_rn_e2m1x8_f32,
+    _cvt_rs_e4m3x4_f32,
     _div_full_f32,
     _div_rn_f32,
     _e4m3x2_to_f16x2,
@@ -2528,13 +2532,10 @@ def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec, cap):
     return enc, pv_f8[0], sf8
 
 
-def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
-    """One 1x16 MS-EDEN block from 16 raw f32 accumulator values -> (w0, w1, E4M3 byte).
-
-    RTNE codes against the pre-correction E4M3 scale (cap 256), then the stochastically
-    rounded ``sf8 * <v, v> / <v, q>`` with ``rbits`` the block's Triton Philox word. The
-    correction reads back the codes it just packed, so it measures that exact rounding.
-    """
+def _ms_eden_block16_corrected(vals, enc_over_fp4max, dec):
+    """One 1x16 MS-EDEN block from 16 raw f32 accumulator values -> (w0, w1, corrected
+    f32 scale): everything of ``_ms_eden_block16`` ahead of the stochastic rounding, so
+    both roundings (software word, hardware ``cvt.rs``) consume the same value."""
     # The bf16-exact values serve both consumers of the rounding: their max is the block
     # amax (what ``_round_rht_amax`` of the raw amax gives: RTNE is monotonic in magnitude,
     # so the max of the rounded values is the rounded max) and they are what the encode
@@ -2569,12 +2570,33 @@ def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
     corr = cutlass.Float32(cutlass.select_(finite, ratio, cutlass.Float32(1.0)))
     # ONE RN multiply of the widened E4M3 scale (no clamp), as Triton's
     # ``block_scale * correction``.
-    return w0, w1, _sr_e4m3_byte(sf8 * corr, rbits)
+    return w0, w1, sf8 * corr
+
+
+def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
+    """One 1x16 MS-EDEN block from 16 raw f32 accumulator values -> (w0, w1, E4M3 byte).
+
+    RTNE codes against the pre-correction E4M3 scale (cap 256), then the stochastically
+    rounded ``sf8 * <v, v> / <v, q>`` with ``rbits`` the block's Triton Philox word. The
+    correction reads back the codes it just packed, so it measures that exact rounding.
+    """
+    w0, w1, corrected = _ms_eden_block16_corrected(vals, enc_over_fp4max, dec)
+    return w0, w1, _sr_e4m3_byte(corrected, rbits)
 
 
 @cute.jit
 def _rht128_tile_ms_eden(
-    acc, tidx, enc_over_fp4max, dec, state, idx_base, u_base, row_addr, rSF
+    acc,
+    tidx,
+    enc_over_fp4max,
+    dec,
+    state,
+    idx_base,
+    u_base,
+    row_addr,
+    rSF,
+    fast_path: cutlass.Constexpr,
+    word,
 ):
     """MS-EDEN quantize this warp's eighth of one 128x128 f32 TMEM accumulator: this
     thread's lane = one output row, blocks ``u_base .. u_base + 3`` of its 8.
@@ -2582,6 +2604,11 @@ def _rht128_tile_ms_eden(
     The codes go straight to global as two 16-byte stores into the lane's 16 code words
     at ``row_addr``; the four scale bytes land in ``rSF`` for the chain's own scatter.
     ``u_base`` is warp-uniform but dynamic, so both warps of a quadrant run one body.
+
+    ``FAST_PATH``: ``idx_base`` is the counter of the row's 16-scale group these blocks
+    belong to and ``word`` (0-3, warp-uniform) which of its four Philox words rounds them;
+    the four corrected scales go through one ``cvt.rs.satfinite.e4m3x4.f32`` into the
+    word ``rSF`` holds.
     """
     copy_atom_t2r = sm100_utils.get_tmem_load_op(
         RHT128_CTA_TILE_COL,
@@ -2598,17 +2625,37 @@ def _rht128_tile_ms_eden(
     tTR_tAcc = thr_copy.partition_S(tAcc_epi)
     tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
     rCodes = cute.make_rmem_tensor((2 * RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint32)
+    if cutlass.const_expr(fast_path):
+        rCorr = cute.make_rmem_tensor((RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Float32)
     for j in cutlass.range_constexpr(RHT128_MSEDEN_BLOCKS_PER_WARP):
         u = u_base + cutlass.Int32(j)
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
         vals = tTR_rAcc.load().reshape((16,))
-        # Triton's tl.randint word for this block: Philox4x32-10 at counter
-        # (offset_base, linear_idx, 0, 0), word 0.
-        rbits = philox_word0(state, cutlass.Uint32(idx_base + u))
-        w0, w1, sf = _ms_eden_block16(vals, enc_over_fp4max, dec, rbits)
+        if cutlass.const_expr(fast_path):
+            w0, w1, corrected = _ms_eden_block16_corrected(vals, enc_over_fp4max, dec)
+        else:
+            # Triton's tl.randint word for this block: Philox4x32-10 at counter
+            # (offset_base, linear_idx, 0, 0), word 0.
+            rbits = philox_word0(state, cutlass.Uint32(idx_base + u))
+            w0, w1, sf = _ms_eden_block16(vals, enc_over_fp4max, dec, rbits)
         rCodes[2 * j] = w0
         rCodes[2 * j + 1] = w1
-        rSF[j] = cutlass.Uint8(sf)
+        if cutlass.const_expr(fast_path):
+            rCorr[j] = corrected
+        else:
+            rSF[j] = cutlass.Uint8(sf)
+    if cutlass.const_expr(fast_path):
+        # Triton's tl.randint4x for the row's 16-scale group: Philox4x32-10 at counter
+        # (offset_base, linear_group16, 0, 0), all four words; this warp's four scales
+        # take word ``word`` of it, one 32-bit draw for one hardware cvt.rs of four.
+        r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base))
+        odd = (word & cutlass.Int32(1)) != cutlass.Int32(0)
+        lo = cutlass.Uint32(cutlass.select_(odd, r1, r0))
+        hi = cutlass.Uint32(cutlass.select_(odd, r3, r2))
+        rbits = cutlass.Uint32(cutlass.select_(word >= cutlass.Int32(2), hi, lo))
+        cute.recast_tensor(rSF, cutlass.Uint32)[0] = _cvt_rs_e4m3x4_f32(
+            rCorr[0], rCorr[1], rCorr[2], rCorr[3], rbits
+        )
     # 16-byte aligned by construction: the code row starts on a 64-byte boundary (the u32
     # pitch and the tile column are multiples of 16 words, the buffer is torch.empty's) and
     # ``u_base * 8`` is 0 or 32.
@@ -2670,6 +2717,7 @@ def _ms_eden_col_sf_base(g, g_end, offsets_t, hidden, u_base, lane_word):
 @cute.jit
 def _rht128_ms_eden_epilogue(
     chain: cutlass.Constexpr,
+    fast_path: cutlass.Constexpr,
     mFP4,
     mSF,
     amax_t,
@@ -2695,6 +2743,10 @@ def _rht128_ms_eden_epilogue(
     4-7 of every lane. Tile coordinates advance incrementally, and each warp's four
     scale bytes of a lane go out as the one u32 word they form in the 128x4 swizzle
     atom (``lane_word``: the lane's word within the atom).
+
+    ``FAST_PATH`` counts one Philox counter per 16 scales of a row (``randint4x``):
+    ``outer * ceil(INNER_SF / 16) + inner_tile // 2`` -- a ceil pitch, since an odd
+    inner tile count leaves the row's last group one tile (8 scales) wide.
     """
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, RHT128_ACC_STAGES
@@ -2716,6 +2768,9 @@ def _rht128_ms_eden_epilogue(
         )
         # Triton's INNER // 16 with INNER = M, the packed capacity.
         inner_blocks = tokens // cutlass.Int32(16)
+        inner_groups = (
+            tokens // cutlass.Int32(128) + cutlass.Int32(1)
+        ) // cutlass.Int32(2)
     else:
         state = philox_prep(
             cutlass.Uint32(sr_rng_t[4]),
@@ -2723,6 +2778,9 @@ def _rht128_ms_eden_epilogue(
             cutlass.Uint32(sr_rng_t[6]),
         )
         inner_blocks = hidden // cutlass.Int32(16)
+        inner_groups = (
+            hidden // cutlass.Int32(128) + cutlass.Int32(1)
+        ) // cutlass.Int32(2)
     tile_n = t_begin // tiles_in_m
     tile_m = t_begin - tile_n * tiles_in_m
     g = _group_idx(tile_n * cutlass.Int32(TOKEN_TILE), offsets_t, num_tensors)
@@ -2754,6 +2812,12 @@ def _rht128_ms_eden_epilogue(
         # linear_idx of block 0: the flat index of the scale in the plain
         # (outer, inner // 16) layout, Triton's counter.
         idx_base = outer * inner_blocks + inner_tile * cutlass.Int32(RHT128_DIM // 16)
+        word = cutlass.Int32(0)
+        if cutlass.const_expr(fast_path):
+            # linear_group16 of the row's 16-scale group these two inner tiles form, and
+            # this warp's word of the four it yields: tile parity, then half.
+            idx_base = outer * inner_groups + inner_tile // cutlass.Int32(2)
+            word = (inner_tile % cutlass.Int32(2)) * cutlass.Int32(2) + half
         acc_pipeline.consumer_wait(acc_state)
         _rht128_tile_ms_eden(
             tCtAcc[(None, None, None, 2 * acc_state.index + chain)],
@@ -2765,6 +2829,8 @@ def _rht128_ms_eden_epilogue(
             u_base,
             gOut[(r_local, None)].iterator.toint(),
             rSF,
+            fast_path,
+            word,
         )
         cute.arch.fence_view_async_tmem_load()
         with cute.arch.elect_one():
@@ -2888,7 +2954,13 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
     below ``logical_packed_length`` only, hidden-fastest. Twenty warps (``RHT128_MSEDEN_*``):
     eight epilogue warps per chain, launch-bounded to one CTA per SM (at most 96 registers a
     thread, 65536 / 640 at the 8-register granularity, no ``setmaxnreg``).
+    ``fast_path`` selects the ``FAST_PATH`` epilogues: one Philox counter per 16 scales of
+    a row and one hardware ``cvt.rs.satfinite.e4m3x4.f32`` per warp per tile -- a different
+    stochastic stream from the Triton op's, not bitwise with it.
     """
+
+    def __init__(self, fast_path: bool = False):
+        self.fast_path = fast_path
 
     @cute.jit
     def __call__(
@@ -3227,6 +3299,7 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
             _rht128_ms_eden_epilogue(
                 0,
+                self.fast_path,
                 mColFP4,
                 mColSF,
                 col_amax_t,
@@ -3266,6 +3339,7 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
             tCtAcc = cute.make_tensor(tmem_ptr, acc_fake_layout)
             _rht128_ms_eden_epilogue(
                 1,
+                self.fast_path,
                 mRowFP4,
                 mRowSF,
                 row_amax_t,
@@ -3285,12 +3359,15 @@ class _Tcgen05GroupRowRhtColRhtQuantizeMsEden:
 
 
 @functools.lru_cache(maxsize=None)
-def _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(device_idx: int):
-    """Compile the grouped row-RHT + col-RHT MS-EDEN quantize kernel with symbolic shapes."""
+def _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(
+    device_idx: int, fast_path: bool
+):
+    """Compile the grouped row-RHT + col-RHT MS-EDEN quantize kernel with symbolic shapes
+    (cached per device+flag)."""
     free = cute.sym_int
     h_sym = cute.sym_int(divisibility=M_TILE)
     t_sym = cute.sym_int(divisibility=TOKEN_TILE)
-    k = _Tcgen05GroupRowRhtColRhtQuantizeMsEden()
+    k = _Tcgen05GroupRowRhtColRhtQuantizeMsEden(fast_path=fast_path)
     return cute.compile(
         k,
         make_fake_tensor(cutlass.BFloat16, (h_sym, t_sym, 1), stride=(1, free(), 1)),
@@ -3348,6 +3425,7 @@ def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
     num_tensors: int,
     rng_state: torch.Tensor,
     logical_packed_length: Optional[torch.Tensor] = None,
+    fast_path: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """MS-EDEN quantize of ``dy @ R_n`` (rowwise) and ``dy.t() @ R_m`` (columnwise), per group.
 
@@ -3357,7 +3435,8 @@ def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
     Returns ``(row_fp4, row_sf, col_fp4, col_sf)`` rowwise first: uint8 code views of the
     u32 buffers and the 4-D swizzled e4m3 scale storage the wrapper returns as 2-D views.
     Rows at or after ``logical_packed_length`` are never read and their outputs are left
-    as allocated.
+    as allocated. ``fast_path`` selects the ``FAST_PATH`` kernel variant (hardware
+    stochastic rounding, one Philox draw per 16 scales; not bitwise with the Triton op).
     """
     tokens, hidden = dy.shape
     dev = dy.device
@@ -3384,7 +3463,7 @@ def _cutedsl_group_row_rht_col_rht_quantize_ms_eden_impl(
     num_ctas = max(1, min(tiles, _get_num_sms(dev.index)))
 
     stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
-    _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(dev.index)(
+    _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(dev.index, bool(fast_path))(
         dy.t().unsqueeze(-1),
         h128,
         dgrad_rht,

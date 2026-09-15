@@ -113,6 +113,39 @@ def _ms_eden(kernel, dy, ar, ac, d, w, offs, E, rng):
     )
 
 
+def _ms_eden_fast(dy, ar, ac, d, w, offs, E, rng):
+    """The CuteDSL op's ``FAST_PATH`` (hardware stochastic rounding, one Philox draw per
+    16 scales): a different random stream from the Triton op's, so never compared bitwise
+    to it -- only its codes are."""
+    return cutedsl_group_row_rht_col_rht_quantize_ms_eden(
+        dy,
+        ar,
+        ac,
+        d,
+        w,
+        offs,
+        E,
+        dy.shape[0],
+        dy.shape[1],
+        VARYING_FIRST_DIM,
+        rng,
+        offs[-1:],
+        fast_path=True,
+    )
+
+
+def _e4m3_neighbours(corrected):
+    """The two E4M3 grid values a stochastic rounding of ``corrected`` chooses between and
+    the 20-bit fractional position between them -- the software path's own 2^-120 grid
+    trick (E4M3 subnormals included), so the neighbours are exactly what both roundings
+    pick from."""
+    bits = (corrected.float() * 2.0**-120).view(torch.int32)
+    frac20 = bits & 0xFFFFF
+    lo = (bits - frac20).view(torch.float32) * 2.0**120
+    hi = (bits - frac20 + (1 << 20)).view(torch.float32) * 2.0**120
+    return lo, hi, frac20.float() / 2.0**20
+
+
 # --- §11.2 ------------------------------------------------------------------
 
 
@@ -587,6 +620,322 @@ def test_cutedsl_ms_eden_matches_triton(group_sizes, hidden):
             c, t, ("row codes", "row scales", "col codes", "col scales")
         ):
             assert torch.equal(got, ref), f"{label} differ for rng_state {words}"
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_fast_path_fixed_rng_state_reproduces_bitwise():
+    """The fast path is a separate compiled variant and, like the default, a pure function
+    of ``(rng_state, position)``: same state, same bytes, launch after launch."""
+    from torchao.prototype.moe_training.nvfp4_training._cutedsl_group_kernels_impl import (
+        _compile_group_row_rht_col_rht_quantize_ms_eden_kernel,
+    )
+
+    dy, offs = _packed([256], 512)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 1)
+    rng = torch.tensor([5, 6, 7, 8], dtype=torch.int64, device="cuda")
+    a = _ms_eden_fast(dy, ar, ac, d, w, offs, 1, rng)
+    b = _ms_eden_fast(dy, ar, ac, d, w, offs, 1, rng)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+    idx = dy.device.index
+    assert _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(
+        idx, True
+    ) is not _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx, False)
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@pytest.mark.parametrize(
+    "group_sizes", [[256], [128, 128], [256, 128, 384], [128, 256]]
+)
+@torch.no_grad()
+def test_fast_path_scales_are_neighbours_of_the_default_path(group_sizes):
+    """Both paths round the same fp32 corrected scale onto its two E4M3 neighbours (the
+    hardware ``cvt.rs`` never leaves the pair, measured on sm_100a), so a fast byte is
+    the default byte or one E4M3 step from it on every scale, on every group layout --
+    and the codes are the default path's RTNE codes. The reference's corrected scale is
+    held to the same one-step band as in ``test_multi_group_matches_the_reference``."""
+    from torchao.prototype.mx_formats.utils import from_blocked
+
+    from .nvfp4_reference import (
+        from_blocked_grouped,
+        reference_group_row_rht_col_rht_quantize_ms_eden,
+    )
+
+    N = 512
+    E = len(group_sizes)
+    M = sum(group_sizes)
+    dy, offs = _packed(group_sizes, N, seed=3)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, E)
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    row_codes, row_sf, col_codes, col_sf = _ms_eden_fast(dy, ar, ac, d, w, offs, E, rng)
+    default = _ms_eden("cutedsl", dy, ar, ac, d, w, offs, E, rng)
+    ref_row_codes, ref_row_scale, ref_col_codes, ref_col_scale = (
+        reference_group_row_rht_col_rht_quantize_ms_eden(dy, ar, ac, d, w, offs, E)
+    )
+
+    assert_codes_bitwise(row_codes, ref_row_codes, "row codes")
+    assert_codes_bitwise(col_codes, ref_col_codes, "col codes")
+    assert torch.equal(row_codes, default[0]) and torch.equal(col_codes, default[2])
+    assert_scales_adjacent(row_sf, default[1], "row scales vs the default path")
+    assert_scales_adjacent(col_sf, default[3], "col scales vs the default path")
+    assert_scales_adjacent(
+        from_blocked(row_sf, M, N // 16),
+        ref_row_scale.to(torch.float8_e4m3fn),
+        "row scales",
+    )
+    assert_scales_adjacent(
+        from_blocked_grouped(col_sf, N, group_sizes),
+        ref_col_scale.to(torch.float8_e4m3fn),
+        "col scales",
+    )
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_fast_path_rounds_up_with_the_fractional_position():
+    """The acceptance test of the different stream, over 2^20 scales per axis.
+
+    The default path's round-up probability is the 20-bit fractional position by
+    construction (bitwise with Triton), so the fast path is held to it: the mean signed
+    E4M3-step difference fast - default is zero within five standard errors and the two
+    round-up rates agree within 0.01, overall and in 16 bins of the reference's
+    fractional position (the hardware truncates the position to 16 bits, a bias of at
+    most 15 / 2^20 of a step, far below resolution), and the two paths differ on about a
+    third of the scales (independent decisions at uniform positions:
+    ``E[2 p (1 - p)] = 1/3``). The reference position only partitions the bins: on a
+    few percent of the blocks it sits a fraction of a step above the kernel's (the
+    one-step band of ``test_multi_group_matches_the_reference``, shared by the Triton
+    op), which moves scales between bins and cannot bias fast - default.
+    """
+    from torchao.prototype.mx_formats.utils import from_blocked
+
+    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+
+    M = N = 4096
+    dy, offs = _packed([M], N, seed=7)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 1)
+    rng = torch.tensor([11, 12, 13, 14], dtype=torch.int64, device="cuda")
+    fast = _ms_eden_fast(dy, ar, ac, d, w, offs, 1, rng)
+    default = _ms_eden("cutedsl", dy, ar, ac, d, w, offs, 1, rng)
+    row_ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
+    col_ref = reference_ms_eden(reference_dynamic_rht(dy, w, transpose=True), ac[0])
+    assert_codes_bitwise(fast[0], row_ref.codes, "row codes")
+    assert_codes_bitwise(fast[2], col_ref.codes, "col codes")
+
+    for got, base, ref, (rows, cols), label in (
+        (fast[1], default[1], row_ref.corrected_scale, (M, N // 16), "rowwise"),
+        (fast[3], default[3], col_ref.corrected_scale, (N, M // 16), "colwise"),
+    ):
+        got = from_blocked(got, *(rows, cols))
+        base = from_blocked(base, *(rows, cols))
+        # Signed byte delta = signed E4M3-step delta (positive bytes are monotonic).
+        steps = (
+            got.view(torch.uint8).to(torch.int16)
+            - base.view(torch.uint8).to(torch.int16)
+        ).float()
+        assert (steps.abs() <= 1).all(), f"{label}: fast is not a neighbour of default"
+        _, _, frac = _e4m3_neighbours(ref)
+        keep = frac > 0  # scales exactly on the grid have nothing to round
+        n = int(keep.sum())
+        assert n >= 2**20 - 2**12, f"{label}: {n} scales"
+        steps, frac = steps[keep], frac[keep]
+        z = steps.mean() * math.sqrt(n) / steps.std()
+        assert abs(z.item()) < 5.0, (
+            f"{label}: fast vs default round-up rate, z = {z:.2f}"
+        )
+        differ = (steps != 0).float().mean().item()
+        assert 0.28 <= differ <= 0.38, (
+            f"{label}: paths differ on {differ:.3f}, not ~1/3"
+        )
+        bins = (frac * 16).long().clamp_(max=15)
+        for b in range(16):
+            sel = bins == b
+            nb = int(sel.sum())
+            z_bin = steps[sel].mean() * math.sqrt(nb) / steps[sel].std()
+            # mean(steps) = P(up | fast) - P(up | default) in E4M3 steps.
+            assert abs(z_bin.item()) < 5.0 and abs(steps[sel].mean().item()) < 0.01, (
+                f"{label} bin {b}: fast vs default round-up rate, z = {z_bin:.2f}, "
+                f"delta = {steps[sel].mean():.4f} over {nb} scales"
+            )
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_fast_path_is_unbiased():
+    """``test_ms_eden_is_unbiased`` for the fast path: ``E[sampled scale] == corrected
+    scale`` and ``E[dequant] == ideal_dequant`` within five standard errors over 64
+    draws (the 16-bit truncation bias, at most 15 / 2^20 of an E4M3 step, is far below
+    the bound)."""
+    from torchao.prototype.mx_formats.utils import from_blocked
+
+    from .nvfp4_reference import (
+        EDEN_BLOCK_SCALE_MAX,
+        reference_dequantize_rowwise,
+        reference_dynamic_rht,
+        reference_ms_eden,
+    )
+
+    M, N = 128, 256
+    dy, offs = _packed([M], N)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 1)
+    row_ref = reference_ms_eden(reference_dynamic_rht(dy, d, transpose=False), ar[0])
+    col_ref = reference_ms_eden(reference_dynamic_rht(dy, w, transpose=True), ac[0])
+
+    draws = 64
+    row_scales, col_scales, dequants = [], [], []
+    for i in range(draws):
+        rng = torch.tensor([1, i, 2, i + 1000], dtype=torch.int64, device="cuda")
+        row_codes, row_sf, _, col_sf = _ms_eden_fast(dy, ar, ac, d, w, offs, 1, rng)
+        assert torch.equal(row_codes, row_ref.codes), (
+            "MS-EDEN codes are RTNE and must not move with the seed"
+        )
+        row_scales.append(from_blocked(row_sf, M, N // 16).float())
+        col_scales.append(from_blocked(col_sf, N, M // 16).float())
+        dequants.append(
+            reference_dequantize_rowwise(
+                row_codes, row_sf, ar[0], fp8_max=EDEN_BLOCK_SCALE_MAX
+            )
+        )
+
+    for samples, target, label in (
+        (torch.stack(row_scales), row_ref.corrected_scale, "rowwise block scale"),
+        (torch.stack(col_scales), col_ref.corrected_scale, "colwise block scale"),
+        (torch.stack(dequants), row_ref.ideal_dequant, "reconstruction"),
+    ):
+        mean = samples.mean(dim=0)
+        se = samples.std(dim=0, unbiased=True) / math.sqrt(draws)
+        assert (mean - target).norm() <= 5.0 * se.norm() + 1e-5 * target.norm(), (
+            f"{label} mean is biased away from the unrounded Eden target"
+        )
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@pytest.mark.parametrize("group_sizes,hidden", [([1408] * 4, 1408), ([2048] * 4, 2048)])
+@torch.no_grad()
+def test_fast_path_sqnr_matches_the_default_path(group_sizes, hidden):
+    """Two unbiased roundings of the same corrected scales reconstruct the rotated input
+    equally well: dequantized SQNR within 0.1 dB of the default path on both axes at the
+    recipe shapes, with no NaN scale byte and zero input quantized to zero."""
+    from torchao.float8.float8_utils import compute_error
+    from torchao.prototype.mx_formats.utils import from_blocked
+
+    from ._assertions import assert_zero_quantized
+    from .nvfp4_reference import (
+        EDEN_BLOCK_SCALE_MAX,
+        from_blocked_grouped,
+        reference_dequantize_rowwise,
+        reference_dynamic_rht,
+    )
+
+    E = len(group_sizes)
+    M = sum(group_sizes)
+    dy, offs = _packed(group_sizes, hidden, seed=5)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, E)
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    outs = {
+        "default": _ms_eden("cutedsl", dy, ar, ac, d, w, offs, E, rng),
+        "fast": _ms_eden_fast(dy, ar, ac, d, w, offs, E, rng),
+    }
+    sqnr = {}
+    for path, (row_codes, row_sf, col_codes, col_sf) in outs.items():
+        for sf in (row_sf, col_sf):
+            assert not (sf.view(torch.uint8) & 0x7F == 0x7F).any(), f"{path}: NaN scale"
+        row_scale = from_blocked(row_sf, M, hidden // 16)
+        col_scale = from_blocked_grouped(col_sf, hidden, group_sizes)
+        start = 0
+        for g, size in enumerate(group_sizes):
+            end = start + size
+            rht = reference_dynamic_rht(dy[start:end], d, transpose=False)
+            dq = reference_dequantize_rowwise(
+                row_codes[start:end],
+                row_scale[start:end],
+                ar[g],
+                is_swizzled=False,
+                fp8_max=EDEN_BLOCK_SCALE_MAX,
+            )
+            sqnr[path, "row", g] = compute_error(rht.float(), dq).item()
+            rht_t = reference_dynamic_rht(dy[start:end], w, transpose=True)
+            dq_t = reference_dequantize_rowwise(
+                col_codes[:, start // 2 : end // 2],
+                col_scale[:, start // 16 : end // 16],
+                ac[g],
+                is_swizzled=False,
+                fp8_max=EDEN_BLOCK_SCALE_MAX,
+            )
+            sqnr[path, "col", g] = compute_error(rht_t.float(), dq_t).item()
+            start = end
+    for (path, axis, g), value in sqnr.items():
+        if path == "fast":
+            assert abs(value - sqnr["default", axis, g]) <= 0.1, (
+                f"{axis} group {g}: fast {value:.3f} dB vs default "
+                f"{sqnr['default', axis, g]:.3f} dB"
+            )
+
+    zero = torch.zeros_like(dy)
+    zr, zc = _amax("cutedsl", zero, d, w, offs, E)
+    row_codes, row_sf, col_codes, col_sf = _ms_eden_fast(
+        zero, zr, zc, d, w, offs, E, rng
+    )
+    assert_zero_quantized(row_codes, row_sf)
+    assert_zero_quantized(col_codes, col_sf)
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_fast_path_each_rng_slice_drives_exactly_one_output():
+    """``test_each_rng_slice_drives_exactly_one_output`` for the fast path, plus the
+    statement that two seeds are two independent streams: their round-up decisions agree
+    on ~2/3 of the scales (uniform fractional positions: ``E[p^2 + (1 - p)^2] = 2/3``),
+    not on all of them and not on the software path's fraction."""
+    M, N = 256, 512
+    dy, offs = _packed([M], N)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 1)
+
+    def run(rng):
+        return _ms_eden_fast(
+            dy,
+            ar,
+            ac,
+            d,
+            w,
+            offs,
+            1,
+            torch.tensor(rng, dtype=torch.int64, device="cuda"),
+        )
+
+    base = run([1, 2, 3, 4])
+    for slot, name, drives_col in (
+        (0, "col_seed", True),
+        (1, "col_offset", True),
+        (2, "row_seed", False),
+        (3, "row_offset", False),
+    ):
+        rng = [1, 2, 3, 4]
+        rng[slot] += 100
+        row_codes, row_sf, col_codes, col_sf = run(rng)
+        assert torch.equal(row_codes, base[0]), "codes are RTNE and never move"
+        assert torch.equal(col_codes, base[2]), "codes are RTNE and never move"
+        moved, held = (col_sf, row_sf) if drives_col else (row_sf, col_sf)
+        moved_base, held_base = (base[3], base[1]) if drives_col else (base[1], base[3])
+        assert not torch.equal(moved, moved_base), f"{name} must move its own scales"
+        assert torch.equal(held, held_base), f"{name} must leave the other axis alone"
+        agree = (moved.view(torch.uint8) == moved_base.view(torch.uint8)).float().mean()
+        assert 0.60 <= agree.item() <= 0.74, (
+            f"{name}: two seeds agree on {agree:.3f} of the scales, not ~2/3"
+        )
 
 
 @_needs_ms_eden

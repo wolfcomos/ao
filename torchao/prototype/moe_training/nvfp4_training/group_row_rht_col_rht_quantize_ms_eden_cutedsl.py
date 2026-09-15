@@ -45,6 +45,7 @@ def cutedsl_group_row_rht_col_rht_quantize_ms_eden(
     shape_rep: int,
     rng_state: torch.Tensor,
     logical_packed_length: Optional[torch.Tensor] = None,
+    fast_path: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-group MS-EDEN quantization of the rotated gradient and its transpose (CuteDSL, SM100+).
 
@@ -58,6 +59,13 @@ def cutedsl_group_row_rht_col_rht_quantize_ms_eden(
 
     ``rng_state`` is the int64 ``[col_seed, col_offset, row_seed, row_offset]`` the Triton op
     takes; MS-EDEN always draws, so it is required.
+
+    ``fast_path=True`` selects the hardware stochastic rounding variant: one Philox counter per
+    16 scales of a row (``randint4x``) and one ``cvt.rs.satfinite.e4m3x4.f32`` for the four
+    scales a warp holds, a different random-bit construction from the software rounding. Its
+    scale bytes are therefore not bitwise with the Triton op's -- each lands on one of the two
+    E4M3 neighbours of the same corrected scale -- while the codes are identical; ``False`` (the
+    default) is bitwise with the Triton op.
 
     Returns ``(row_fp4_rht_dy, row_sf_rht_dy, col_fp4_rht_dy_t, col_sf_rht_dy_t)`` -- rowwise
     first: ``(psl, hidden//2)`` uint8, ``(psl, hidden//16)`` float8_e4m3fn (a view of the
@@ -126,6 +134,7 @@ def cutedsl_group_row_rht_col_rht_quantize_ms_eden(
             num_tensors,
             rng_state,
             logical_packed_length=logical_packed_length,
+            fast_path=fast_path,
         )
     )
     # Rowwise pair first, matching every sibling quantize op.
@@ -151,6 +160,7 @@ def _(
     shape_rep,
     rng_state,
     logical_packed_length=None,
+    fast_path=False,
 ):
     qd = dy.new_empty((hidden_size, packed_sequence_length // 2), dtype=torch.uint8)
     sfd = dy.new_empty(
