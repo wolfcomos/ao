@@ -256,6 +256,51 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   the instruction cache. The times above were measured before `_sr_e4m3_byte` gained its
   sign select (one `shr.u32` more per block), a form byte-identical on every valid input.
 
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quantize_ms_eden --fast-path
+```
+
+| model | projection | E | tokens | dim | cutedsl_fast_us | cutedsl_us | fast/default | triton_us | speedup | cutedsl_fast_gbps |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 11.06 | 11.48 | 0.964x | 32.30 | 2.92x | 74.0 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 11.07 | 11.50 | 0.962x | 32.11 | 2.90x | 74.0 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 100.39 | 117.75 | 0.853x | 289.15 | 2.88x | 2154.2 |
+| 16B | down (w2) | 4 | 12288 | 2048 | 141.15 | 166.23 | 0.849x | 405.27 | 2.87x | 2228.6 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 354.96 | 421.32 | 0.842x | 1033.00 | 2.91x | 2363.3 |
+| 671B | down (w2) | 4 | 32768 | 7168 | 1217.59 | 1457.21 | 0.836x | 3554.27 | 2.92x | 2411.3 |
+
+- `--fast-path` (the same shapes, medians of 3 passes at the 1200 MHz application clock;
+  the `cutedsl_us` column is the default path re-measured in the same session on the
+  kernel after the perf commits, so it is the current default at these shapes -- the table
+  above this block predates those commits): the `FAST_PATH` variant of the CuteDSL op
+  rounds the corrected block scales in hardware -- one Philox4x32-10 counter per 16 scales
+  of a row (Triton's `randint4x` at counter `(offset_base, outer * ceil(INNER_SF / 16) +
+  inner_tile // 2)`, the same `(seed, offset_base)` per chain, recomputed by each of the
+  four warp-tiles that share it) and, per warp and tile, one `cvt.rs.satfinite.e4m3x4.f32`
+  of the four corrected scales the warp holds with the draw's word `2 * (inner_tile % 2) +
+  half`, written as the u32 scale word -- in place of four Philox rounds, four software
+  20-bit roundings and the byte pack per warp-tile. 671B down 1457.21 -> 1217.59 us
+  (-16.4%, 2015 -> 2411 GB/s), 16B down 166.23 -> 141.15 us (-15.1%), 16B gate/up 117.75
+  -> 100.39 us (-14.7%). The fast variant's cubin holds 3424 SASS against the default's
+  3592 (REG 96, LOCAL 0, one CTA per SM on both): 4 `F2FP.*.RS` -- the `cvt.rs` of four
+  scales, one per epilogue warp body -- in place of 112 of the 127 `IMAD.WIDE.U32` (the
+  software Philox rounds; 15 remain for the per-16-scale counter), `LOP3` 335 -> 221,
+  `SHF` 70 -> 50. The default variant's SASS is byte-identical to the branch's before this
+  commit (3592 lines, opcode and operand text), and its four outputs are `torch.equal` to
+  the branch's and to Triton 3.8's on 14 cases.
+- The fast path is a different stochastic stream, not a lowering of the software rounding:
+  the hardware reads 16 random bits per value (`P(up) = floor(frac20 / 16) / 2^16` against
+  the software path's 20-bit `frac20 / 2^20`; the two values of a pair share one half of
+  the word, one of them bit-reversed) and always lands on one of the two E4M3 neighbours
+  of the same corrected scale (measured on sm_100a: 0 non-neighbour outputs in 4 x 2^20
+  random draws, `P(up) = 1.000 +- 0.003 * position`). Its scale bytes are therefore not
+  bitwise with the Triton op's -- about a third of them differ by one E4M3 step, the
+  independent-decision rate -- while the codes are identical and the default
+  (`fast_path=False`) column stays bitwise. Accepted by distribution (`test_fast_path_*`:
+  neighbour membership, round-up rate vs fractional position over 2^20 scales per axis,
+  dequantized SQNR within 0.1 dB of the default path at the 16B recipe shapes), not by
+  `torch.equal`.
+
 ### group_col_rht_requant_amax (`cutedsl_group_col_rht_requant_amax` vs `triton_group_col_rht_requant_amax`)
 
 The V2 backward weight amax: one pass over the packed forward weight of the `(E, M, N)`
