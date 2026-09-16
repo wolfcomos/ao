@@ -65,6 +65,20 @@ and are accepted by the distribution tests described under the kernel.
 | row_cast_col_rht_amax | yes | 4.31-4.54x | 4.97-5.13x | 5485-5846 |
 | row_cast_col_rht_quantize | yes | 2.11-2.14x | 2.27-2.28x | 4075-4178 |
 
+## End to end
+
+An internal end-to-end comparison of the V2 recipe (DeepSeek-V3 671B, 16 nodes x 4 GB300,
+ep-32, bs-8, compiled, unseeded; the cluster's own clocks, not this file's 1200 MHz frame)
+ran `kernel_preference=cutedsl` against `triton` at the same torchtitan and torchao pin,
+once on the kernels before the perf commits (0556473f1) and once on this record's
+(f6f0e0999). The CuteDSL arm was the faster of the two in step TFLOP/s in both runs. The
+nine ops are a small share of the step, so the `fast_path` variant of the MS-EDEN quantize
+is projected to move step throughput by well under a percent, below what a single
+cross-node run pair resolves; it was never run end to end (the V2 recipe has no `fast_path`
+knob). Unseeded runs start the two arms from different weights, so loss is a band reading
+only; the step-level bitwise check is the seeded 16B gate, not yet run. The per-run
+numbers and raw traces are kept in an internal record.
+
 ## Kernels
 
 ### group_row_cast_quantize
