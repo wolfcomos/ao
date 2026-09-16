@@ -699,19 +699,18 @@ def test_fast_path_scales_are_neighbours_of_the_default_path(group_sizes):
 @_skip_no_cutedsl
 @torch.no_grad()
 def test_fast_path_rounds_up_with_the_fractional_position():
-    """The acceptance test of the different stream, over 2^20 scales per axis.
+    """The acceptance test of the stochastic rounding, over 2^20 scales per axis.
 
-    The default path's round-up probability is the 20-bit fractional position by
-    construction (bitwise with Triton), so the fast path is held to it: the mean signed
-    E4M3-step difference fast - default is zero within five standard errors and the two
-    round-up rates agree within 0.01, overall and in 16 bins of the reference's
-    fractional position (the hardware truncates the position to 16 bits, a bias of at
-    most 15 / 2^20 of a step, far below resolution), and the two paths differ on about a
-    third of the scales (independent decisions at uniform positions:
-    ``E[2 p (1 - p)] = 1/3``). The reference position only partitions the bins: on a
-    few percent of the blocks it sits a fraction of a step above the kernel's (the
-    one-step band of ``test_multi_group_matches_the_reference``, shared by the Triton
-    op), which moves scales between bins and cannot bias fast - default.
+    Both paths round the reference's fp32 corrected scale: every scale clear of the E4M3
+    grid lands on one of its two neighbours, and the round-up rate follows the fractional
+    position between them within 0.01 in each of 16 bins and within five standard errors
+    overall (the fast path truncates the position to 16 bits, a bias of at most 15 / 2^20
+    of a step, far below resolution). A correction fed the clamped scaled values misses
+    the pair on 0.3 % of the scales and rounds up 0.035 less often than the position says
+    (z about -90). The two paths are then held to each other: the mean signed E4M3-step
+    difference fast - default is zero within five standard errors overall and per bin, and
+    they differ on about a third of the scales (independent decisions at uniform
+    positions: ``E[2 p (1 - p)] = 1/3``).
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
@@ -735,16 +734,35 @@ def test_fast_path_rounds_up_with_the_fractional_position():
     ):
         got = from_blocked(got, *(rows, cols))
         base = from_blocked(base, *(rows, cols))
+        lo, hi, frac = _e4m3_neighbours(ref)
+        keep = frac > 0  # scales exactly on the grid have nothing to round
+        n = int(keep.sum())
+        assert n >= 2**20 - 2**12, f"{label}: {n} scales"
+        # The reference sums the dot products in another order than the kernels, so only
+        # scales clear of a grid point by more than that noise are held to the pair.
+        clear = (frac > 2**-10) & (frac < 1 - 2**-10)
+        bins = (frac[keep] * 16).long().clamp_(max=15)
+        var = (frac[keep] * (1 - frac[keep])).sum()
+        ups = {}
+        for path, x in (("fast", got), ("default", base)):
+            x = x.float()
+            outside = ~((x == lo) | (x == hi)) & clear
+            assert not outside.any(), (
+                f"{label}: {int(outside.sum())} {path} scales are not a neighbour of the "
+                "reference's corrected scale"
+            )
+            up = (x[keep] == hi[keep]).float()
+            z = (up.sum() - frac[keep].sum()) / var.sqrt()
+            assert abs(z.item()) < 5.0, (
+                f"{label}: {path} round-up rate vs position, z = {z:.2f}"
+            )
+            ups[path] = up
         # Signed byte delta = signed E4M3-step delta (positive bytes are monotonic).
         steps = (
             got.view(torch.uint8).to(torch.int16)
             - base.view(torch.uint8).to(torch.int16)
         ).float()
         assert (steps.abs() <= 1).all(), f"{label}: fast is not a neighbour of default"
-        _, _, frac = _e4m3_neighbours(ref)
-        keep = frac > 0  # scales exactly on the grid have nothing to round
-        n = int(keep.sum())
-        assert n >= 2**20 - 2**12, f"{label}: {n} scales"
         steps, frac = steps[keep], frac[keep]
         z = steps.mean() * math.sqrt(n) / steps.std()
         assert abs(z.item()) < 5.0, (
@@ -754,10 +772,15 @@ def test_fast_path_rounds_up_with_the_fractional_position():
         assert 0.28 <= differ <= 0.38, (
             f"{label}: paths differ on {differ:.3f}, not ~1/3"
         )
-        bins = (frac * 16).long().clamp_(max=15)
         for b in range(16):
             sel = bins == b
             nb = int(sel.sum())
+            position = frac[sel].mean().item()
+            for path, up in ups.items():
+                assert abs(up[sel].mean().item() - position) < 0.01, (
+                    f"{label} bin {b}: {path} P(up) {up[sel].mean():.4f} vs position "
+                    f"{position:.4f} over {nb} scales"
+                )
             z_bin = steps[sel].mean() * math.sqrt(nb) / steps[sel].std()
             # mean(steps) = P(up | fast) - P(up | default) in E4M3 steps.
             assert abs(z_bin.item()) < 5.0 and abs(steps[sel].mean().item()) < 0.01, (

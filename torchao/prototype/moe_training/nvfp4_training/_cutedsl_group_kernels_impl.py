@@ -105,7 +105,7 @@ from ._cutedsl_kernels_impl import (
     _get_sr_rng_buffer,
     _max_f32,
     _min_f32,
-    _mul_clamp_f32x8,
+    _mul_f32x8,
     _pack16_rn_from_enc,
     _quant16,
     _rcp_rn_f32,
@@ -2557,7 +2557,9 @@ def _ms_eden_block16_corrected(vals, enc_over_fp4max, dec):
     enc, _, sf8 = _ms_eden_enc_from_amax(
         _abs_amax16(e), enc_over_fp4max, dec, cutlass.Float32(EDEN_BLOCK_SCALE_MAX)
     )
-    v = _mul_clamp_f32x8(*e[0:8], enc) + _mul_clamp_f32x8(*e[8:16], enc)
+    # Unclamped, as Triton's ``_ms_eden_correction_with_sr``; the codes saturate in
+    # ``cvt.rn.satfinite`` regardless.
+    v = _mul_f32x8(*e[0:8], enc) + _mul_f32x8(*e[8:16], enc)
     w0 = _cvt_rn_e2m1x8_f32(*v[0:8])
     w1 = _cvt_rn_e2m1x8_f32(*v[8:16])
     q = _cvt_e2m1x8_to_f32(w0) + _cvt_e2m1x8_to_f32(w1)

@@ -97,6 +97,13 @@ if torch_version_at_least("2.10.0") and has_triton():
         dequant stays a full FP4 error away from it. It falls back to 1.0 where the
         ratio is undefined: a block that packs to all-zero codes has ``<v, q> == 0``.
 
+        ``scaled`` must be the unclamped tile. When the block's E4M3 scale rounded down
+        (half the blocks), its amax element sits in (6, 6.375] and saturates to code 6;
+        the correction repays exactly that excess. Fed the clamped tile it sees ``v ==
+        q == 6`` there, repays nothing, and the block comes out ~0.7 % small -- a
+        one-sided bias the stochastic step cannot average away. ``reference_ms_eden``
+        and the kernels this op was ported from take the unclamped values.
+
         The E4M3 rounding is MS-EDEN's only random step, and it happens here in fp32.
         The returned value already sits exactly on the E4M3 grid, so the implicit
         fp32 -> float8_e4m3fn conversion in the scale store is exact and cannot
@@ -203,6 +210,7 @@ if torch_version_at_least("2.10.0") and has_triton():
             BLOCK_N % RHT_SIZE == 0, "rowwise RHT requires BLOCK_N % RHT_SIZE == 0"
         )
         VARYING_FIRST_DIM: tl.constexpr = 1
+        FP4_E2M1_MAX: tl.constexpr = 6.0
 
         tile_idx = tl.program_id(0)
         num_tiles_token = tl.cdiv(M, BLOCK_M)
@@ -244,6 +252,8 @@ if torch_version_at_least("2.10.0") and has_triton():
             # through bfloat16, and this op exposes no switch to skip it.
             a_t_rht = tl.dot(a_t_reshape, col_rht).to(tl.bfloat16)
 
+            # Unclamped for the correction (``_ms_eden_correction_with_sr``); the packer
+            # gets a clamped copy.
             col_scale, col_scaled = _nvfp4_quantize(
                 a_t_rht,
                 col_global_amax,
@@ -251,8 +261,13 @@ if torch_version_at_least("2.10.0") and has_triton():
                 BLOCK_M,
                 False,  # FAST_MATH
                 _EDEN_BLOCK_SCALE_MAX,
+                CLAMP=False,
             )
-            col_pairs = col_scaled.reshape(BLOCK_N, BLOCK_M // 2, 2).split()
+            col_pairs = (
+                tl.clamp(col_scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
+                .reshape(BLOCK_N, BLOCK_M // 2, 2)
+                .split()
+            )
             col_fp4 = convert_8xfp32_to_4xfp4_packed(col_pairs)
             packed_inner_t = pid_m * (BLOCK_M // 2) + tl.arange(0, BLOCK_M // 2)
             packed_offsets_t = (
@@ -300,8 +315,13 @@ if torch_version_at_least("2.10.0") and has_triton():
                 BLOCK_N,
                 False,  # FAST_MATH
                 _EDEN_BLOCK_SCALE_MAX,
+                CLAMP=False,
             )
-            row_pairs = row_scaled.reshape(BLOCK_M, BLOCK_N // 2, 2).split()
+            row_pairs = (
+                tl.clamp(row_scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
+                .reshape(BLOCK_M, BLOCK_N // 2, 2)
+                .split()
+            )
             row_fp4 = convert_8xfp32_to_4xfp4_packed(row_pairs)
             packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
             packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]

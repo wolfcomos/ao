@@ -682,8 +682,9 @@ def _cvt_rn_e2m1x8_f32(
     loc=None,
     ip=None,
 ) -> cutlass.Uint32:
-    """Pack eight already scaled and clamped values to FP4, RTNE (the second half of
-    ``_mul_cvt_rn_e2m1x8_acc_f32``): even element in the low nibble, odd in the high."""
+    """Pack eight already scaled values to FP4, RTNE (the second half of
+    ``_mul_cvt_rn_e2m1x8_acc_f32``; ``satfinite`` takes anything past +-6 to 6): even
+    element in the low nibble, odd in the high."""
     return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -975,7 +976,7 @@ def _bf16round_f32x8(
 
 
 @dsl_user_op
-def _mul_clamp_f32x8(
+def _mul_f32x8(
     e0: cutlass.Float32,
     e1: cutlass.Float32,
     e2: cutlass.Float32,
@@ -989,13 +990,13 @@ def _mul_clamp_f32x8(
     loc=None,
     ip=None,
 ):
-    """Triton's ``clamp(x * encode, -6, 6)`` for eight bf16-exact f32 values.
+    """Triton's ``x * encode`` for eight bf16-exact f32 values, unclamped.
 
     The multiply of ``_mul_cvt_rn_e2m1x8_acc_f32`` (its bf16 round-through is
-    ``_bf16round_f32x8``'s here) returning the scaled values instead of packing them, with
-    the clamp that helper leaves to ``cvt.rn.satfinite`` made explicit: ``mul.rn.f32x2``
-    (``.rn`` forbids any fusion), then ``min.xorsign.abs.f32`` -- min(|a|, 6) carrying a's
-    sign, the one instruction Triton's clamp lowers to.
+    ``_bf16round_f32x8``'s here) returning the scaled values instead of packing them:
+    ``mul.rn.f32x2`` (``.rn`` forbids any fusion). No clamp: MS-EDEN's correction takes the
+    unclamped values (Triton's ``_ms_eden_correction_with_sr``), and the code conversion
+    saturates in ``cvt.rn.satfinite`` on its own.
     """
     rst = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32()] * 8),
@@ -1013,7 +1014,6 @@ def _mul_clamp_f32x8(
         (
             "{\n"
             ".reg .b64 s2, p01, p23, p45, p67;\n"
-            ".reg .f32 a0, a1, a2, a3, a4, a5, a6, a7;\n"
             "mov.b64 s2, {$16, $16};\n"
             "mov.b64 p01, {$8, $9};\n"
             "mov.b64 p23, {$10, $11};\n"
@@ -1023,18 +1023,10 @@ def _mul_clamp_f32x8(
             "mul.rn.f32x2 p23, p23, s2;\n"
             "mul.rn.f32x2 p45, p45, s2;\n"
             "mul.rn.f32x2 p67, p67, s2;\n"
-            "mov.b64 {a0, a1}, p01;\n"
-            "mov.b64 {a2, a3}, p23;\n"
-            "mov.b64 {a4, a5}, p45;\n"
-            "mov.b64 {a6, a7}, p67;\n"
-            "min.xorsign.abs.f32 $0, a0, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $1, a1, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $2, a2, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $3, a3, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $4, a4, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $5, a5, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $6, a6, 0f40C00000;\n"
-            "min.xorsign.abs.f32 $7, a7, 0f40C00000;\n"
+            "mov.b64 {$0, $1}, p01;\n"
+            "mov.b64 {$2, $3}, p23;\n"
+            "mov.b64 {$4, $5}, p45;\n"
+            "mov.b64 {$6, $7}, p67;\n"
             "}"
         ),
         "=f,=f,=f,=f,=f,=f,=f,=f,f,f,f,f,f,f,f,f,f",
@@ -1081,19 +1073,24 @@ def _sr_e4m3_byte(
     needed. ``mul.rn.f32`` without ``.ftz``: E4M3-subnormal scales pass through f32
     subnormals here.
 
-    Exact while the rounded magnitude is at most 448, the largest finite E4M3; past it
-    Triton's saturating cvt returns 448 where these bits read as the NaN pattern (480) or
-    wrap (512 and up). Finite input guarantees it: the stored scale is at most 256, and
-    the correction ``<v, v> / <v, q>`` is the ``v * q``-weighted mean of the per-element
+    ``min.f32`` against 448 first, the largest finite E4M3: Triton's saturating fp8
+    store returns 448 for anything the rounding lands past it, and 448 sits on the grid,
+    so the rounding leaves it there; without the ``min`` these bits would read as the
+    NaN pattern (480) or wrap (512 and up). In contract -- a group's amax at least its
+    blocks' amax -- the value never gets there: the stored scale is at most 256, and the
+    correction ``<v, v> / <v, q>`` is the ``v * q``-weighted mean of the per-element
     ratios ``v / q`` (an element that rounds to code 0 adds only its ``v^2 <= 1/16`` to
-    the numerator). With a normal stored scale the amax element lands in [5.64, 6] (E4M3
-    rounds within 2^-4 of the target 6), so it weighs at least 33 at a ratio of at most 1;
+    the numerator). With a normal stored scale the amax element lands in [5.625, 6.375]
+    (E4M3 rounds within 2^-4 of the target 6; past 6 it saturates to code 6, which is
+    what the correction repays), so it weighs at least 33 at a ratio of at most 17/16;
     every element at or above 3/4 is at most 5/4 of its RTNE code, and the elements
     between 1/4 and 3/4 (code 1/2, ratio below 3/2) weigh at most 3/8 each. The maximum
-    is 411/336 = 1.2232, fifteen elements at the 5.0 tie beside a 6: corrected at most
-    313.15, its stochastic round-up at most 320. With a subnormal stored scale (below
-    2^-6) the amax element still lands at 3 or above, so the same mean stays below 2 and
-    the corrected value far below 448.
+    is 415.64/338.25 = 1.2288, fifteen elements at the 5.0 tie beside a 6.375: corrected
+    at most 314.58, its stochastic round-up at most 320. With a subnormal stored scale
+    (below 2^-6) the amax element still lands at 3 or above, so the same mean stays below
+    2 and the corrected value far below 448. An amax below a block's own caps that
+    block's scale at 256 while its elements scale past 6 without bound, and the
+    corrected value follows; the ``min`` keeps that case at Triton's 448.
     """
     return cutlass.Uint32(
         llvm.inline_asm(
@@ -1103,7 +1100,8 @@ def _sr_e4m3_byte(
                 "{\n"
                 ".reg .b32 u, r, t;\n"
                 ".reg .f32 s;\n"
-                "mul.rn.f32 s, $1, 0f03800000;\n"
+                "min.f32 s, $1, 0f43E00000;\n"
+                "mul.rn.f32 s, s, 0f03800000;\n"
                 "mov.b32 u, s;\n"
                 "and.b32 r, $2, 0x000FFFFF;\n"
                 "add.u32 u, u, r;\n"
