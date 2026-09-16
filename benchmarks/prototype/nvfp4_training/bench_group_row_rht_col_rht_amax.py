@@ -23,9 +23,9 @@ from tabulate import tabulate
 from torch.utils._triton import has_triton
 from tqdm import tqdm
 
-from benchmarks.prototype.nvfp4_training.bench_utils import kernel_time_us
-from benchmarks.prototype.nvfp4_training.deepseek_v3_shapes import (
+from benchmarks.prototype.nvfp4_training.bench_utils import (
     get_deepseek_v3_activation_shapes,
+    kernel_time_us,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     VARYING_FIRST_DIM,
