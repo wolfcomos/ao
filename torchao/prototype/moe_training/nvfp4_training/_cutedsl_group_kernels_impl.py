@@ -92,11 +92,14 @@ from ._cutedsl_kernels_impl import (
     _bf16hi_to_f32,
     _bf16lo_to_f32,
     _bf16round_f32x8,
+    _cvt_e2m1x8_to_bf16x2x4,
     _cvt_e2m1x8_to_f32,
     _cvt_rn_e2m1x8_f32,
     _cvt_rs_e4m3x4_f32,
+    _div_approx_f32,
     _div_full_f32,
     _div_rn_f32,
+    _dot16_e_q_bf16,
     _e4m3x2_to_f16x2,
     _f16hi_to_f32,
     _f16lo_to_f32,
@@ -2514,6 +2517,21 @@ def _dot16_tree_rn(a, b):
     return even + odd
 
 
+def _dot16_chain_fast(a, b):
+    """``FAST_PATH`` twin of ``_dot16_tree_rn`` returning the two f32x2 lanes still apart:
+    one ``mul.rn.f32x2`` then seven ``fma.rn.f32x2`` down a single accumulator (8 of the
+    tree's 15 packed ops). Each fused step keeps the product exact, so the sum differs from
+    Triton's tree only in the last ulps -- that is fine here because the fast path's dots
+    feed nothing but the corrected scale, which is stochastically rounded anyway; the codes
+    and the encode reciprocal ahead of them do not see this function."""
+    acc = cute.arch.mul_packed_f32x2((a[0], a[1]), (b[0], b[1]))
+    for j in range(1, 8):
+        acc = cute.arch.fma_packed_f32x2(
+            (a[2 * j], a[2 * j + 1]), (b[2 * j], b[2 * j + 1]), acc
+        )
+    return acc
+
+
 def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec, cap):
     """``_enc_from_amax`` at the ceiling ``cap`` (the MS-EDEN one or ``FP8_E4M3_MAX``),
     returning the stored E4M3 scale as its byte and widened to f32 (the MS-EDEN correction
@@ -2532,10 +2550,26 @@ def _ms_eden_enc_from_amax(amax, enc_over_fp4max, dec, cap):
     return enc, pv_f8[0], sf8
 
 
-def _ms_eden_block16_corrected(vals, enc_over_fp4max, dec):
+def _ms_eden_block16_corrected(
+    vals,
+    enc_over_fp4max,
+    dec,
+    approx_div: cutlass.Constexpr = False,
+    fast_dots: cutlass.Constexpr = False,
+):
     """One 1x16 MS-EDEN block from 16 raw f32 accumulator values -> (w0, w1, corrected
     f32 scale): everything of ``_ms_eden_block16`` ahead of the stochastic rounding, so
-    both roundings (software word, hardware ``cvt.rs``) consume the same value."""
+    both roundings (software word, hardware ``cvt.rs``) consume the same value.
+
+    ``approx_div`` (``FAST_PATH`` only) takes the correction ratio through
+    ``div.approx`` instead of Triton's ``div.full``: the ratio feeds only the scale, which
+    the stochastic rounding moves by a whole E4M3 step anyway, and the two quotients
+    agree to a few ulp (about 2^-20 of that step), while the codes and the ``enc`` they
+    come from stay bitwise.
+
+    ``fast_dots`` (``FAST_PATH`` only) takes ``<v, v>`` through ``_dot16_chain_fast``
+    and ``<v, q>`` as ``<e, q> * enc`` through ``_dot16_e_q_bf16`` on the bf16x2-decoded
+    codes, adding the two chain pairs in one packed add."""
     # The bf16-exact values serve both consumers of the rounding: their max is the block
     # amax (what ``_round_rht_amax`` of the raw amax gives: RTNE is monotonic in magnitude,
     # so the max of the rounded values is the rounded max) and they are what the encode
@@ -2562,12 +2596,22 @@ def _ms_eden_block16_corrected(vals, enc_over_fp4max, dec):
     v = _mul_f32x8(*e[0:8], enc) + _mul_f32x8(*e[8:16], enc)
     w0 = _cvt_rn_e2m1x8_f32(*v[0:8])
     w1 = _cvt_rn_e2m1x8_f32(*v[8:16])
-    q = _cvt_e2m1x8_to_f32(w0) + _cvt_e2m1x8_to_f32(w1)
-    dot_sq = _dot16_tree_rn(v, v)
-    dot_cross = _dot16_tree_rn(v, q)
-    ratio = _div_full_f32(dot_sq, dot_cross)
+    if cutlass.const_expr(fast_dots):
+        qp = _cvt_e2m1x8_to_bf16x2x4(w0) + _cvt_e2m1x8_to_bf16x2x4(w1)
+        sq = _dot16_chain_fast(v, v)
+        cr = _dot16_e_q_bf16(*e, *qp)
+        dot_sq, eq = cute.arch.add_packed_f32x2((sq[0], cr[0]), (sq[1], cr[1]))
+        dot_cross = eq * enc
+    else:
+        q = _cvt_e2m1x8_to_f32(w0) + _cvt_e2m1x8_to_f32(w1)
+        dot_sq = _dot16_tree_rn(v, v)
+        dot_cross = _dot16_tree_rn(v, q)
+    if cutlass.const_expr(approx_div):
+        ratio = _div_approx_f32(dot_sq, dot_cross)
+    else:
+        ratio = _div_full_f32(dot_sq, dot_cross)
     # False for inf and NaN, as Triton's ``< inf``; a zero ``dot_cross`` makes the ratio
-    # inf or NaN, so Triton's ``!= 0`` guard is implied.
+    # inf or NaN (both divisions: 1 / 0 is inf), so Triton's ``!= 0`` guard is implied.
     finite = _abs_f32(ratio) <= cutlass.Float32(FP32_MAX)
     corr = cutlass.Float32(cutlass.select_(finite, ratio, cutlass.Float32(1.0)))
     # ONE RN multiply of the widened E4M3 scale (no clamp), as Triton's
@@ -2598,7 +2642,7 @@ def _rht128_tile_ms_eden(
     row_addr,
     rSF,
     fast_path: cutlass.Constexpr,
-    word,
+    rbits,
 ):
     """MS-EDEN quantize this warp's eighth of one 128x128 f32 TMEM accumulator: this
     thread's lane = one output row, blocks ``u_base .. u_base + 3`` of its 8.
@@ -2607,10 +2651,10 @@ def _rht128_tile_ms_eden(
     at ``row_addr``; the four scale bytes land in ``rSF`` for the chain's own scatter.
     ``u_base`` is warp-uniform but dynamic, so both warps of a quadrant run one body.
 
-    ``FAST_PATH``: ``idx_base`` is the counter of the row's 16-scale group these blocks
-    belong to and ``word`` (0-3, warp-uniform) which of its four Philox words rounds them;
-    the four corrected scales go through one ``cvt.rs.satfinite.e4m3x4.f32`` into the
-    word ``rSF`` holds.
+    ``FAST_PATH``: ``rbits`` is this warp's word of the Philox draw of the row's 16-scale
+    group these blocks belong to (the caller draws it once per group and reuses it for
+    the group's second tile); the four corrected scales go through one
+    ``cvt.rs.satfinite.e4m3x4.f32`` with it into the word ``rSF`` holds.
     """
     copy_atom_t2r = sm100_utils.get_tmem_load_op(
         RHT128_CTA_TILE_COL,
@@ -2634,7 +2678,9 @@ def _rht128_tile_ms_eden(
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
         vals = tTR_rAcc.load().reshape((16,))
         if cutlass.const_expr(fast_path):
-            w0, w1, corrected = _ms_eden_block16_corrected(vals, enc_over_fp4max, dec)
+            w0, w1, corrected = _ms_eden_block16_corrected(
+                vals, enc_over_fp4max, dec, approx_div=True, fast_dots=True
+            )
         else:
             # Triton's tl.randint word for this block: Philox4x32-10 at counter
             # (offset_base, linear_idx, 0, 0), word 0.
@@ -2647,14 +2693,7 @@ def _rht128_tile_ms_eden(
         else:
             rSF[j] = cutlass.Uint8(sf)
     if cutlass.const_expr(fast_path):
-        # Triton's tl.randint4x for the row's 16-scale group: Philox4x32-10 at counter
-        # (offset_base, linear_group16, 0, 0), all four words; this warp's four scales
-        # take word ``word`` of it, one 32-bit draw for one hardware cvt.rs of four.
-        r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base))
-        odd = (word & cutlass.Int32(1)) != cutlass.Int32(0)
-        lo = cutlass.Uint32(cutlass.select_(odd, r1, r0))
-        hi = cutlass.Uint32(cutlass.select_(odd, r3, r2))
-        rbits = cutlass.Uint32(cutlass.select_(word >= cutlass.Int32(2), hi, lo))
+        # One 32-bit draw for one hardware cvt.rs of four.
         cute.recast_tensor(rSF, cutlass.Uint32)[0] = _cvt_rs_e4m3x4_f32(
             rCorr[0], rCorr[1], rCorr[2], rCorr[3], rbits
         )
@@ -2666,6 +2705,61 @@ def _rht128_tile_ms_eden(
     _st_global_v4_u32(
         code_addr + cutlass.Int64(16), rCodes[4], rCodes[5], rCodes[6], rCodes[7]
     )
+
+
+@cute.jit
+def _rht128_tile_ms_eden_fast(
+    acc,
+    tidx,
+    enc_over_fp4max,
+    dec,
+    u_base,
+    row_addr,
+    rSF,
+    rbits,
+    rCodes,
+    rCorr,
+    blocks: cutlass.Constexpr,
+):
+    """``_rht128_tile_ms_eden``'s ``FAST_PATH`` body in two pieces for the row chain: the
+    head ``blocks = (0,)`` runs in both arms of the Philox-reuse branch (the draw interleaves
+    with it), the tail ``blocks = (1, 2, 3)`` is common code and also rounds the four scales
+    and stores the codes. ``rCodes`` / ``rCorr`` are the caller's, so block 0's results cross
+    the branch merge as plain registers. Same arithmetic as ``_rht128_tile_ms_eden``."""
+    copy_atom_t2r = sm100_utils.get_tmem_load_op(
+        RHT128_CTA_TILE_COL,
+        utils.LayoutEnum.ROW_MAJOR,
+        cutlass.Float32,
+        cutlass.Float32,
+        RHT128_EPI_TILE,
+        False,
+    )
+    tAcc = transform_partitioned_tensor_layout(acc)
+    tAcc_epi = cute.flat_divide(tAcc, RHT128_EPI_TILE)
+    tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0)])
+    thr_copy = tiled_copy_t2r.get_slice(tidx)
+    tTR_tAcc = thr_copy.partition_S(tAcc_epi)
+    tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+    for k in cutlass.range_constexpr(len(blocks)):
+        j = blocks[k]
+        u = u_base + cutlass.Int32(j)
+        cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
+        vals = tTR_rAcc.load().reshape((16,))
+        w0, w1, corrected = _ms_eden_block16_corrected(
+            vals, enc_over_fp4max, dec, approx_div=True, fast_dots=True
+        )
+        rCodes[2 * j] = w0
+        rCodes[2 * j + 1] = w1
+        rCorr[j] = corrected
+    if cutlass.const_expr(blocks[-1] == RHT128_MSEDEN_BLOCKS_PER_WARP - 1):
+        cute.recast_tensor(rSF, cutlass.Uint32)[0] = _cvt_rs_e4m3x4_f32(
+            rCorr[0], rCorr[1], rCorr[2], rCorr[3], rbits
+        )
+        code_addr = row_addr + cutlass.Int64(u_base) * cutlass.Int64(8)
+        _st_global_v4_u32(code_addr, rCodes[0], rCodes[1], rCodes[2], rCodes[3])
+        _st_global_v4_u32(
+            code_addr + cutlass.Int64(16), rCodes[4], rCodes[5], rCodes[6], rCodes[7]
+        )
 
 
 def _store_grouped_col_sf_word(mSF_u32, rSF, r, c_base, g, offsets_t, hidden):
@@ -2793,6 +2887,18 @@ def _rht128_ms_eden_epilogue(
             g, g_end, offsets_t, hidden, u_base, lane_word
         )
     rSF = cute.make_rmem_tensor((RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint8)
+    if cutlass.const_expr(fast_path):
+        # Loop-carried Philox cache: the two of the draw's four words this warp can consume
+        # (word ``half`` for the group's even inner tile, ``2 + half`` for its odd one).
+        even_word = cutlass.Uint32(0)
+        odd_word = cutlass.Uint32(0)
+        if cutlass.const_expr(chain == 1):
+            rCodes = cute.make_rmem_tensor(
+                (2 * RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint32
+            )
+            rCorr = cute.make_rmem_tensor(
+                (RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Float32
+            )
     for i in cutlass.range(t_end - t_begin, unroll=1):
         token = tile_n * cutlass.Int32(TOKEN_TILE)
         if token >= g_end:
@@ -2814,26 +2920,111 @@ def _rht128_ms_eden_epilogue(
         # linear_idx of block 0: the flat index of the scale in the plain
         # (outer, inner // 16) layout, Triton's counter.
         idx_base = outer * inner_blocks + inner_tile * cutlass.Int32(RHT128_DIM // 16)
-        word = cutlass.Int32(0)
         if cutlass.const_expr(fast_path):
-            # linear_group16 of the row's 16-scale group these two inner tiles form, and
-            # this warp's word of the four it yields: tile parity, then half.
+            # linear_group16 of the row's 16-scale group these two inner tiles form:
+            # Triton's tl.randint4x, Philox4x32-10 at counter (offset_base,
+            # linear_group16, 0, 0), all four words, drawn once per group; this warp's
+            # word of the four is tile parity, then half.
             idx_base = outer * inner_groups + inner_tile // cutlass.Int32(2)
-            word = (inner_tile % cutlass.Int32(2)) * cutlass.Int32(2) + half
-        acc_pipeline.consumer_wait(acc_state)
-        _rht128_tile_ms_eden(
-            tCtAcc[(None, None, None, 2 * acc_state.index + chain)],
-            tidx,
-            enc_over_fp4max,
-            dec,
-            state,
-            idx_base,
-            u_base,
-            gOut[(r_local, None)].iterator.toint(),
-            rSF,
-            fast_path,
-            word,
-        )
+            tile_parity = inner_tile % cutlass.Int32(2)
+            odd_tile = tile_parity != cutlass.Int32(0)
+            odd_half = half != cutlass.Int32(0)
+            if cutlass.const_expr(chain == 1):
+                # Tiles run tile_m-fastest and wrap to 0, so an odd inner tile that is not
+                # the chunk's first follows its group's even tile in the previous iteration
+                # (same outer row, same group): reuse that draw. Block 0 of the tile sits in
+                # both arms: ptxas predicates a pure-ALU ``if`` body of this size
+                # (predicated-off instructions still issue), a draw in a block of its own is a
+                # latency-exposed dependency chain, and duplicating the whole body overflows
+                # the instruction cache; next to block 0 the draw interleaves.
+                acc_view = tCtAcc[(None, None, None, 2 * acc_state.index + chain)]
+                row_addr = gOut[(r_local, None)].iterator.toint()
+                rbits = cutlass.Uint32(0)
+                if tile_parity * i == cutlass.Int32(0):
+                    acc_pipeline.consumer_wait(acc_state)
+                    r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base))
+                    even_word = cutlass.Uint32(cutlass.select_(odd_half, r1, r0))
+                    odd_word = cutlass.Uint32(cutlass.select_(odd_half, r3, r2))
+                    rbits = cutlass.Uint32(
+                        cutlass.select_(odd_tile, odd_word, even_word)
+                    )
+                    _rht128_tile_ms_eden_fast(
+                        acc_view,
+                        tidx,
+                        enc_over_fp4max,
+                        dec,
+                        u_base,
+                        row_addr,
+                        rSF,
+                        rbits,
+                        rCodes,
+                        rCorr,
+                        (0,),
+                    )
+                else:
+                    acc_pipeline.consumer_wait(acc_state)
+                    rbits = odd_word
+                    _rht128_tile_ms_eden_fast(
+                        acc_view,
+                        tidx,
+                        enc_over_fp4max,
+                        dec,
+                        u_base,
+                        row_addr,
+                        rSF,
+                        rbits,
+                        rCodes,
+                        rCorr,
+                        (0,),
+                    )
+                _rht128_tile_ms_eden_fast(
+                    acc_view,
+                    tidx,
+                    enc_over_fp4max,
+                    dec,
+                    u_base,
+                    row_addr,
+                    rSF,
+                    rbits,
+                    rCodes,
+                    rCorr,
+                    (1, 2, 3),
+                )
+            else:
+                # Chain 0's consecutive tiles are different outer rows: draw every tile.
+                acc_pipeline.consumer_wait(acc_state)
+                r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base))
+                even_word = cutlass.Uint32(cutlass.select_(odd_half, r1, r0))
+                odd_word = cutlass.Uint32(cutlass.select_(odd_half, r3, r2))
+                rbits = cutlass.Uint32(cutlass.select_(odd_tile, odd_word, even_word))
+                _rht128_tile_ms_eden(
+                    tCtAcc[(None, None, None, 2 * acc_state.index + chain)],
+                    tidx,
+                    enc_over_fp4max,
+                    dec,
+                    state,
+                    idx_base,
+                    u_base,
+                    gOut[(r_local, None)].iterator.toint(),
+                    rSF,
+                    fast_path,
+                    rbits,
+                )
+        else:
+            acc_pipeline.consumer_wait(acc_state)
+            _rht128_tile_ms_eden(
+                tCtAcc[(None, None, None, 2 * acc_state.index + chain)],
+                tidx,
+                enc_over_fp4max,
+                dec,
+                state,
+                idx_base,
+                u_base,
+                gOut[(r_local, None)].iterator.toint(),
+                rSF,
+                fast_path,
+                cutlass.Uint32(0),
+            )
         cute.arch.fence_view_async_tmem_load()
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)

@@ -1059,6 +1059,26 @@ def _div_full_f32(
 
 
 @dsl_user_op
+def _div_approx_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """``a * rcp.approx(b)``: one ``MUFU.RCP`` and one ``FMUL`` (<= 2 ulp, like
+    ``div.full.f32``, which spends six more SASS on its range pre-scale and denormal test).
+    ``1 / 0`` is inf, so a zero ``b`` yields inf or NaN, never a finite quotient."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "div.approx.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _sr_e4m3_byte(
     corrected: cutlass.Float32, rbits: cutlass.Uint32, *, loc=None, ip=None
 ) -> cutlass.Uint32:
@@ -4293,3 +4313,161 @@ def _cutedsl_group_col_cast_requantize_impl(
     )
     # uint32 -> uint8 quadruples the last extent: (E, N, M//8) -> (E, N, M//2).
     return col_fp4.view(torch.uint8), col_sf
+
+
+@dsl_user_op
+def _cvt_e2m1x8_to_bf16x2x4(word: cutlass.Uint32, *, loc=None, ip=None):
+    """``FAST_PATH`` decode of one packed-FP4 word to four packed bf16x2 words, word k =
+    elements ``2k`` (low half) and ``2k + 1`` (high half): one ``cvt.rn.bf16x2.e2m1x2``
+    per byte (PTX ISA 9.2; the DSL emits 9.4). Every E2M1 value is exact in bf16, so this
+    is ``_cvt_e2m1x8_to_f32`` without its eight f16 -> f32 widenings, for a consumer that
+    reads bf16 halves in place (``_dot16_e_q_bf16``). Multi-output form as that helper.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [word.ir_value(loc=loc, ip=ip)],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            "mov.b32 {b0, b1, b2, b3}, $4;\n"
+            "cvt.rn.bf16x2.e2m1x2 $0, b0;\n"
+            "cvt.rn.bf16x2.e2m1x2 $1, b1;\n"
+            "cvt.rn.bf16x2.e2m1x2 $2, b2;\n"
+            "cvt.rn.bf16x2.e2m1x2 $3, b3;\n"
+            "}"
+        ),
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [k], loc=loc, ip=ip))
+        for k in range(4)
+    )
+
+
+@dsl_user_op
+def _dot16_e_q_bf16(
+    e0: cutlass.Float32,
+    e1: cutlass.Float32,
+    e2: cutlass.Float32,
+    e3: cutlass.Float32,
+    e4: cutlass.Float32,
+    e5: cutlass.Float32,
+    e6: cutlass.Float32,
+    e7: cutlass.Float32,
+    e8: cutlass.Float32,
+    e9: cutlass.Float32,
+    e10: cutlass.Float32,
+    e11: cutlass.Float32,
+    e12: cutlass.Float32,
+    e13: cutlass.Float32,
+    e14: cutlass.Float32,
+    e15: cutlass.Float32,
+    q0: cutlass.Uint32,
+    q1: cutlass.Uint32,
+    q2: cutlass.Uint32,
+    q3: cutlass.Uint32,
+    q4: cutlass.Uint32,
+    q5: cutlass.Uint32,
+    q6: cutlass.Uint32,
+    q7: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """``FAST_PATH`` mixed-precision ``<e, q>`` of a 1x16 block: sixteen ``fma.rn.f32.bf16``
+    (one ``FHFMA.BF16`` each) taking ``e_k`` as the bf16 in the HIGH half of its widened f32
+    word (what ``_bf16round_f32x8`` produces; the low half is zero) and ``q_k`` as a half of
+    the packed bf16x2 words of ``_cvt_e2m1x8_to_bf16x2x4``, accumulated in f32 down two
+    chains (even and odd k, 8 deep) that are returned unsummed, as ``_dot16_chain_fast``.
+    Each product is exact (8 x 3 significant bits fit f32), so versus ``<v, q>`` with
+    ``v = RN(e * enc)`` the only differences are the missing per-term rounding and the
+    summation order: ``<e, q> * enc`` moves the corrected scale by float rounding only.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [
+            e0.ir_value(loc=loc, ip=ip),
+            e1.ir_value(loc=loc, ip=ip),
+            e2.ir_value(loc=loc, ip=ip),
+            e3.ir_value(loc=loc, ip=ip),
+            e4.ir_value(loc=loc, ip=ip),
+            e5.ir_value(loc=loc, ip=ip),
+            e6.ir_value(loc=loc, ip=ip),
+            e7.ir_value(loc=loc, ip=ip),
+            e8.ir_value(loc=loc, ip=ip),
+            e9.ir_value(loc=loc, ip=ip),
+            e10.ir_value(loc=loc, ip=ip),
+            e11.ir_value(loc=loc, ip=ip),
+            e12.ir_value(loc=loc, ip=ip),
+            e13.ir_value(loc=loc, ip=ip),
+            e14.ir_value(loc=loc, ip=ip),
+            e15.ir_value(loc=loc, ip=ip),
+            q0.ir_value(loc=loc, ip=ip),
+            q1.ir_value(loc=loc, ip=ip),
+            q2.ir_value(loc=loc, ip=ip),
+            q3.ir_value(loc=loc, ip=ip),
+            q4.ir_value(loc=loc, ip=ip),
+            q5.ir_value(loc=loc, ip=ip),
+            q6.ir_value(loc=loc, ip=ip),
+            q7.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b16 t, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
+            ".reg .b16 l0, u0, l1, u1, l2, u2, l3, u3, l4, u4, l5, u5, l6, u6, l7, u7;\n"
+            "mov.b32 {t, h0}, $2;\n"
+            "mov.b32 {t, h1}, $3;\n"
+            "mov.b32 {t, h2}, $4;\n"
+            "mov.b32 {t, h3}, $5;\n"
+            "mov.b32 {t, h4}, $6;\n"
+            "mov.b32 {t, h5}, $7;\n"
+            "mov.b32 {t, h6}, $8;\n"
+            "mov.b32 {t, h7}, $9;\n"
+            "mov.b32 {t, h8}, $10;\n"
+            "mov.b32 {t, h9}, $11;\n"
+            "mov.b32 {t, h10}, $12;\n"
+            "mov.b32 {t, h11}, $13;\n"
+            "mov.b32 {t, h12}, $14;\n"
+            "mov.b32 {t, h13}, $15;\n"
+            "mov.b32 {t, h14}, $16;\n"
+            "mov.b32 {t, h15}, $17;\n"
+            "mov.b32 {l0, u0}, $18;\n"
+            "mov.b32 {l1, u1}, $19;\n"
+            "mov.b32 {l2, u2}, $20;\n"
+            "mov.b32 {l3, u3}, $21;\n"
+            "mov.b32 {l4, u4}, $22;\n"
+            "mov.b32 {l5, u5}, $23;\n"
+            "mov.b32 {l6, u6}, $24;\n"
+            "mov.b32 {l7, u7}, $25;\n"
+            "mov.f32 $0, 0f00000000;\n"
+            "mov.f32 $1, 0f00000000;\n"
+            "fma.rn.f32.bf16 $0, h0, l0, $0;\n"
+            "fma.rn.f32.bf16 $1, h1, u0, $1;\n"
+            "fma.rn.f32.bf16 $0, h2, l1, $0;\n"
+            "fma.rn.f32.bf16 $1, h3, u1, $1;\n"
+            "fma.rn.f32.bf16 $0, h4, l2, $0;\n"
+            "fma.rn.f32.bf16 $1, h5, u2, $1;\n"
+            "fma.rn.f32.bf16 $0, h6, l3, $0;\n"
+            "fma.rn.f32.bf16 $1, h7, u3, $1;\n"
+            "fma.rn.f32.bf16 $0, h8, l4, $0;\n"
+            "fma.rn.f32.bf16 $1, h9, u4, $1;\n"
+            "fma.rn.f32.bf16 $0, h10, l5, $0;\n"
+            "fma.rn.f32.bf16 $1, h11, u5, $1;\n"
+            "fma.rn.f32.bf16 $0, h12, l6, $0;\n"
+            "fma.rn.f32.bf16 $1, h13, u6, $1;\n"
+            "fma.rn.f32.bf16 $0, h14, l7, $0;\n"
+            "fma.rn.f32.bf16 $1, h15, u7, $1;\n"
+            "}"
+        ),
+        "=f,=f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [1], loc=loc, ip=ip)),
+    )
