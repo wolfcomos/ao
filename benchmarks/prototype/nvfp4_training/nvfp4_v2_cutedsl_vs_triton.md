@@ -197,6 +197,20 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   3296 SASS instructions) and the Triton op +3%: its kernel keeps the unclamped tile live
   beside the clamped copy it packs, 5424 to 5576 SASS instructions and 243 to 247
   registers, no spills either way.
+- 4496c9da9 speeds up the fast path only, inside its `fast_path` branch: the correction
+  ratio through `div.approx.ftz.f32` instead of `div.full.f32`; the two 16-term inner
+  products as fused `fma.rn.f32x2` chains instead of Triton's multiply-then-add tree; the
+  codes decoded straight to bf16 pairs (`cvt.rn.bf16x2.e2m1x2`) and the cross product as
+  `fma.rn.f32.bf16` of the bf16-exact scaled values, so the f16-to-f32 widening of the
+  dequantized values is gone; and on the row chain one Philox draw per 16-scale group
+  instead of one per tile. Codes unchanged; the corrected scale moves at float-rounding
+  level ahead of the stochastic E4M3 rounding (no fast-path scale byte differs from the
+  previous fast path at the recipe shapes; the `test_fast_path_*` items and the adversarial
+  probe hold). Measured on a GB200 at 2062 MHz, paired three-pass medians (this table is
+  at 1200 MHz): 671B down 704.5 to 636.2 us (-9.7%, 4168 to 4615 GB/s, 3.6x Triton), 671B
+  gate/up -9.1%, 16B down -7.6%, 16B gate/up -6.7%; warp instructions -12%, the shared
+  FMA-heavy pipe 63 to 44% busy, 3296 SASS instructions as before, REG 96 to 95, no
+  spills. The default kernel's PTX and SASS are unchanged.
 
 ### group_col_rht_requant_amax
 
