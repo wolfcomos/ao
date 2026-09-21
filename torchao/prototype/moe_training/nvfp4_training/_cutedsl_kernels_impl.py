@@ -4471,3 +4471,42 @@ def _dot16_e_q_bf16(
         cutlass.Float32(llvm.extractvalue(T.f32(), rst, [0], loc=loc, ip=ip)),
         cutlass.Float32(llvm.extractvalue(T.f32(), rst, [1], loc=loc, ip=ip)),
     )
+
+
+@dsl_user_op
+def _rcp_approx_f32(b: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """``FAST_PATH`` scheduling twin of ``_div_approx_f32``: its first SASS instruction, the
+    lone ``MUFU.RCP``. ``div.approx.ftz.f32 d, a, b`` is defined as ``a * rcp.approx.ftz(b)``
+    and ptxas emits exactly ``MUFU.RCP`` + ``FMUL.FTZ`` for it, so the pair
+    ``_mul_ftz_f32(a, _rcp_approx_f32(b))`` is the same two instructions on the same operands
+    -- written apart only so the scheduler may place work between them."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [b.ir_value(loc=loc, ip=ip)],
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _mul_ftz_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """``FAST_PATH`` scheduling twin of ``_div_approx_f32``: its second SASS instruction, the
+    ``FMUL.FTZ`` that multiplies the numerator by ``_rcp_approx_f32``'s reciprocal."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "mul.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )

@@ -109,8 +109,10 @@ from ._cutedsl_kernels_impl import (
     _max_f32,
     _min_f32,
     _mul_f32x8,
+    _mul_ftz_f32,
     _pack16_rn_from_enc,
     _quant16,
+    _rcp_approx_f32,
     _rcp_rn_f32,
     _round_rht_amax,
     _sr_e4m3_byte,
@@ -2556,6 +2558,7 @@ def _ms_eden_block16_corrected(
     dec,
     approx_div: cutlass.Constexpr = False,
     fast_dots: cutlass.Constexpr = False,
+    defer_ratio: cutlass.Constexpr = False,
 ):
     """One 1x16 MS-EDEN block from 16 raw f32 accumulator values -> (w0, w1, corrected
     f32 scale): everything of ``_ms_eden_block16`` ahead of the stochastic rounding, so
@@ -2569,7 +2572,13 @@ def _ms_eden_block16_corrected(
 
     ``fast_dots`` (``FAST_PATH`` only) takes ``<v, v>`` through ``_dot16_chain_fast``
     and ``<v, q>`` as ``<e, q> * enc`` through ``_dot16_e_q_bf16`` on the bf16x2-decoded
-    codes, adding the two chain pairs in one packed add."""
+    codes, adding the two chain pairs in one packed add.
+
+    ``defer_ratio`` (``FAST_PATH`` only, with ``approx_div``) stops at the division's
+    ``MUFU.RCP`` and returns ``(w0, w1, sf8, <v, v>, rcp(<v, q>))``; the caller finishes the
+    block with ``_ms_eden_corr_deferred`` where it likes. Same instructions on the same
+    operands, only placed apart -- the ``MUFU`` of the block a body ends on otherwise issues
+    one slot ahead of the multiply that reads it and exposes its whole latency."""
     # The bf16-exact values serve both consumers of the rounding: their max is the block
     # amax (what ``_round_rht_amax`` of the raw amax gives: RTNE is monotonic in magnitude,
     # so the max of the rounded values is the rounded max) and they are what the encode
@@ -2607,6 +2616,8 @@ def _ms_eden_block16_corrected(
         dot_sq = _dot16_tree_rn(v, v)
         dot_cross = _dot16_tree_rn(v, q)
     if cutlass.const_expr(approx_div):
+        if cutlass.const_expr(defer_ratio):
+            return w0, w1, sf8, dot_sq, _rcp_approx_f32(dot_cross)
         ratio = _div_approx_f32(dot_sq, dot_cross)
     else:
         ratio = _div_full_f32(dot_sq, dot_cross)
@@ -2628,6 +2639,17 @@ def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
     """
     w0, w1, corrected = _ms_eden_block16_corrected(vals, enc_over_fp4max, dec)
     return w0, w1, _sr_e4m3_byte(corrected, rbits)
+
+
+def _ms_eden_corr_deferred(sf8, dot_sq, rcp):
+    """``_ms_eden_block16_corrected``'s tail under ``defer_ratio``: the ``FMUL.FTZ`` that
+    ``div.approx.ftz`` puts after its ``MUFU.RCP``, then the unchanged finiteness select and
+    the one RN multiply of the widened E4M3 scale. Instruction for instruction and operand
+    for operand what the undeferred ``FAST_PATH`` tail is."""
+    ratio = _mul_ftz_f32(dot_sq, rcp)
+    finite = _abs_f32(ratio) <= cutlass.Float32(FP32_MAX)
+    corr = cutlass.Float32(cutlass.select_(finite, ratio, cutlass.Float32(1.0)))
+    return sf8 * corr
 
 
 @cute.jit
@@ -2672,14 +2694,21 @@ def _rht128_tile_ms_eden(
     tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
     rCodes = cute.make_rmem_tensor((2 * RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint32)
     if cutlass.const_expr(fast_path):
-        rCorr = cute.make_rmem_tensor((RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Float32)
+        # Every block's ``defer_ratio`` parts, held back so that the last block's ratio tail
+        # runs after -- not one slot after -- its ``MUFU.RCP``.
+        held = []
     for j in cutlass.range_constexpr(RHT128_MSEDEN_BLOCKS_PER_WARP):
         u = u_base + cutlass.Int32(j)
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
         vals = tTR_rAcc.load().reshape((16,))
         if cutlass.const_expr(fast_path):
-            w0, w1, corrected = _ms_eden_block16_corrected(
-                vals, enc_over_fp4max, dec, approx_div=True, fast_dots=True
+            w0, w1, sf8, dot_sq, rcp = _ms_eden_block16_corrected(
+                vals,
+                enc_over_fp4max,
+                dec,
+                approx_div=True,
+                fast_dots=True,
+                defer_ratio=True,
             )
         else:
             # Triton's tl.randint word for this block: Philox4x32-10 at counter
@@ -2689,13 +2718,17 @@ def _rht128_tile_ms_eden(
         rCodes[2 * j] = w0
         rCodes[2 * j + 1] = w1
         if cutlass.const_expr(fast_path):
-            rCorr[j] = corrected
+            held.append((sf8, dot_sq, rcp))
         else:
             rSF[j] = cutlass.Uint8(sf)
     if cutlass.const_expr(fast_path):
+        # The four ratio tails together, last block last: the ``MUFU.RCP`` of the block the
+        # body ends on issues under the earlier blocks' tails instead of under the multiply
+        # that reads it.
+        corr = [_ms_eden_corr_deferred(*part) for part in held]
         # One 32-bit draw for one hardware cvt.rs of four.
         cute.recast_tensor(rSF, cutlass.Uint32)[0] = _cvt_rs_e4m3x4_f32(
-            rCorr[0], rCorr[1], rCorr[2], rCorr[3], rbits
+            corr[0], corr[1], corr[2], corr[3], rbits
         )
     # 16-byte aligned by construction: the code row starts on a 64-byte boundary (the u32
     # pitch and the tile column are multiples of 16 words, the buffer is torch.empty's) and
@@ -2718,13 +2751,13 @@ def _rht128_tile_ms_eden_fast(
     rSF,
     rbits,
     rCodes,
-    rCorr,
+    rCorr0,
     blocks: cutlass.Constexpr,
 ):
     """``_rht128_tile_ms_eden``'s ``FAST_PATH`` body in two pieces for the row chain: the
     head ``blocks = (0,)`` runs in both arms of the Philox-reuse branch (the draw interleaves
     with it), the tail ``blocks = (1, 2, 3)`` is common code and also rounds the four scales
-    and stores the codes. ``rCodes`` / ``rCorr`` are the caller's, so block 0's results cross
+    and stores the codes. ``rCodes`` / ``rCorr0`` are the caller's, so block 0's results cross
     the branch merge as plain registers. Same arithmetic as ``_rht128_tile_ms_eden``."""
     copy_atom_t2r = sm100_utils.get_tmem_load_op(
         RHT128_CTA_TILE_COL,
@@ -2740,20 +2773,31 @@ def _rht128_tile_ms_eden_fast(
     thr_copy = tiled_copy_t2r.get_slice(tidx)
     tTR_tAcc = thr_copy.partition_S(tAcc_epi)
     tTR_rAcc = cute.make_rmem_tensor(((16, 1), 1, 1), cutlass.Float32)
+    held = []
     for k in cutlass.range_constexpr(len(blocks)):
         j = blocks[k]
         u = u_base + cutlass.Int32(j)
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
         vals = tTR_rAcc.load().reshape((16,))
-        w0, w1, corrected = _ms_eden_block16_corrected(
-            vals, enc_over_fp4max, dec, approx_div=True, fast_dots=True
+        w0, w1, sf8, dot_sq, rcp = _ms_eden_block16_corrected(
+            vals,
+            enc_over_fp4max,
+            dec,
+            approx_div=True,
+            fast_dots=True,
+            defer_ratio=True,
         )
         rCodes[2 * j] = w0
         rCodes[2 * j + 1] = w1
-        rCorr[j] = corrected
+        held.append((sf8, dot_sq, rcp))
+    corr = [_ms_eden_corr_deferred(*part) for part in held]
+    if cutlass.const_expr(blocks[0] == 0):
+        rCorr0[0] = corr[0]
     if cutlass.const_expr(blocks[-1] == RHT128_MSEDEN_BLOCKS_PER_WARP - 1):
+        if cutlass.const_expr(blocks[0] != 0):
+            corr = [rCorr0[0]] + corr
         cute.recast_tensor(rSF, cutlass.Uint32)[0] = _cvt_rs_e4m3x4_f32(
-            rCorr[0], rCorr[1], rCorr[2], rCorr[3], rbits
+            corr[0], corr[1], corr[2], corr[3], rbits
         )
         code_addr = row_addr + cutlass.Int64(u_base) * cutlass.Int64(8)
         _st_global_v4_u32(code_addr, rCodes[0], rCodes[1], rCodes[2], rCodes[3])
@@ -2896,9 +2940,7 @@ def _rht128_ms_eden_epilogue(
             rCodes = cute.make_rmem_tensor(
                 (2 * RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Uint32
             )
-            rCorr = cute.make_rmem_tensor(
-                (RHT128_MSEDEN_BLOCKS_PER_WARP,), cutlass.Float32
-            )
+            rCorr0 = cute.make_rmem_tensor((1,), cutlass.Float32)
     for i in cutlass.range(t_end - t_begin, unroll=1):
         token = tile_n * cutlass.Int32(TOKEN_TILE)
         if token >= g_end:
@@ -2958,7 +3000,7 @@ def _rht128_ms_eden_epilogue(
                         rSF,
                         rbits,
                         rCodes,
-                        rCorr,
+                        rCorr0,
                         (0,),
                     )
                 else:
@@ -2974,7 +3016,7 @@ def _rht128_ms_eden_epilogue(
                         rSF,
                         rbits,
                         rCodes,
-                        rCorr,
+                        rCorr0,
                         (0,),
                     )
                 _rht128_tile_ms_eden_fast(
@@ -2987,7 +3029,7 @@ def _rht128_ms_eden_epilogue(
                     rSF,
                     rbits,
                     rCodes,
-                    rCorr,
+                    rCorr0,
                     (1, 2, 3),
                 )
             else:
