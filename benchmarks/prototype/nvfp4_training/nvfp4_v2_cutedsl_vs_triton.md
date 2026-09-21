@@ -211,6 +211,23 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   gate/up -9.1%, 16B down -7.6%, 16B gate/up -6.7%; warp instructions -12%, the shared
   FMA-heavy pipe 63 to 44% busy, 3296 SASS instructions as before, REG 96 to 95, no
   spills. The default kernel's PTX and SASS are unchanged.
+- 48b99b19d changes only the scheduling of the fast path: the four correction-ratio tails
+  of a tile (the `FMUL.FTZ` of `div.approx.ftz.f32`, the finiteness select and the
+  multiply of the widened E4M3 scale) run together after the block loop of both tile
+  bodies, last block last, so the `MUFU.RCP` of the block a body ends on no longer issues
+  one slot ahead of the multiply that reads it. MUFU-to-FMUL distances at the nine block
+  sites [1,1,1,1,4,5,5,5,5] to [1,1,3,12,17,19,133,133,279]; the two Philox-arm block-0
+  sites stay at 1 (deferring them across the branch merge measured 3-5% slower at 16B).
+  Same instructions on the same operands: every fast output is bytewise identical to
+  4496c9da9's at the four recipe shapes and two rng states (32/32 tensors); the default
+  kernel's PTX and SASS are unchanged. Measured on a GB200 with the SM clock capped at
+  1200 MHz, paired three-pass medians over three interleaved rounds: 671B down 1016.0 to
+  1006.0 us (-0.98%, 2890 to 2918 GB/s), 671B gate/up 297.1 to 294.0 (-1.05%), 16B down
+  119.9 to 118.1 (-1.48%), 16B gate/up 85.2 to 83.9 (-1.48%); the Triton control flat
+  within 0.54%; ncu gpc cycles -0.97%, warp-state samples at the FMUL.FTZ PCs -45%. REG 95
+  to 96, no spills, 3296 SASS instructions with every arithmetic opcode count as before.
+  The table above is unchanged: its `fast_us` column is f6f0e0999's 1200 MHz record of the
+  fast path before 4496c9da9.
 
 ### group_col_rht_requant_amax
 
