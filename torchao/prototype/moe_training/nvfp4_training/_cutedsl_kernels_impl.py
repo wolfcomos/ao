@@ -508,7 +508,7 @@ def philox_prep(seed_lo, seed_hi, offset_base):
     return sched, c0_r2, c1_r2, c3_r1
 
 
-def philox4_all(state, chunk_counter):
+def philox4_all(state, chunk_counter, wide: bool = False):
     """The four random words a 16-element chunk needs, from a single Philox draw.
 
     These kernels once reproduced triton's counter stride, drawing one word per packed
@@ -521,19 +521,35 @@ def philox4_all(state, chunk_counter):
     per-thread value: these kernels are persistent, and the grouped one schedules through
     CLC, so visit order is not fixed and a running counter would make the output depend on
     scheduling rather than on position.
+
+    ``wide`` (trace-time) draws each (mul.hi, mul.lo) pair as one wide multiply, as
+    ``philox_word0`` does (values identical); the MS-EDEN FAST_PATH draws take it.
     """
     sched, c0_r2, c1_r2, c3_r1 = state
     A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
     c0_r1 = chunk_counter ^ sched[0][0]
     c0, c1 = c0_r2, c1_r2
-    c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
-    c3 = A * c0_r1
+    if wide:
+        lo, hi = _mulwide_u32(A, c0_r1)
+        c2 = hi ^ c3_r1 ^ sched[1][1]
+        c3 = lo
+    else:
+        c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
+        c3 = A * c0_r1
     for r in range(2, PHILOX_ROUNDS):
         _c0, _c2 = c0, c2
-        c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
-        c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
-        c1 = B * _c2
-        c3 = A * _c0
+        if wide:
+            lo_b, hi_b = _mulwide_u32(B, _c2)
+            lo_a, hi_a = _mulwide_u32(A, _c0)
+            c0 = hi_b ^ c1 ^ sched[r][0]
+            c2 = hi_a ^ c3 ^ sched[r][1]
+            c1 = lo_b
+            c3 = lo_a
+        else:
+            c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
+            c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
+            c1 = B * _c2
+            c3 = A * _c0
     return c0, c1, c2, c3
 
 

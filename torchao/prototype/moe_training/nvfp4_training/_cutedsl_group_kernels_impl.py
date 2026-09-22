@@ -2984,7 +2984,9 @@ def _rht128_ms_eden_epilogue(
                 rbits = cutlass.Uint32(0)
                 if tile_parity * i == cutlass.Int32(0):
                     acc_pipeline.consumer_wait(acc_state)
-                    r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base))
+                    r0, r1, r2, r3 = philox4_all(
+                        state, cutlass.Uint32(idx_base), wide=True
+                    )
                     even_word = cutlass.Uint32(cutlass.select_(odd_half, r1, r0))
                     odd_word = cutlass.Uint32(cutlass.select_(odd_half, r3, r2))
                     rbits = cutlass.Uint32(
@@ -3035,7 +3037,7 @@ def _rht128_ms_eden_epilogue(
             else:
                 # Chain 0's consecutive tiles are different outer rows: draw every tile.
                 acc_pipeline.consumer_wait(acc_state)
-                r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base))
+                r0, r1, r2, r3 = philox4_all(state, cutlass.Uint32(idx_base), wide=True)
                 even_word = cutlass.Uint32(cutlass.select_(odd_half, r1, r0))
                 odd_word = cutlass.Uint32(cutlass.select_(odd_half, r3, r2))
                 rbits = cutlass.Uint32(cutlass.select_(odd_tile, odd_word, even_word))
