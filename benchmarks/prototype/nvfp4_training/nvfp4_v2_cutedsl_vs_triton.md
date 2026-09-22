@@ -9,9 +9,12 @@ benches in this directory. Compare numbers within this file only; the tables in
 
 - NVIDIA GB200, 152 SMs, SM application clock capped at 1200 MHz for every table here
   (medians of three passes on 2026-09-16, GPUs 0-3 of one node, the tree of this file's
-  commit). SM-bound kernels run about 1.6x slower than at the 1965 MHz maximum;
-  memory-bound rows do not scale with the SM clock. Most of these kernels are SM-bound at
-  this clock on both backends, so the speedup, not the absolute time, is the
+  commit). The MS-EDEN table is the exception: re-measured on 2026-09-22 on the tree of
+  this file's commit, medians of three passes on GPU 0 of another GB200 node of the same
+  kind at the same cap, its default and Triton columns reproducing the 2026-09-16 record
+  within 0.4% and 0.7%. SM-bound kernels run about 1.6x slower than at the 1965 MHz
+  maximum; memory-bound rows do not scale with the SM clock. Most of these kernels are
+  SM-bound at this clock on both backends, so the speedup, not the absolute time, is the
   clock-portable number.
 - Peak bandwidth 7936 GB/s (`torch.cuda.get_device_properties` on the GPU that produced
   the first tables; other GB200s on these nodes report 8064). Every GB/s and `pct_peak` is
@@ -56,8 +59,8 @@ and are accepted by the distribution tests described under the kernel.
 |---|---|---:|---:|---:|
 | row_cast_quantize | yes | 1.67-1.75x | 1.93-1.95x | 5580-5601 |
 | row_rht_col_rht_amax | yes | 5.01-5.18x | 5.62-5.75x | 5270-5601 |
-| row_rht_col_rht_quantize_ms_eden | yes | 2.61-2.64x | 2.63-2.64x | 2068-2108 |
-| row_rht_col_rht_quantize_ms_eden, `fast_path=True` | codes only | 3.19-3.22x | 3.24-3.25x | 2546-2597 |
+| row_rht_col_rht_quantize_ms_eden | yes | 2.61-2.62x | 2.62-2.63x | 2067-2108 |
+| row_rht_col_rht_quantize_ms_eden, `fast_path=True` | codes only | 3.52-3.56x | 3.64-3.67x | 2868-2938 |
 | col_rht_requant_amax | yes | 1.87-1.89x | 2.39-2.41x | 991-1000 |
 | col_rht_requantize | yes | 1.85-1.88x | 2.06-2.29x | 1290-1441 |
 | col_cast_requant_amax | yes | 2.20-2.21x | 4.58-4.78x | 3970-4135 |
@@ -163,33 +166,34 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
 
 | model | projection | E | tokens | dim | cutedsl_us | fast_us | triton_us | speedup | fast_speedup | cutedsl_gbps | fast_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 11.36 | 10.64 | 32.48 | 2.86x | 3.05x | 72.1 | 77.0 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 11.36 | 10.62 | 32.38 | 2.85x | 3.05x | 72.1 | 77.1 |
-| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 113.01 | 92.90 | 298.77 | 2.64x | 3.22x | 1913.7 | 2328.0 |
-| 16B | down (w2) | 4 | 12288 | 2048 | 160.33 | 131.28 | 419.08 | 2.61x | 3.19x | 1962.0 | 2396.1 |
-| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 405.63 | 329.50 | 1066.58 | 2.63x | 3.24x | 2068.0 | 2545.8 |
-| 671B | down (w2) | 4 | 32768 | 7168 | 1392.65 | 1130.74 | 3673.81 | 2.64x | 3.25x | 2108.2 | 2596.5 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 11.35 | 10.10 | 32.38 | 2.85x | 3.21x | 72.2 | 81.1 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 11.34 | 10.09 | 32.30 | 2.85x | 3.20x | 72.2 | 81.2 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 113.41 | 84.43 | 296.83 | 2.62x | 3.52x | 1907.0 | 2561.5 |
+| 16B | down (w2) | 4 | 12288 | 2048 | 160.34 | 117.63 | 419.05 | 2.61x | 3.56x | 1962.0 | 2674.2 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 405.79 | 292.50 | 1064.60 | 2.62x | 3.64x | 2067.2 | 2867.9 |
+| 671B | down (w2) | 4 | 32768 | 7168 | 1392.93 | 999.37 | 3663.66 | 2.63x | 3.67x | 2107.8 | 2937.9 |
 
 - `cutedsl_us` and `speedup` are the default path, `fast_us` and `fast_speedup` the
   `fast_path=True` variant. The CuteDSL op is its one kernel (the signed `R^T` tiles are
   built in shared memory); the Triton op adds two sign-matrix builds, 12.0-15.1 us. Both
-  kernels are SM-bound (27-33% of peak at 671B down). The default path runs one CTA per SM
+  kernels are SM-bound (27-37% of peak at 671B down). The default path runs one CTA per SM
   with an issue-limited epilogue at ~4.4k cycles per tile (two-point over the 671B rows)
   and the tensor pipe ~23% busy. REG 96, no spills, 3472 SASS instructions (the fast
-  variant 3296); Triton 3.8's kernel holds 247 registers, no spills, 5576 SASS
+  variant 3256); Triton 3.8's kernel holds 247 registers, no spills, 5576 SASS
   instructions.
-- `fast_path=True` (default `False`; the recipe calls the Triton op and never reaches it)
-  rounds the corrected scales in hardware: one `cvt.rs.satfinite.e4m3x4.f32` per warp-tile
-  in place of four Philox rounds and four software roundings, for 18% less op time at 16B
-  and 19% at 671B. It is a different stochastic stream, 16 random bits per value instead
-  of 20, with the two values of a pair sharing one half-word, one of them bit-reversed.
-  Its scale bytes are therefore not bitwise with Triton's: about a third differ by one
-  E4M3 step, always the other neighbour of the same corrected scale, while the codes are
-  identical. Accepted by distribution (`test_fast_path_*`): every scale lands on one of
-  the reference's two E4M3 neighbours, and the round-up rate equals the fractional
-  position within 0.01 per bin over 2^20 scales per axis. The tests also check
-  unbiasedness over 64 draws, SQNR within 0.1 dB of the default path, determinism, and
-  rng-slice isolation.
+- `fast_path=True` (default `False`; the recipe never passes it: no knob in the V2
+  dispatch or in torchtitan) rounds the corrected scales in hardware: one
+  `cvt.rs.satfinite.e4m3x4.f32` per warp-tile in place of four Philox rounds and four
+  software roundings, for 26-27% less op time at 16B and 28% at 671B with the three
+  fast-path commits below (18-19% before them, at f6f0e0999). It is a different stochastic
+  stream, 16 random bits per value instead of 20, with the two values of a pair sharing
+  one half-word, one of them bit-reversed. Its scale bytes are therefore not bitwise with
+  Triton's: about a third differ by one E4M3 step, always the other neighbour of the same
+  corrected scale, while the codes are identical. Accepted by distribution
+  (`test_fast_path_*`): every scale lands on one of the reference's two E4M3 neighbours,
+  and the round-up rate equals the fractional position within 0.01 per bin over 2^20
+  scales per axis. The tests also check unbiasedness over 64 draws, SQNR within 0.1 dB of
+  the default path, determinism, and rng-slice isolation.
 - 26c3f8116 feeds the unclamped scaled values into the correction on both backends (the
   clamped ones hid the saturated amax element on half the blocks, a one-sided ~0.3% shrink
   of the dequantized operand overall, ~0.7% on those blocks). Against the fe57e17d5 record
@@ -206,11 +210,12 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   instead of one per tile. Codes unchanged; the corrected scale moves at float-rounding
   level ahead of the stochastic E4M3 rounding (no fast-path scale byte differs from the
   previous fast path at the recipe shapes; the `test_fast_path_*` items and the adversarial
-  probe hold). Measured on a GB200 at 2062 MHz, paired three-pass medians (this table is
-  at 1200 MHz): 671B down 704.5 to 636.2 us (-9.7%, 4168 to 4615 GB/s, 3.6x Triton), 671B
-  gate/up -9.1%, 16B down -7.6%, 16B gate/up -6.7%; warp instructions -12%, the shared
-  FMA-heavy pipe 63 to 44% busy, 3296 SASS instructions as before, REG 96 to 95, no
-  spills. The default kernel's PTX and SASS are unchanged.
+  probe hold). Measured on a GB200 at 2062 MHz, paired three-pass medians (this table,
+  re-measured after all three fast-path commits, is at 1200 MHz): 671B down 704.5 to
+  636.2 us (-9.7%, 4168 to 4615 GB/s, 3.6x Triton), 671B gate/up -9.1%, 16B down -7.6%,
+  16B gate/up -6.7%; warp instructions -12%, the shared FMA-heavy pipe 63 to 44% busy,
+  3296 SASS instructions as before, REG 96 to 95, no spills. The default kernel's PTX and
+  SASS are unchanged.
 - 48b99b19d changes only the scheduling of the fast path: the four correction-ratio tails
   of a tile (the `FMUL.FTZ` of `div.approx.ftz.f32`, the finiteness select and the
   multiply of the widened E4M3 scale) run together after the block loop of both tile
@@ -226,8 +231,8 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   119.9 to 118.1 (-1.48%), 16B gate/up 85.2 to 83.9 (-1.48%); the Triton control flat
   within 0.54%; ncu gpc cycles -0.97%, warp-state samples at the FMUL.FTZ PCs -45%. REG 95
   to 96, no spills, 3296 SASS instructions with every arithmetic opcode count as before.
-  The table above is unchanged: its `fast_us` column is f6f0e0999's 1200 MHz record of the
-  fast path before 4496c9da9.
+  The table above includes this change: its `fast_us` column is the 2026-09-22
+  re-measurement of cc25bf416 at 1200 MHz.
 - b10c60780 fuses the Philox multiplies of the fast path: `philox4_all` takes a trace-time
   `wide` keyword whose arm draws every (mul.hi, mul.lo) product pair of the Philox rounds
   as one `mul.wide.u32`, as the default path's `philox_word0` has always done, and the two
@@ -246,8 +251,16 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   292.4 (-0.52%), 16B down 118.5 to 117.7 (-0.70%), 16B gate/up 85.1 to 84.6 (-0.55%); the
   Triton control flat within 0.64%; ncu at 671B down: warp instructions executed -1.2%,
   gpc cycles -0.76%, long-scoreboard samples 13.4 to 15.6% (about half of the freed issue
-  slots become waits). The table above is unchanged: its `fast_us` column is f6f0e0999's
-  1200 MHz record of the fast path before 4496c9da9.
+  slots become waits). The table above includes this change: its `fast_us` column is the
+  2026-09-22 re-measurement of cc25bf416 at 1200 MHz.
+- The three fast-path commits together at 1200 MHz, the table above against the f6f0e0999
+  record: fast path 1130.74 to 999.37 us at 671B down (-11.6%; -11.2% at 671B gate/up,
+  -10.4% at 16B down, -9.1% at 16B gate/up), fast over default 0.81-0.82 to 0.72-0.74,
+  3.2x to 3.5-3.7x Triton, 2868-2938 GB/s at 671B; the default and Triton columns are
+  within 0.4% and 0.7% of the 2026-09-16 record (default kernel SASS unchanged, Triton
+  unchanged). At full clock on GB300 (an internal bench run on f6f0e0999, before
+  these three commits) fast over default was 0.83-0.85, so the full-clock ratio after them
+  is projected at ~0.73-0.78, not measured.
 
 ### group_col_rht_requant_amax
 
