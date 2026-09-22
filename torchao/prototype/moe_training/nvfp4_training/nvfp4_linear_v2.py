@@ -30,6 +30,7 @@ What the two recipes share and where they diverge:
   ``w.t()`` rotated by ``R_n``.
 """
 
+from functools import partial
 from typing import Optional
 
 import torch
@@ -218,6 +219,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
         sr_seed: torch.Tensor,
         use_cutedsl: bool = False,
         use_fast_math: bool = True,
+        ms_eden_fast_path: bool = False,
     ):
         M = input_hp.shape[-2]
         K = input_hp.shape[-1]
@@ -309,6 +311,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.use_cutedsl = use_cutedsl
         ctx.use_fast_math = use_fast_math
+        ctx.ms_eden_fast_path = ms_eden_fast_path
         return output
 
     @staticmethod
@@ -335,7 +338,10 @@ class _NVFP4LinearV2(torch.autograd.Function):
             else triton_group_row_rht_col_rht_amax
         )
         group_row_rht_col_rht_quantize_ms_eden = (
-            cutedsl_group_row_rht_col_rht_quantize_ms_eden
+            partial(
+                cutedsl_group_row_rht_col_rht_quantize_ms_eden,
+                fast_path=ctx.ms_eden_fast_path,
+            )
             if ctx.use_cutedsl
             else triton_group_row_rht_col_rht_quantize_ms_eden
         )
@@ -412,8 +418,8 @@ class _NVFP4LinearV2(torch.autograd.Function):
             else None
         )
         # input_hp, weight_hp, bias, wgrad_rht, dgrad_rht, sr_seed, use_cutedsl,
-        # use_fast_math
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None
+        # use_fast_math, ms_eden_fast_path
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
 
 @torch._dynamo.allow_in_graph
@@ -636,6 +642,7 @@ def nvfp4_linear_v2(
     sr_seed: torch.Tensor,
     kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
+    ms_eden_fast_path: bool = False,
 ) -> torch.Tensor:
     """``input @ weight.t() + bias`` under the V2 recipe.
 
@@ -652,11 +659,21 @@ def nvfp4_linear_v2(
             rather than falling back. The weight amax is Triton on every path -- it
             has no CuteDSL twin.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
+        ms_eden_fast_path: round the MS-EDEN scales of the backward in hardware
+            (``cvt.rs``) rather than in software. The FP4 codes are bitwise with the
+            default path and with Triton; each scale byte lands on one of the two E4M3
+            neighbours of the same corrected scale, so the step is not bitwise with
+            Triton. CuteDSL only: raises if the MS-EDEN op resolves to Triton.
 
     Both sign buffers must be the module-owned tensors that
     ``resample_nvfp4_rht_signs`` updates in place, not fresh allocations.
     """
     use_cutedsl = _resolve_use_cutedsl(kernel_preference)
+    if ms_eden_fast_path and not use_cutedsl:
+        raise ValueError(
+            "ms_eden_fast_path=True requires the MS-EDEN op on CuteDSL; this call "
+            "resolves it to Triton"
+        )
     return _NVFP4LinearV2.apply(
         input_hp,
         weight_hp,
@@ -666,6 +683,7 @@ def nvfp4_linear_v2(
         sr_seed,
         use_cutedsl,
         use_fast_math,
+        ms_eden_fast_path,
     )
 
 

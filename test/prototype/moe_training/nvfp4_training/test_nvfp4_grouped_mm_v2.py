@@ -118,6 +118,7 @@ class _RecordOps(TorchDispatchMode):
     def __init__(self):
         self.names = set()
         self.kernels = set()
+        self.ms_eden_fast_path = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         name = func.name() if hasattr(func, "name") else str(func)
@@ -126,6 +127,11 @@ class _RecordOps(TorchDispatchMode):
             self.names.add(name)
             # torchao::<backend>_<kernel> -> <kernel>
             self.kernels.add(name.split("::")[1].split("_", 1)[1])
+            if name.endswith(_MS_EDEN_OP):
+                # The dispatcher drops a trailing argument left at its default.
+                bound = dict(zip((a.name for a in func._schema.arguments), args))
+                bound.update(kwargs or {})
+                self.ms_eden_fast_path = bound.get("fast_path", False)
         return func(*args, **(kwargs or {}))
 
 
@@ -405,6 +411,70 @@ def test_v2_backends_are_bitwise_for_a_fixed_rng_state(sizes, pad, monkeypatch):
         results.append((out, h.grad, w2.grad))
     for name, triton, cutedsl in zip(("out", "h.grad", "w2.grad"), *results):
         assert torch.equal(triton, cutedsl), f"{name} differs across backends"
+
+
+@_needs_v2
+@_requires_cutedsl
+def test_v2_ms_eden_fast_path_moves_only_the_scale_bytes(monkeypatch):
+    """``ms_eden_fast_path`` reaches the CuteDSL MS-EDEN op as ``fast_path=True`` and
+    touches nothing else: the forward is the default path's bitwise, and the gradients
+    stay close to it because only the scale bytes move, each by at most one E4M3 step.
+    Leaving the knob out is the same call as passing ``False``."""
+    fixed = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    monkeypatch.setattr(gmm_v2_mod, "_backward_rng_state", lambda sr_seed: fixed)
+    sizes = [128, 384, 256]
+    state = _state()
+
+    def step(**kwargs):
+        _, _, w2, _, offs = _moe_inputs(sizes, 512, 256)
+        h = torch.randn(
+            sum(sizes), 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with _RecordOps() as recorder:
+            out = nvfp4_v2_grouped_mm(
+                h,
+                w2,
+                wgrad_rht=state["fc2_wgrad"],
+                dgrad_rht=state["fc2_dgrad"],
+                sr_seed=state["fc2_seed"],
+                offs=offs,
+                kernel_preference=KernelPreference.CUTEDSL,
+                **kwargs,
+            )
+            out.float().square().mean().backward()
+        return recorder, out, h.grad, w2.grad
+
+    default = step()
+    off = step(ms_eden_fast_path=False)
+    fast = step(ms_eden_fast_path=True)
+    assert default[0].ms_eden_fast_path is False and off[0].ms_eden_fast_path is False
+    assert fast[0].ms_eden_fast_path is True
+    for name, want, got in zip(("out", "h.grad", "w2.grad"), default[1:], off[1:]):
+        assert torch.equal(want, got), f"{name} differs between omitted and False"
+    assert torch.equal(default[1], fast[1]), "the fast path is a backward-only change"
+    for name, want, got in zip(("h.grad", "w2.grad"), default[2:], fast[2:]):
+        assert torch.isfinite(got).all(), f"{name} has non-finite values"
+        assert compute_error(want.float(), got.float()) > 20.0, name
+
+
+@maybe_sm100
+@torch.no_grad()
+def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
+    """The fast path is a variant of the CuteDSL kernel, so a call whose MS-EDEN op
+    resolves to Triton refuses it before any kernel runs."""
+    _, _, w2, _, offs = _moe_inputs([128, 128], 512, 256)
+    h = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="requires the MS-EDEN op on CuteDSL"):
+        nvfp4_v2_grouped_mm(
+            h,
+            w2.detach(),
+            wgrad_rht=_signs(0),
+            dgrad_rht=_signs(1),
+            sr_seed=_seed(1),
+            offs=offs,
+            kernel_preference=KernelPreference.TRITON,
+            ms_eden_fast_path=True,
+        )
 
 
 @_needs_v1_requant

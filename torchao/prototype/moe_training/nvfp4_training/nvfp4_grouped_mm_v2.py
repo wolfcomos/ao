@@ -19,6 +19,7 @@ runs, so the split is a configuration choice rather than a hard-coded assumption
 Recipe V1 is untouched by this module; it stays in ``nvfp4_grouped_mm.py``.
 """
 
+from functools import partial
 from typing import Optional
 
 import torch
@@ -257,6 +258,7 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         pad_token_groups_for_grouped_mm: bool,
         kernel_preference: KernelPreference,
         use_fast_math: bool,
+        ms_eden_fast_path: bool,
     ) -> torch.Tensor:
         num_tokens, K, num_experts, N = _validate_grouped_inputs(
             input_act,
@@ -270,6 +272,11 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         use_cutedsl_rht, use_cutedsl_weight = _resolve_backends(
             kernel_preference, num_experts
         )
+        if ms_eden_fast_path and not use_cutedsl_rht:
+            raise ValueError(
+                "ms_eden_fast_path=True requires the MS-EDEN op on CuteDSL; this call "
+                "resolves it to Triton"
+            )
 
         input_act = input_act.to(torch.bfloat16).contiguous()
         weight = weight.to(torch.bfloat16).contiguous()
@@ -374,6 +381,7 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.use_cutedsl_rht = use_cutedsl_rht
         ctx.use_cutedsl_weight = use_cutedsl_weight
+        ctx.ms_eden_fast_path = ms_eden_fast_path
         return output
 
     @staticmethod
@@ -407,7 +415,10 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
             else triton_group_row_rht_col_rht_amax
         )
         group_row_rht_col_rht_quantize_ms_eden = (
-            cutedsl_group_row_rht_col_rht_quantize_ms_eden
+            partial(
+                cutedsl_group_row_rht_col_rht_quantize_ms_eden,
+                fast_path=ctx.ms_eden_fast_path,
+            )
             if ctx.use_cutedsl_rht
             else triton_group_row_rht_col_rht_quantize_ms_eden
         )
@@ -487,8 +498,8 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
                 alignment_size=_ALIGNMENT,
             )
         # input_act, weight, wgrad_rht, dgrad_rht, sr_seed, offs, pad,
-        # kernel_preference, use_fast_math
-        return grad_input, grad_weight, None, None, None, None, None, None, None
+        # kernel_preference, use_fast_math, ms_eden_fast_path
+        return grad_input, grad_weight, None, None, None, None, None, None, None, None
 
 
 class _NVFP4GroupedMMV1Requant(torch.autograd.Function):
@@ -745,6 +756,7 @@ def nvfp4_v2_grouped_mm(
     pad_token_groups_for_grouped_mm: bool = False,
     kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
+    ms_eden_fast_path: bool = False,
 ) -> torch.Tensor:
     """Grouped ``A @ B[g].t()`` under the V2 recipe.
 
@@ -767,6 +779,11 @@ def nvfp4_v2_grouped_mm(
             Triton; CUTEDSL demands CuteDSL and raises if it cannot run. The
             per-expert weight amax is Triton on every path -- it has no CuteDSL twin.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
+        ms_eden_fast_path: round the MS-EDEN scales of the backward in hardware
+            (``cvt.rs``) rather than in software. The FP4 codes are bitwise with the
+            default path and with Triton; each scale byte lands on one of the two E4M3
+            neighbours of the same corrected scale, so the step is not bitwise with
+            Triton. CuteDSL only: raises if the MS-EDEN op resolves to Triton.
 
     When padding is off, ``offs[-1]`` may be less than ``M``: rows from ``offs[-1]``
     on are the dispatcher's spare capacity, are never read, and carry no contract in
@@ -782,6 +799,7 @@ def nvfp4_v2_grouped_mm(
         pad_token_groups_for_grouped_mm,
         kernel_preference,
         use_fast_math,
+        ms_eden_fast_path,
     )
     if bias is not None:
         output = output + bias.to(output.dtype)
