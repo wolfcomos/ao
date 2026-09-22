@@ -228,6 +228,26 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   to 96, no spills, 3296 SASS instructions with every arithmetic opcode count as before.
   The table above is unchanged: its `fast_us` column is f6f0e0999's 1200 MHz record of the
   fast path before 4496c9da9.
+- b10c60780 fuses the Philox multiplies of the fast path: `philox4_all` takes a trace-time
+  `wide` keyword whose arm draws every (mul.hi, mul.lo) product pair of the Philox rounds
+  as one `mul.wide.u32`, as the default path's `philox_word0` has always done, and the two
+  MS-EDEN fast draw sites (chain 1's Philox-compute arm, chain 0's per-tile draw) pass it;
+  the non-wide arm is the previous statements verbatim, so the two stochastic-rounding
+  kernels that also draw through `philox4_all` are unchanged. ptxas emits `IMAD.HI.U32` +
+  `IMAD` for the split pair and one `IMAD.WIDE.U32` for the fused form: both draw blocks
+  113 to 98 SASS instructions, the fast kernel 3296 to 3256 (`IMAD.HI.U32` 30 to 2, `IMAD`
+  47 to 20, `IMAD.WIDE.U32` 15 to 46), REG 96 as before, no spills, every floating-point
+  opcode count unchanged. Same words from the same operands (the high and low halves of
+  `mul.wide.u32` are `mul.hi.u32` and `mul.lo.u32` by definition): every fast output is
+  bytewise identical to 48b99b19d's at the four recipe shapes and two rng states (32/32
+  tensors, twice); the default kernel's PTX and SASS are unchanged. Measured on a GB200
+  with the SM clock capped at 1200 MHz, paired three-pass medians over three adjacent
+  rounds: 671B down 1006.6 to 999.1 us (-0.75%, 2917 to 2939 GB/s), 671B gate/up 293.9 to
+  292.4 (-0.52%), 16B down 118.5 to 117.7 (-0.70%), 16B gate/up 85.1 to 84.6 (-0.55%); the
+  Triton control flat within 0.64%; ncu at 671B down: warp instructions executed -1.2%,
+  gpc cycles -0.76%, long-scoreboard samples 13.4 to 15.6% (about half of the freed issue
+  slots become waits). The table above is unchanged: its `fast_us` column is f6f0e0999's
+  1200 MHz record of the fast path before 4496c9da9.
 
 ### group_col_rht_requant_amax
 
