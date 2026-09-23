@@ -13,9 +13,9 @@ benches in this directory. Compare numbers within this file only; the tables in
   this file's commit, medians of three passes on GPU 0 of another GB200 node of the same
   kind at the same cap, its default and Triton columns reproducing the 2026-09-16 record
   within 0.4% and 0.7%; the `group_row_rht_col_rht_amax`, `group_row_cast_quantize` and
-  `group_row_cast_col_rht_amax` tables likewise on 2026-09-23 on a third such node (GPUs 0-2;
-  the first within 0.9% of the 2026-09-16 record, the other two on kernels changed that day,
-  their Triton columns within 0.5%). SM-bound kernels run about 1.6x slower than at the 1965 MHz
+  `group_row_cast_col_rht_amax` and `group_row_cast_col_rht_quantize` tables likewise on
+  2026-09-23 on a third such node (GPUs 0-2; the first within 0.9% of the 2026-09-16 record,
+  the other three on kernels changed that day, their Triton columns within 0.5%). SM-bound kernels run about 1.6x slower than at the 1965 MHz
   maximum; memory-bound rows do not scale with the SM clock. Most of these kernels are
   SM-bound at this clock on both backends, so the speedup, not the absolute time, is the
   clock-portable number.
@@ -69,7 +69,7 @@ and are accepted by the distribution tests described under the kernel.
 | col_cast_requant_amax | yes | 2.20-2.21x | 4.58-4.78x | 3970-4135 |
 | col_cast_requantize | yes | 5.00-5.25x | 5.62-5.65x | 1408-1411 |
 | row_cast_col_rht_amax | yes | 4.63-4.94x | 5.51-5.77x | 6093-6572 |
-| row_cast_col_rht_quantize | yes | 2.11-2.14x | 2.27-2.28x | 4075-4178 |
+| row_cast_col_rht_quantize | yes | 2.17-2.20x | 2.38-2.40x | 4289-4390 |
 
 ## End to end
 
@@ -470,17 +470,23 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_quant
 
 | model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 7.51 | 15.10 | 2.01x | 109.1 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 7.53 | 15.19 | 2.02x | 108.9 |
-| 16B | gate/up (w1/w3) | 4 | 12288 | 2048 | 87.94 | 185.15 | 2.11x | 3577.3 |
-| 16B | down (w2) | 4 | 12288 | 1408 | 61.53 | 131.77 | 2.14x | 3515.0 |
-| 671B | gate/up (w1/w3) | 4 | 32768 | 7168 | 702.75 | 1602.31 | 2.28x | 4177.9 |
-| 671B | down (w2) | 4 | 32768 | 2048 | 205.84 | 467.36 | 2.27x | 4075.2 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 7.51 | 15.74 | 2.09x | 109.0 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 7.52 | 15.70 | 2.09x | 108.9 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 2048 | 84.95 | 184.24 | 2.17x | 3702.9 |
+| 16B | down (w2) | 4 | 12288 | 1408 | 59.77 | 131.49 | 2.20x | 3618.6 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 7168 | 668.87 | 1602.29 | 2.40x | 4389.5 |
+| 671B | down (w2) | 4 | 32768 | 2048 | 195.60 | 465.88 | 2.38x | 4288.7 |
 
 - The CuteDSL op is its one kernel; the Triton op adds a sign-matrix build, 5.9-8.3 us.
   Kernel-only 2.01-2.27x over the four large rows.
-- 671B: 4075-4178 GB/s, 51-53% of peak; the two quantize epilogues bound the kernel at
+- 671B: 4289-4390 GB/s, 54-55% of peak; the two quantize epilogues bound the kernel at
   this clock, not the UMMA chain or HBM. REG 76, no spills.
+- The row warps store their E4M3 scales as one 4-byte word per lane quad: the four lanes
+  whose bytes are adjacent in the 128x4 swizzle exchange them with two butterfly shuffles
+  and two byte permutes (`cute.arch.shuffle_sync_bfly` / `cute.arch.prmt`), so the four
+  scattered 1-byte stores of a tile row become one store. Bytes unchanged. Against the same
+  tree without it, timed back to back on one GPU: 16B 87.95 / 61.54 us, 671B 702.93 /
+  205.73 us, i.e. -2.8 .. -4.9% (three-pass spreads <= 0.4%).
 
 ## Triton baseline for the nine grouped kernels
 
