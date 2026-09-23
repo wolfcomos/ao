@@ -101,8 +101,6 @@ from ._cutedsl_kernels_impl import (
     _div_rn_f32,
     _dot16_e_q_bf16,
     _e4m3x2_to_f16x2,
-    _f16hi_to_f32,
-    _f16lo_to_f32,
     _get_num_sms,
     _get_rht_buffer,
     _get_sr_rng_buffer,
@@ -3892,57 +3890,59 @@ def _rht128_colrht_next_tile(e, pid_m, pid_n, tiles_m, tiles_n, more):
 @dsl_user_op
 def _rht128_colrht_dequant_word(
     word: cutlass.Uint32,
-    sf: cutlass.Float32,
+    sfp: cutlass.Uint32,
     gds: cutlass.Float32,
+    hi: cutlass.Constexpr,
     *,
     loc=None,
     ip=None,
 ):
-    """``_dequant_e2m1x8_bf16x2x4`` with its sixteen ``mul.rn.f32`` as eight ``mul.f32x2``
-    (per lane the same correctly rounded product, as the epilogue's packs): exact e2m1
-    decode, the exact product by the block scale, the one rounding by the decode scale,
-    ``cvt.rn.bf16x2.f32``. Word k holds elements ``2k`` (low half) and ``2k + 1``."""
+    """``_dequant_e2m1x8_bf16x2x4`` with the block scale the ``hi`` (else low) f16 half
+    of ``sfp``, each element's widening and block-scale multiply one ``fma.rn.f32.f16``
+    with a ``-0.0`` addend (at most 2 + 4 significant bits, exact in f16 and f32, so its
+    one rounding is exact and every zero keeps its sign) and the eight ``mul.rn.f32`` by
+    the decode scale as four ``mul.f32x2`` (per lane the same correctly rounded product,
+    as the epilogue's packs): the same values, value for value. Word k holds elements ``2k``
+    (low half) and ``2k + 1``."""
+    s = "sh" if hi else "sl"
     rst = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * 4),
         [
             word.ir_value(loc=loc, ip=ip),
-            sf.ir_value(loc=loc, ip=ip),
+            sfp.ir_value(loc=loc, ip=ip),
             gds.ir_value(loc=loc, ip=ip),
         ],
         (
             "{\n"
             ".reg .b8 b0, b1, b2, b3;\n"
             ".reg .b32 p0, p1, p2, p3;\n"
-            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
-            ".reg .f32 q0, q1, q2, q3, q4, q5, q6, q7;\n"
-            ".reg .b64 s2, g2, r01, r23, r45, r67;\n"
+            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3, sl, sh;\n"
+            ".reg .f32 q0, q1, q2, q3, q4, q5, q6, q7, nz;\n"
+            ".reg .b64 g2, r01, r23, r45, r67;\n"
             "mov.b32 {b0, b1, b2, b3}, $4;\n"
             "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
             "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
             "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
             "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "mov.b32 {sl, sh}, $5;\n"
+            "mov.f32 nz, 0f80000000;\n"
             "mov.b32 {l0, h0}, p0;\n"
             "mov.b32 {l1, h1}, p1;\n"
             "mov.b32 {l2, h2}, p2;\n"
             "mov.b32 {l3, h3}, p3;\n"
-            "cvt.f32.f16 q0, l0;\n"
-            "cvt.f32.f16 q1, h0;\n"
-            "cvt.f32.f16 q2, l1;\n"
-            "cvt.f32.f16 q3, h1;\n"
-            "cvt.f32.f16 q4, l2;\n"
-            "cvt.f32.f16 q5, h2;\n"
-            "cvt.f32.f16 q6, l3;\n"
-            "cvt.f32.f16 q7, h3;\n"
-            "mov.b64 s2, {$5, $5};\n"
+            "fma.rn.f32.f16 q0, l0, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q1, h0, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q2, l1, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q3, h1, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q4, l2, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q5, h2, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q6, l3, " + s + ", nz;\n"
+            "fma.rn.f32.f16 q7, h3, " + s + ", nz;\n"
             "mov.b64 g2, {$6, $6};\n"
             "mov.b64 r01, {q0, q1};\n"
             "mov.b64 r23, {q2, q3};\n"
             "mov.b64 r45, {q4, q5};\n"
             "mov.b64 r67, {q6, q7};\n"
-            "mul.f32x2 r01, r01, s2;\n"
-            "mul.f32x2 r23, r23, s2;\n"
-            "mul.f32x2 r45, r45, s2;\n"
-            "mul.f32x2 r67, r67, s2;\n"
             "mul.f32x2 r01, r01, g2;\n"
             "mul.f32x2 r23, r23, g2;\n"
             "mul.f32x2 r45, r45, g2;\n"
@@ -3957,7 +3957,7 @@ def _rht128_colrht_dequant_word(
             "cvt.rn.bf16x2.f32 $3, q7, q6;\n"
             "}"
         ),
-        "=r,=r,=r,=r,r,f,f",
+        "=r,=r,=r,=r,r,r,f",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -3968,11 +3968,11 @@ def _rht128_colrht_dequant_word(
     )
 
 
-def _rht128_colrht_put_word(word, sf, gds_m, st4, off):
+def _rht128_colrht_put_word(word, sfp, gds_m, hi, st4, off):
     """Dequantize one code word (eight columns of the tile row) and store its four
     bf16x2 words as one 16 B chunk at swizzled stage byte offset ``off``. Plain
     function, traced inline."""
-    st4[0], st4[1], st4[2], st4[3] = _rht128_colrht_dequant_word(word, sf, gds_m)
+    st4[0], st4[1], st4[2], st4[3] = _rht128_colrht_dequant_word(word, sfp, gds_m, hi)
     cute.make_tensor(
         cute.make_ptr(cutlass.Uint32, off, cute.AddressSpace.smem, assumed_align=16),
         cute.make_layout((4,)),
@@ -4006,7 +4006,7 @@ def _rht128_dequant_a_producer(
     ``RHT128_COLRHT_LOAD_STAGES - 1`` tiles ahead (this thread's 36 B of each slot), so
     the DRAM round trip overlaps several tiles' decode without rotating registers.
 
-    Numerics are the Triton reconstruction's, op for op (``_rht128_colrht_dequant_word``),
+    Numerics are the Triton reconstruction's, value for value (``_rht128_colrht_dequant_word``),
     with the sign vector folded into the per-row decode scale ``gds_m = s_m * gds`` (an
     exact sign flip) and an invalid (NaN/inf) expert amax filling the row with the
     sign-folded zero ``s_m * (+0)``: every A element is Triton's times ``s_m``, so every
@@ -4143,14 +4143,13 @@ def _rht128_dequant_a_producer(
         if valid != cutlass.Int32(0):
             for j in cutlass.range_constexpr(2):
                 sfp = _e4m3x2_to_f16x2(sfw >> cutlass.Uint32(16 * j))
-                sf_ab = _f16lo_to_f32(sfp)
-                sf_cd = _f16hi_to_f32(sfp)
                 words = (c0, c1, c2, c3) if j == 0 else (c4, c5, c6, c7)
                 for k in cutlass.range_constexpr(4):
                     _rht128_colrht_put_word(
                         words[k],
-                        sf_ab if k < 2 else sf_cd,
+                        sfp,
                         gds_m,
+                        k >= 2,
                         st4,
                         stage_off + cutlass.Int32(16) * (cutlass.Int32(4 * j + k) ^ x),
                     )
