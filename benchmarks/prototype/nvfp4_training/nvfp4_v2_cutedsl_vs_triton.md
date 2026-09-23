@@ -12,7 +12,8 @@ benches in this directory. Compare numbers within this file only; the tables in
   commit). The MS-EDEN table is the exception: re-measured on 2026-09-22 on the tree of
   this file's commit, medians of three passes on GPU 0 of another GB200 node of the same
   kind at the same cap, its default and Triton columns reproducing the 2026-09-16 record
-  within 0.4% and 0.7%. SM-bound kernels run about 1.6x slower than at the 1965 MHz
+  within 0.4% and 0.7%; the `group_row_rht_col_rht_amax` table likewise on 2026-09-23 on a
+  third such node (GPU 2, within 0.9% of the 2026-09-16 record). SM-bound kernels run about 1.6x slower than at the 1965 MHz
   maximum; memory-bound rows do not scale with the SM clock. Most of these kernels are
   SM-bound at this clock on both backends, so the speedup, not the absolute time, is the
   clock-portable number.
@@ -58,7 +59,7 @@ and are accepted by the distribution tests described under the kernel.
 | kernel | bitwise vs Triton 3.8 | 16B speedup | 671B speedup | 671B GB/s |
 |---|---|---:|---:|---:|
 | row_cast_quantize | yes | 1.67-1.75x | 1.93-1.95x | 5580-5601 |
-| row_rht_col_rht_amax | yes | 5.01-5.18x | 5.62-5.75x | 5270-5601 |
+| row_rht_col_rht_amax | yes | 5.04-5.20x | 5.63-5.74x | 5291-5607 |
 | row_rht_col_rht_quantize_ms_eden | yes | 2.61-2.62x | 2.62-2.63x | 2067-2108 |
 | row_rht_col_rht_quantize_ms_eden, `fast_path=True` | codes only | 3.52-3.56x | 3.64-3.67x | 2868-2938 |
 | col_rht_requant_amax | yes | 1.87-1.89x | 2.39-2.41x | 991-1000 |
@@ -131,17 +132,21 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_amax
 
 | model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.33 | 26.08 | 3.13x | 62.9 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 8.33 | 26.18 | 3.14x | 62.9 |
-| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 32.55 | 163.04 | 5.01x | 4251.6 |
-| 16B | down (w2) | 4 | 12288 | 2048 | 43.76 | 226.80 | 5.18x | 4601.2 |
-| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 101.87 | 572.00 | 5.62x | 5270.3 |
-| 671B | down (w2) | 4 | 32768 | 7168 | 335.47 | 1927.44 | 5.75x | 5601.3 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.28 | 25.78 | 3.11x | 63.3 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 8.29 | 25.87 | 3.12x | 63.2 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 1408 | 32.27 | 162.80 | 5.04x | 4288.7 |
+| 16B | down (w2) | 4 | 12288 | 2048 | 43.56 | 226.60 | 5.20x | 4621.9 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 2048 | 101.48 | 571.54 | 5.63x | 5290.6 |
+| 671B | down (w2) | 4 | 32768 | 7168 | 335.11 | 1923.41 | 5.74x | 5607.3 |
 
 - The CuteDSL op is its one kernel; the Triton op adds two sign-matrix builds and two
   fills, 15.5-19.3 us. Kernel-only 4.48-5.72x over the four large rows.
-- 671B down: 5601 GB/s, 71% of peak. Tensor-bound at 1200 MHz: ~1.06k cycles per tile at
+- 671B down: 5607 GB/s, 71% of peak. Tensor-bound at 1200 MHz: ~1.06k cycles per tile at
   the floor of its 16 UMMAs, after a 1.85 us launch. REG 50, no spills.
+- The TMA loads carry an L2 evict-first cache hint (`createpolicy.fractional.L2::evict_first`
+  passed as `cache_policy`); `dy` streams through once. Against the same tree without the
+  hint, timed concurrently on a second GPU of the node: 16B 32.41 / 43.66 us, 671B 101.79 /
+  335.40 us, i.e. -0.1 .. -0.4%, at the run-to-run spread; codes of the amaxes unchanged.
 
 ### group_row_rht_col_rht_quantize_ms_eden
 
