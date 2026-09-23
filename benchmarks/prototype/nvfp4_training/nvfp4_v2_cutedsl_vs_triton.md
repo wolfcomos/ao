@@ -12,8 +12,10 @@ benches in this directory. Compare numbers within this file only; the tables in
   commit). The MS-EDEN table is the exception: re-measured on 2026-09-22 on the tree of
   this file's commit, medians of three passes on GPU 0 of another GB200 node of the same
   kind at the same cap, its default and Triton columns reproducing the 2026-09-16 record
-  within 0.4% and 0.7%; the `group_row_rht_col_rht_amax` table likewise on 2026-09-23 on a
-  third such node (GPU 2, within 0.9% of the 2026-09-16 record). SM-bound kernels run about 1.6x slower than at the 1965 MHz
+  within 0.4% and 0.7%; the `group_row_rht_col_rht_amax`, `group_row_cast_quantize` and
+  `group_row_cast_col_rht_amax` tables likewise on 2026-09-23 on a third such node (GPUs 0-2;
+  the first within 0.9% of the 2026-09-16 record, the other two on kernels changed that day,
+  their Triton columns within 0.5%). SM-bound kernels run about 1.6x slower than at the 1965 MHz
   maximum; memory-bound rows do not scale with the SM clock. Most of these kernels are
   SM-bound at this clock on both backends, so the speedup, not the absolute time, is the
   clock-portable number.
@@ -58,7 +60,7 @@ and are accepted by the distribution tests described under the kernel.
 
 | kernel | bitwise vs Triton 3.8 | 16B speedup | 671B speedup | 671B GB/s |
 |---|---|---:|---:|---:|
-| row_cast_quantize | yes | 1.67-1.75x | 1.93-1.95x | 5580-5601 |
+| row_cast_quantize | yes | 1.76-1.85x | 2.01-2.02x | 5785-5820 |
 | row_rht_col_rht_amax | yes | 5.04-5.20x | 5.63-5.74x | 5291-5607 |
 | row_rht_col_rht_quantize_ms_eden | yes | 2.61-2.62x | 2.62-2.63x | 2067-2108 |
 | row_rht_col_rht_quantize_ms_eden, `fast_path=True` | codes only | 3.52-3.56x | 3.64-3.67x | 2868-2938 |
@@ -66,7 +68,7 @@ and are accepted by the distribution tests described under the kernel.
 | col_rht_requantize | yes | 1.85-1.88x | 2.06-2.29x | 1290-1441 |
 | col_cast_requant_amax | yes | 2.20-2.21x | 4.58-4.78x | 3970-4135 |
 | col_cast_requantize | yes | 5.00-5.25x | 5.62-5.65x | 1408-1411 |
-| row_cast_col_rht_amax | yes | 4.31-4.54x | 4.97-5.13x | 5485-5846 |
+| row_cast_col_rht_amax | yes | 4.63-4.94x | 5.51-5.77x | 6093-6572 |
 | row_cast_col_rht_quantize | yes | 2.11-2.14x | 2.27-2.28x | 4075-4178 |
 
 ## End to end
@@ -101,18 +103,24 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_quantize
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 3.79 | 3.98 | 1.05x | 177.1 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 3.79 | 3.98 | 1.05x | 177.2 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 7.09 | 11.83 | 1.67x | 4167.6 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 6.72 | 11.77 | 1.75x | 4399.0 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 26.96 | 52.16 | 1.93x | 5580.4 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 26.86 | 52.27 | 1.95x | 5601.0 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 3.68 | 3.94 | 1.07x | 182.6 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 3.68 | 3.93 | 1.07x | 182.6 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 6.71 | 11.78 | 1.76x | 4406.8 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 6.34 | 11.73 | 1.85x | 4664.9 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 25.85 | 52.20 | 2.02x | 5820.2 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 26.01 | 52.36 | 2.01x | 5784.7 |
 
 - Op time is kernel time on both backends (no glue).
-- Memory-bound at 671B: 70-71% of peak against Triton's 2.9 TB/s, about 5.6 TB/s of a
+- Memory-bound at 671B: 73% of peak against Triton's 2.9 TB/s, about 5.8 TB/s of a
   measured 5.9-6.2 TB/s streaming ceiling; 16B and the debug model sit on the launch
-  floor. REG 76, no spills, no shared memory, barriers or shuffles, six resident CTAs per
+  floor. REG 78, no spills, no shared memory, barriers or shuffles, six resident CTAs per
   SM; Triton's kernel holds 107 registers and reduces through shared memory.
+- The expert's two-level scale (its amax load and two correctly rounded divides) is
+  computed after the first batch's eight 16 B loads are issued, in their shadow; before,
+  the tile's first HBM request sat behind that chain and the loop-entry branch, which
+  ptxas does not hoist across. Against the same tree with the chain hoisted, timed back to
+  back on one GPU: 16B 7.00 / 6.63 us, 671B 26.84 / 26.77 us, i.e. -3.2 .. -5.1% (three-pass
+  spreads <= 0.4%); codes and scales unchanged.
 
 ### group_row_rht_col_rht_amax
 
@@ -421,18 +429,26 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_amax
 
 | model | projection | E | tokens | dim | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.28 | 18.96 | 2.29x | 63.3 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 8.29 | 18.93 | 2.28x | 63.3 |
-| 16B | gate/up (w1/w3) | 4 | 12288 | 2048 | 42.71 | 194.07 | 4.54x | 4714.0 |
-| 16B | down (w2) | 4 | 12288 | 1408 | 31.61 | 136.39 | 4.31x | 4378.9 |
-| 671B | gate/up (w1/w3) | 4 | 32768 | 7168 | 321.43 | 1649.80 | 5.13x | 5846.0 |
-| 671B | down (w2) | 4 | 32768 | 2048 | 97.87 | 486.16 | 4.97x | 5485.3 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.05 | 18.51 | 2.30x | 65.1 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 8.04 | 18.48 | 2.30x | 65.2 |
+| 16B | gate/up (w1/w3) | 4 | 12288 | 2048 | 39.22 | 193.73 | 4.94x | 5133.9 |
+| 16B | down (w2) | 4 | 12288 | 1408 | 29.26 | 135.46 | 4.63x | 4730.9 |
+| 671B | gate/up (w1/w3) | 4 | 32768 | 7168 | 285.93 | 1648.56 | 5.77x | 6571.8 |
+| 671B | down (w2) | 4 | 32768 | 2048 | 88.11 | 485.19 | 5.51x | 6093.2 |
 
 - The CuteDSL op is its kernel plus one fill (the column amax and a ready flag; CTA 0
   zeroes the row amax in-kernel), ~2 us; the Triton op adds a sign-matrix build to two
   fills, 9.7-12.8 us. Kernel-only 4.23-5.14x over the four large rows.
-- 671B: 5485-5846 GB/s, 69-74% of peak, the HBM share of a tile now within reach of its
-  8-UMMA chain and the row warps' shared-memory pass. REG 61, no spills.
+- 671B: 6093-6572 GB/s, 77-83% of peak, the HBM share of a tile now within reach of its
+  8-UMMA chain and the row warps' shared-memory pass. REG 65, no spills.
+- The col warps reduce each 128x128 accumulator with three-input `max.NaN.abs.f32`
+  (`_rht128_tile_amax`): ptxas already emitted one FMNMX3 per three values for the old
+  abs / max chain, so the instruction count is unchanged, but the chain was 64 deep per
+  tile per thread and is now eight independent depth-3 trees. Against the same tree with
+  the serial chain, timed back to back on one GPU: 16B 43.03 / 31.74 us, 671B 321.40 /
+  98.09 us, i.e. -6.3 .. -10.8% (three-pass spreads <= 0.2%); the two-chain gradient amax
+  and the col_rht requant amax, which share the helper, moved by less than 0.7%. Amaxes
+  unchanged.
 
 ### group_row_cast_col_rht_quantize
 
