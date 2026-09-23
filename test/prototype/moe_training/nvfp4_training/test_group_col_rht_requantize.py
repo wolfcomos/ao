@@ -332,6 +332,30 @@ def test_cutedsl_requantize_matches_triton(E, M, N):
 
 @_needs_kernel
 @_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_requantize_matches_triton_on_nan_scales():
+    """A NaN scale byte reconstructs its whole rowwise block to NaN, which the RHT-128
+    then spreads over whole columnwise blocks, so no block mixes a NaN with finite values
+    and the backends agree independently of the maxNum block amax the raw-row kernels
+    rely on. The requantization amax itself still propagates the NaN on both backends, so
+    the finite amax of the unpoisoned weight is supplied instead."""
+    E, M, N = 2, 256, 512
+    _, codes, scales, amax = _packed_weights(E, M, N, seed=225)
+    d = _signs(seed=0)
+    amax_t = _amax("triton", codes, scales, amax, d, E)
+    scale_bytes = scales.view(torch.uint8).view(E, -1)
+    scale_bytes[0, [0, 5, 77, 1000]] = 0x7F
+    scale_bytes[1, [3, 1234]] = 0xFF  # the negative-signed NaN
+    assert torch.isnan(_amax("triton", codes, scales, amax, d, E)).all()
+    assert torch.isnan(_amax("cutedsl", codes, scales, amax, d, E)).all()
+    t_codes, t_scales = _requant("triton", codes, scales, amax, amax_t, d, E)
+    c_codes, c_scales = _requant("cutedsl", codes, scales, amax, amax_t, d, E)
+    assert_codes_bitwise(c_codes, t_codes, "codes")
+    assert torch.equal(c_scales.view(torch.uint8), t_scales.view(torch.uint8))
+
+
+@_needs_kernel
+@_skip_no_cutedsl
 @pytest.mark.parametrize("signs", ["random", "all-minus-one"])
 @torch.no_grad()
 def test_cutedsl_degenerate_experts_match_triton(signs):

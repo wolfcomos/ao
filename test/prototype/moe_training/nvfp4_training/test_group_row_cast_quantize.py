@@ -272,6 +272,34 @@ def test_cutedsl_group_row_cast_quantize_matches_triton(shape):
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
+@_needs_kernel
+@_skip_no_cutedsl
+@pytest.mark.parametrize("shape", _BITWISE_SHAPES)
+@torch.no_grad()
+def test_cutedsl_group_row_cast_quantize_matches_triton_on_nan_blocks(shape):
+    """A NaN element is dropped from its block's amax on both backends (Triton's
+    ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their own scale and only
+    an all-NaN block scales as NaN; the NaN itself encodes as +6 either way. Finite global
+    amaxes, since the recipe's NaN-propagating expert amax would hide the block."""
+    E, M, N = shape
+    W = _weights(E, M, N, seed=3)
+    nan = float("nan")
+    W[0, 0, 0] = nan  # first lane of a block
+    W[0, 1, 31] = nan  # last lane
+    W[0, 2, 40:42] = nan  # two NaN in one block
+    W[0, 3, 48:64] = nan  # an all-NaN block
+    W[0, 4, 64] = float("inf")
+    W.view(torch.int16)[0, 5, 80] = -0x40  # 0xFFC0, a negative-signed NaN
+    W[-1, -1, -1] = nan  # last lane of the last expert
+    amax = torch.nan_to_num(W.float(), 0.0, 0.0, 0.0).abs().amax(dim=(1, 2))
+    cutedsl = _row_cast_quantize("cutedsl", W, amax, E)
+    triton_out = _row_cast_quantize("triton", W, amax, E)
+    for name, c, t in zip(("codes", "scales"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Wrapper-layer tests -- these run today, no kernel body required
 # ---------------------------------------------------------------------------

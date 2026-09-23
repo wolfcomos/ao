@@ -624,6 +624,33 @@ def test_cutedsl_ms_eden_matches_triton(group_sizes, hidden):
 
 @_needs_ms_eden
 @_skip_no_cutedsl
+@pytest.mark.parametrize("group_sizes,hidden", _BITWISE_CASES)
+@torch.no_grad()
+def test_cutedsl_ms_eden_matches_triton_on_nan_blocks(group_sizes, hidden):
+    """The RHT-128 on both axes spreads a NaN in ``dy`` over whole 1x16 blocks, so no
+    block mixes a NaN with finite values and the backends agree independently of the
+    maxNum block amax the raw-row kernels rely on. The amaxes are taken over the NaN-free
+    tensor, since the NaN-propagating group amax would hide the block."""
+    dy, offs = _packed(group_sizes, hidden, seed=225)
+    dy[0, 0] = float("nan")
+    dy[1, hidden - 1] = float("nan")
+    dy[sum(group_sizes) - 1, 0:2] = float("nan")
+    d, w = _signs(seed=0), _signs(seed=1)
+    E = len(group_sizes)
+    ar, ac = _amax("cutedsl", torch.nan_to_num(dy, 0.0, 0.0, 0.0), d, w, offs, E)
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    t = _ms_eden("triton", dy, ar, ac, d, w, offs, E, rng)
+    c = _ms_eden("cutedsl", dy, ar, ac, d, w, offs, E, rng)
+    for got, ref, label in zip(
+        c, t, ("row codes", "row scales", "col codes", "col scales")
+    ):
+        assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8)), (
+            f"{label} differ"
+        )
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
 @torch.no_grad()
 def test_fast_path_fixed_rng_state_reproduces_bitwise():
     """The fast path is a separate compiled variant and, like the default, a pure function

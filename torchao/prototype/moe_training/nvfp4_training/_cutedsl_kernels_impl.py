@@ -611,6 +611,27 @@ def _max_f32(
 
 
 @dsl_user_op
+def _maxnum_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """IEEE-754 maxNum: a NaN operand is dropped, as Triton's ``tl.max`` (arith.maxnumf ->
+    ``max.f32``) drops it, so only an all-NaN block stays NaN. Used for the BLOCK amax;
+    ``_max_f32`` (.NaN) stays for the expert/global amax whose Triton twins re-inject NaN
+    after ``tl.max``."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "max.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _atom_max_f32_nonneg(
     addr: cutlass.Pointer, val: cutlass.Float32, *, loc=None, ip=None
 ) -> cutlass.Float32:
@@ -1320,10 +1341,11 @@ def _round_rht_amax(amax):
 
 
 def _abs_amax16(vals):
-    """Max abs over 16 f32 rmem values (the 1x16 block amax)."""
+    """Max abs over 16 f32 rmem values (the 1x16 block amax). ``_maxnum_f32`` drops a NaN
+    element as Triton's ``tl.max`` does, so the 15 finite neighbours keep their scale."""
     amax = _abs_f32(vals[0])
     for i in range(1, 16):
-        amax = _max_f32(amax, _abs_f32(vals[i]))
+        amax = _maxnum_f32(amax, _abs_f32(vals[i]))
     return amax
 
 
@@ -1335,7 +1357,7 @@ def _group16_amax(amax, deltas: cutlass.Constexpr = (8, 4, 2, 1)):
     way the offsets stay inside an aligned lane group, so every lane ends with the shared
     block max."""
     for delta in deltas:
-        amax = _max_f32(amax, cute.arch.shuffle_sync_bfly(amax, delta))
+        amax = _maxnum_f32(amax, cute.arch.shuffle_sync_bfly(amax, delta))
     return amax
 
 
@@ -2415,7 +2437,7 @@ class _Tcgen05RowColFused:
                     # The pair is two of the 16 strips of one 16x16 block: fold them in-register,
                     # then butterfly over the 8 lanes holding the other 14.
                     amax = _group16_amax(
-                        _max_f32(_abs_amax16(blk0), _abs_amax16(blk1)), (4, 2, 1)
+                        _maxnum_f32(_abs_amax16(blk0), _abs_amax16(blk1)), (4, 2, 1)
                     )
                     # Weight mode is RTNE only (asserted at compile), so no SR draw here.
                     enc, sf = _enc_from_amax(amax, enc_over_fp4max, g_dec)

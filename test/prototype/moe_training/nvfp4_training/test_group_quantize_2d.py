@@ -241,6 +241,35 @@ def test_cutedsl_group_quantize_2d_matches_triton():
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
+@_skip_no_triton
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_group_quantize_2d_matches_triton_on_nan_blocks():
+    """A NaN is dropped from its 16x16 block's amax on both backends (Triton's ``tl.max``
+    is IEEE maxNum), so the finite neighbours keep their scale and only an all-NaN block
+    scales as NaN; the NaN itself encodes as +6 either way. Finite global amaxes, since
+    the NaN-propagating expert amax would hide the block."""
+    torch.manual_seed(3)
+    E, M, N = 3, 256, 512
+    weights = torch.randn((E, M, N), dtype=torch.bfloat16, device="cuda")
+    nan = float("nan")
+    weights[0, 0, 0] = nan
+    weights[0, 31, 31] = nan
+    weights[1, 100, 200:203] = nan
+    weights[2, 16:32, 16:32] = nan  # an all-NaN block
+    weights[2, -1, -1] = float("inf")
+    global_amax = (
+        torch.nan_to_num(weights.float(), 0.0, 0.0, 0.0).abs().amax(dim=(1, 2))
+    )
+
+    cutedsl = _group_quantize("cutedsl", weights, global_amax, E)
+    triton_out = _group_quantize("triton", weights, global_amax, E)
+    for name, c, t in zip(("q", "sf", "qt", "sft"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
+
+
 @requires_grouped_kernel
 @torch.no_grad()
 def test_group_quantize_2d_large_expert_offset():

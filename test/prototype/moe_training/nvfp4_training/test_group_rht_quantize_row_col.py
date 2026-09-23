@@ -701,6 +701,56 @@ def test_cutedsl_group_quantize_matches_triton_bitwise(graph_case, use_fast_math
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
+def _finite_amax(x):
+    """``max|x|`` over the finite elements: the global amax a NaN block is tested under,
+    since the kernels' own NaN-propagating amax would hide the block."""
+    return torch.nan_to_num(x.float(), 0.0, 0.0, 0.0).abs().amax()
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
+@torch.no_grad()
+def test_cutedsl_group_quantize_matches_triton_bitwise_on_nan_blocks(
+    graph_case, use_fast_math
+):
+    """A NaN in ``A`` is dropped from its rowwise block's amax on both backends (Triton's
+    ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their scale; the RHT-16
+    spreads it over its whole columnwise block, which stays NaN on both."""
+    spec, A, B, offsets, _, _, _, _ = graph_case
+    psl, hs = A.shape
+    num_groups = len(spec.groups)
+    _skip_if_unsupported_groups("cutedsl", num_groups)
+    A = A.clone()
+    A[0, 0] = float("nan")
+    A[1, hs - 1] = float("nan")
+    A[psl - 1, 16:32] = float("nan")
+    A[2, 40] = float("inf")
+    groups = A.split(list(spec.groups))
+    amax_row = torch.stack([_finite_amax(A_g) for A_g in groups])
+    amax_col = torch.stack([_finite_amax(_rht_reference(A_g, B)) for A_g in groups])
+
+    args = (
+        A,
+        list(_HARDCODED_SIGN_VECTOR),
+        offsets,
+        num_groups,
+        psl,
+        hs,
+        spec.shape_rep,
+        amax_row,
+        amax_col,
+        None,
+        False,
+    )
+    cutedsl = _group_quantize("cutedsl", *args, use_fast_math=use_fast_math)
+    triton_out = _group_quantize("triton", *args, use_fast_math=use_fast_math)
+    for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
+
+
 def _run_sr(graph_case, rng_state, kernel="triton", use_fast_math=False):
     spec, A, B, offsets, amax_row, amax_col, _, _ = graph_case
     psl, hs = A.shape
@@ -1155,6 +1205,61 @@ def test_cutedsl_group_quantize_dynamic_matches_triton_bitwise(case, use_fast_ma
         ("qa", "sfa", "qd", "sfd"), plain["triton"], plain["cutedsl"]
     ):
         assert torch.equal(c, t), f"{name} differs between backends"
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
+@torch.no_grad()
+def test_cutedsl_group_quantize_dynamic_matches_triton_bitwise_on_nan_blocks(
+    use_fast_math,
+):
+    """The raw rowwise half of the dynamic path drops a NaN from its block amax on both
+    backends (Triton's ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their
+    scale; the RHT-128 columnwise half spreads it over whole blocks, which stay NaN on
+    both. The amaxes are taken over the NaN-free tensor."""
+    A, offsets, groups, hidden, shape_rep, signs = _dynamic_bitwise_case("triple")
+    A[0, 0] = float("nan")
+    A[1, hidden - 1] = float("nan")
+    A[sum(groups) - 1, 16:32] = float("nan")
+    A[2, 40] = float("inf")
+    col_amax, row_amax = triton_group_rht_amax(
+        torch.nan_to_num(A, 0.0, 0.0, 0.0),
+        [],
+        offsets,
+        len(groups),
+        A.shape[0],
+        hidden,
+        shape_rep,
+        logical_packed_length=offsets[-1:],
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    args = (
+        A,
+        [],
+        offsets,
+        len(groups),
+        A.shape[0],
+        hidden,
+        shape_rep,
+        row_amax,
+        col_amax,
+        None,
+        False,
+    )
+    kwargs = dict(
+        logical_packed_length=offsets[-1:],
+        use_fast_math=use_fast_math,
+        sign_tensor=signs,
+        dynamic_rht=True,
+    )
+    cutedsl = _group_quantize("cutedsl", *args, **kwargs)
+    triton_out = _group_quantize("triton", *args, **kwargs)
+    for name, c, t in zip(("qa", "sfa", "qd", "sfd"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
 
 
 @_maybe_sm100
