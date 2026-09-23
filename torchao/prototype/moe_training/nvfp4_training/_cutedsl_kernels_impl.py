@@ -3418,9 +3418,6 @@ class _RowCastQuantize:
         b = tidx % cutlass.Int32(8)  # 16-column block within the 128-column tile
         r_slab = tidx // cutlass.Int32(8)  # row within a 16-row step
 
-        # One expert per CTA: its two-level scale is hoisted out of the loop.
-        _, dec, enc_over_fp4max = _global_scale(row_amax_t[e])
-
         row_bytes = cutlass.Int64(N) * cutlass.Int64(2)
         code_pitch = cutlass.Int64(N // cutlass.Int32(2))
         # SF bytes per 128-row block of one expert: (N // 64) atoms of 512 B.
@@ -3483,6 +3480,11 @@ class _RowCastQuantize:
                         cute.make_layout((4,)),
                     ).load()
                     words.append((v0, v1))
+                if cutlass.const_expr(h == 0):
+                    # One expert per CTA: its two-level scale is computed per row block,
+                    # in the shadow of the first batch's outstanding loads (the host
+                    # passes GRID_Y = m_blocks, so once per CTA).
+                    _, dec, enc_over_fp4max = _global_scale(row_amax_t[e])
                 for s in cutlass.range_constexpr(4 * h, 4 * h + 4):
                     v0, v1 = words[s - 4 * h]
                     for j in cutlass.range_constexpr(4):
