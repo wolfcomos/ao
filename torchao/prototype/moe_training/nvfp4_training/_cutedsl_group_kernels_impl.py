@@ -105,6 +105,7 @@ from ._cutedsl_kernels_impl import (
     _get_rht_buffer,
     _get_sr_rng_buffer,
     _max3_abs_f32,
+    _max_abs_bf16x2_x8,
     _max_f32,
     _min_f32,
     _mul_f32x8,
@@ -5216,52 +5217,6 @@ RHT128_ROWCAST_SIGN_THREADS = 32 * (
 RHT128_ROWCAST_ACC_CONSUMER_WARPS = (
     RHT128_ROWCAST_COL_WARP_END - RHT128_ROWCAST_COL_WARP_BEGIN
 )
-
-
-@dsl_user_op
-def _max_abs_bf16x2_x8(
-    w0: cutlass.Uint32,
-    w1: cutlass.Uint32,
-    w2: cutlass.Uint32,
-    w3: cutlass.Uint32,
-    w4: cutlass.Uint32,
-    w5: cutlass.Uint32,
-    w6: cutlass.Uint32,
-    w7: cutlass.Uint32,
-    *,
-    loc=None,
-    ip=None,
-) -> cutlass.Uint32:
-    """Per-half ``max|.|`` of eight packed bf16 pairs, as a packed pair with junk signs.
-
-    ``max.NaN.xorsign.abs.bf16x2`` keeps the larger magnitude of each half exactly (a
-    comparison, no rounding), makes any NaN input a NaN as ``max.NaN.f32`` does, and
-    sets the result's sign to the XOR of the input signs -- junk that
-    ``_bf16x2_amax_to_f32`` masks off. One ``HMNMX2`` per word replaces the widen pair
-    plus the f32 max of the scalar path.
-    """
-    return cutlass.Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [w.ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3, w4, w5, w6, w7)],
-            (
-                "{\n"
-                ".reg .b32 m0, m1, m2, m3;\n"
-                "max.NaN.xorsign.abs.bf16x2 m0, $1, $2;\n"
-                "max.NaN.xorsign.abs.bf16x2 m1, $3, $4;\n"
-                "max.NaN.xorsign.abs.bf16x2 m2, $5, $6;\n"
-                "max.NaN.xorsign.abs.bf16x2 m3, $7, $8;\n"
-                "max.NaN.xorsign.abs.bf16x2 m0, m0, m1;\n"
-                "max.NaN.xorsign.abs.bf16x2 m2, m2, m3;\n"
-                "max.NaN.xorsign.abs.bf16x2 $0, m0, m2;\n"
-                "}"
-            ),
-            "=r,r,r,r,r,r,r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 @dsl_user_op

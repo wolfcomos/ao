@@ -891,6 +891,57 @@ def _max_f16x2(
 
 
 @dsl_user_op
+def _max_abs_bf16x2_x8(
+    w0: cutlass.Uint32,
+    w1: cutlass.Uint32,
+    w2: cutlass.Uint32,
+    w3: cutlass.Uint32,
+    w4: cutlass.Uint32,
+    w5: cutlass.Uint32,
+    w6: cutlass.Uint32,
+    w7: cutlass.Uint32,
+    nan: cutlass.Constexpr = True,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Per-half ``max|.|`` of eight packed bf16 pairs, as a packed pair with junk signs.
+
+    ``max{.NaN}.xorsign.abs.bf16x2`` keeps the larger magnitude of each half exactly (a
+    comparison, no rounding) and sets the result's sign to the XOR of the input signs --
+    junk the caller masks off (``& 0x7FFF7FFF``) before widening the halves with
+    ``_bf16lo_to_f32`` / ``_bf16hi_to_f32``. With ``.NaN`` (``nan=True``, the tile /
+    global amax) any NaN input makes a NaN as ``max.NaN.f32`` does; without it (the
+    block amax) a NaN half is dropped as ``_maxnum_f32`` drops it and only a both-NaN
+    half stays NaN. Seven ``HMNMX2`` over the eight words replace the sixteen
+    ``abs.f32`` and the f32 max chain of the scalar path.
+    """
+    op = "max.NaN.xorsign.abs.bf16x2" if nan else "max.xorsign.abs.bf16x2"
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [w.ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3, w4, w5, w6, w7)],
+            (
+                "{\n"
+                ".reg .b32 m0, m1, m2, m3;\n"
+                f"{op} m0, $1, $2;\n"
+                f"{op} m1, $3, $4;\n"
+                f"{op} m2, $5, $6;\n"
+                f"{op} m3, $7, $8;\n"
+                f"{op} m0, m0, m1;\n"
+                f"{op} m2, m2, m3;\n"
+                f"{op} $0, m0, m2;\n"
+                "}"
+            ),
+            "=r,r,r,r,r,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _dequant_e2m1x8_bf16x2x4(
     word: cutlass.Uint32,
     sf: cutlass.Float32,
@@ -3424,8 +3475,9 @@ class _RowCastQuantize:
     an expert and the expert's global scale is loop-invariant. Thread ``t`` owns the
     16-column block ``b = t % 8`` of slab row ``t // 8``; eight unrolled 16-row steps
     cover the block. Per 1x16 block the arithmetic is the fused kernel's rowwise path
-    verbatim (``_global_scale`` + ``_quant16``), so the output is the Triton op's byte
-    for byte; only the addressing is new. No MMA, TMA, SMEM or atomics.
+    (``_global_scale`` + ``_quant16_from_amax``, the block amax taken over the eight
+    packed bf16x2 words as loaded), so the output is the Triton op's byte for byte; only
+    the addressing is new. No MMA, TMA, SMEM or atomics.
     """
 
     @cute.jit
@@ -3537,7 +3589,23 @@ class _RowCastQuantize:
                         blk[2 * j + 1] = _bf16hi_to_f32(v0[j])
                         blk[8 + 2 * j] = _bf16lo_to_f32(v1[j])
                         blk[8 + 2 * j + 1] = _bf16hi_to_f32(v1[j])
-                    w0, w1, sf = _quant16(blk, enc_over_fp4max, dec)
+                    # The block amax over the packed words (seven HMNMX2 over the eight
+                    # words, then the two halves; the mask clears the junk signs), the
+                    # widened values only for the multiply. NaN-dropping at both levels,
+                    # as _abs_amax16 / Triton's tl.max.
+                    mm = _max_abs_bf16x2_x8(
+                        v0[0],
+                        v0[1],
+                        v0[2],
+                        v0[3],
+                        v1[0],
+                        v1[1],
+                        v1[2],
+                        v1[3],
+                        nan=False,
+                    ) & cutlass.Uint32(0x7FFF7FFF)
+                    amax = _maxnum_f32(_bf16lo_to_f32(mm), _bf16hi_to_f32(mm))
+                    w0, w1, sf = _quant16_from_amax(blk, amax, enc_over_fp4max, dec)
                     q_ptr = cute.make_ptr(
                         cutlass.Uint64,
                         q_blk + cutlass.Int64(16 * s) * code_pitch,
