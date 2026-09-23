@@ -107,11 +107,13 @@ from ._cutedsl_kernels_impl import (
     _max3_abs_f32,
     _max_abs_bf16x2_x8,
     _max_f32,
+    _maxnum_f32,
     _min_f32,
     _mul_f32x8,
     _mul_ftz_f32,
     _pack16_rn_from_enc,
     _quant16,
+    _quant16_from_amax,
     _rcp_approx_f32,
     _rcp_rn_f32,
     _round_rht_amax,
@@ -6561,15 +6563,32 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                         rBlk,
                     )
                     rWords = cute.recast_tensor(rBlk, cutlass.Uint32)
+                    # Block amax on the packed words (as ``_rowcast_tile_amax``, but
+                    # NaN-dropping as ``_abs_amax16``): the per-half magnitudes, then
+                    # the two halves widened and folded with their junk signs cleared.
+                    # The widened values feed only the multiply.
+                    m = _max_abs_bf16x2_x8(
+                        rWords[0],
+                        rWords[1],
+                        rWords[2],
+                        rWords[3],
+                        rWords[4],
+                        rWords[5],
+                        rWords[6],
+                        rWords[7],
+                        nan=False,
+                    )
+                    amax = _maxnum_f32(
+                        _abs_f32(_bf16lo_to_f32(m)), _abs_f32(_bf16hi_to_f32(m))
+                    )
                     for j in cutlass.range_constexpr(8):
                         blk[2 * j] = _bf16lo_to_f32(rWords[j])
                         blk[2 * j + 1] = _bf16hi_to_f32(rWords[j])
-                    w0, w1, sf = _quant16(
+                    w0, w1, sf = _quant16_from_amax(
                         blk,
+                        amax,
                         r_enc_over_fp4max,
                         r_dec,
-                        False,
-                        None,
                         fast_math=self.fast_math,
                     )
                     # One 64-bit store, not two 32-bit ones (see the RHT-16 fused kernel).

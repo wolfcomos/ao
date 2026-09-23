@@ -909,12 +909,12 @@ def _max_abs_bf16x2_x8(
 
     ``max{.NaN}.xorsign.abs.bf16x2`` keeps the larger magnitude of each half exactly (a
     comparison, no rounding) and sets the result's sign to the XOR of the input signs --
-    junk the caller masks off (``& 0x7FFF7FFF``) before widening the halves with
-    ``_bf16lo_to_f32`` / ``_bf16hi_to_f32``. With ``.NaN`` (``nan=True``, the tile /
-    global amax) any NaN input makes a NaN as ``max.NaN.f32`` does; without it (the
-    block amax) a NaN half is dropped as ``_maxnum_f32`` drops it and only a both-NaN
-    half stays NaN. Seven ``HMNMX2`` over the eight words replace the sixteen
-    ``abs.f32`` and the f32 max chain of the scalar path.
+    junk the callers clear (``& 0x7FFF7FFF`` on the packed word, ``_abs_f32`` on the
+    halves widened with ``_bf16lo_to_f32`` / ``_bf16hi_to_f32``). With ``.NaN``
+    (``nan=True``, the tile / global amax) any NaN input makes a NaN as ``max.NaN.f32``
+    does; without it (the block amax) a NaN half is dropped as ``_maxnum_f32`` drops it
+    and only a both-NaN half stays NaN. Seven ``HMNMX2`` over the eight words replace
+    the sixteen ``abs.f32`` and the f32 max chain of the scalar path.
     """
     op = "max.NaN.xorsign.abs.bf16x2" if nan else "max.xorsign.abs.bf16x2"
     return cutlass.Uint32(
