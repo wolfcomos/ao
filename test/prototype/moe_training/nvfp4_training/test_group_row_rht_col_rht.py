@@ -869,6 +869,188 @@ def test_fast_path_is_unbiased():
 
 
 @_needs_ms_eden
+@pytest.mark.parametrize("kernel", _KERNELS)
+@torch.no_grad()
+def test_ms_eden_keeps_rn_error_and_sr_unbiasedness(kernel):
+    """RN, per-element SR, MS-EDEN default and MS-EDEN fast on one RHT-128 matrix.
+
+    TransformerEngine's ``check_quantization_nvfp4_versus_reference`` quantizes once with
+    RN and ``n_iters`` times with SR, averages the SR dequants and asserts the average is
+    closer to the input than RN is. This is that comparison with MS-EDEN in it, all four
+    on ``x = dy @ R_128`` at the EDEN ceiling so the two-level scale grid is the same:
+
+    * RN: RTNE codes against the RTNE E4M3 block scale (``nvfp4_reference_quantize``).
+      Deterministic, so its mean of draws is itself.
+    * per-element SR: the same block scale, every element rounded onto its two E2M1
+      neighbours with probability given by its fractional position
+      (``pack_fp4_stochastic``; no RHT-128 kernel in the tree does this). Unbiased for
+      what it rounds, which is the *clamped* scaled value: the block amax saturates at 6
+      whenever its E4M3 block scale rounded down, so its mean of draws converges on the
+      clamped input and its inner product with ``x`` falls short of ``<x, x>`` by the
+      clamp's share (-0.35 % here). RN inherits the same shrink and adds RTNE's own --
+      on a density that falls with ``|x|`` more elements round down than up (-0.41 %).
+    * MS-EDEN default and fast (CuteDSL only): the RN codes and the Eden-corrected block
+      scale, stochastically rounded to E4M3 by software Philox or by hardware ``cvt.rs``.
+
+    ``E[MS-EDEN dequant]`` is ``ideal_dequant``, not ``x``: the codes are RTNE, and the
+    correction ``<v, v> / <v, q>`` rescales each block so that its inner product with the
+    input is preserved, which leaves the reconstruction a full FP4 quantization error away
+    from ``x`` (``MSEdenReferenceOutput``). So the RMSE of the MS-EDEN mean of draws
+    against ``x`` stays at RN's level (0.95 RN, held above 0.5 RN) while per-element SR's
+    falls with the draw count (0.21 RN after 64). What MS-EDEN makes unbiased is the inner
+    product ``<x, dequant>``, the quantity the GEMM consumes: the relative bias
+    ``(<x, mean dq> - <x, x>) / <x, x>`` is zero within five standard errors for both
+    MS-EDEN paths and, for SR, equal to the clamp's within five.
+
+    Single-draw error: SR pays for its unbiasedness with variance -- uniform positions
+    give ``E[p (1 - p)] = 1/6`` of a step squared against RTNE's ``1/12`` -- so its
+    single-draw RMSE is about ``sqrt 2`` times RN's. MS-EDEN only moves the block scale by one
+    E4M3 step, so its single-draw MSE is the ideal reconstruction's plus the scale draw's
+    variance, ``p (1 - p) (step / S_enc)^2 q^2`` per element -- an identity held within
+    five standard errors in place of a tolerance on RN's RMSE. With the block scales in
+    E4M3's normal range, as here, one step is at most 1/8 of the scale, well below the
+    E2M1 element step, so that variance stays small: on this Gaussian input MS-EDEN
+    lands 2 % above RN and at ``1 / sqrt 2`` of SR (a subnormal block scale can move by
+    half of itself and would put MS-EDEN above SR). The table and the reference line
+    under it are what ``pytest -s`` prints.
+    """
+    from .nvfp4_reference import (
+        EDEN_BLOCK_SCALE_MAX,
+        FP4_E2M1_MAX,
+        decode_fp4_codes,
+        global_encode_scale,
+        nvfp4_reference_quantize,
+        pack_fp4_stochastic,
+        reference_dequantize_rowwise,
+        reference_dynamic_rht,
+        reference_ms_eden,
+    )
+
+    M, N = 256, 512
+    dy, offs = _packed([M], N, seed=11)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax(kernel, dy, d, w, offs, 1)
+    x = reference_dynamic_rht(dy, d, transpose=False).float()
+    rn = nvfp4_reference_quantize(x, ar[0], fp8_max=EDEN_BLOCK_SCALE_MAX)
+    ref = reference_ms_eden(x, ar[0])
+    s_enc = global_encode_scale(ar[0], EDEN_BLOCK_SCALE_MAX)
+    generator = torch.Generator(device="cuda").manual_seed(0)
+
+    def dequant(codes, sf, is_swizzled):
+        return reference_dequantize_rowwise(
+            codes, sf, ar[0], is_swizzled=is_swizzled, fp8_max=EDEN_BLOCK_SCALE_MAX
+        )
+
+    def ms_eden(i, fast):
+        rng = torch.tensor([1, i, 2, i + 1000], dtype=torch.int64, device="cuda")
+        args = (dy, ar, ac, d, w, offs, 1, rng)
+        row_codes, row_sf, _, _ = (
+            _ms_eden_fast(*args) if fast else _ms_eden(kernel, *args)
+        )
+        assert torch.equal(row_codes, rn.codes), "MS-EDEN codes are the RN codes"
+        return dequant(row_codes, row_sf, is_swizzled=True)
+
+    quantizers = {
+        "RN": lambda i: dequant(rn.codes, rn.scales, is_swizzled=False),
+        "per-element SR": lambda i: dequant(
+            pack_fp4_stochastic(rn.scaled, generator), rn.scales, is_swizzled=False
+        ),
+        "MS-EDEN default": lambda i: ms_eden(i, fast=False),
+    }
+    if kernel == "cutedsl":
+        quantizers["MS-EDEN fast"] = lambda i: ms_eden(i, fast=True)
+
+    draws = 64
+    # fp64 sums: the relative biases below are ~1e-5 of <x, x>.
+    xx = x.double().pow(2).sum()
+    stats = {}
+    print(f"\n[{kernel}] {draws} draws, {M}x{N}")
+    print(
+        f"{'scheme':17}{'rmse_single':>12}{'rmse_mean':>11}{'ip_bias_rel':>13}"
+        f"{'+-se':>9}{'rmse_mean_vs_ideal':>20}"
+    )
+    for name, quantize in quantizers.items():
+        dq = torch.stack([quantize(i) for i in range(draws)])
+        mse = (dq - x).pow(2).mean(dim=(1, 2))
+        bias = ((dq.double() * x.double()).sum(dim=(1, 2)) - xx) / xx
+        mean = dq.mean(dim=0)
+        s = stats[name] = dict(
+            rmse_single=mse.sqrt().mean().item(),
+            mse=mse.mean().item(),
+            mse_se=mse.std().item() / math.sqrt(draws),
+            rmse_mean=(mean - x).pow(2).mean().sqrt().item(),
+            ip_bias=bias.mean().item(),
+            ip_se=bias.std().item() / math.sqrt(draws),
+            rmse_mean_vs_ideal=(mean - ref.ideal_dequant).pow(2).mean().sqrt().item(),
+            mean=mean,
+            se=dq.std(dim=0) / math.sqrt(draws),
+        )
+        print(
+            f"{name:17}{s['rmse_single']:12.4e}{s['rmse_mean']:11.4e}"
+            f"{s['ip_bias']:+13.2e}{s['ip_se']:9.1e}{s['rmse_mean_vs_ideal']:20.4e}"
+        )
+
+    rn_, sr = stats["RN"], stats["per-element SR"]
+    # E[SR dequant] is the clamped scaled value; its inner-product bias is the clamp's.
+    enc = rn.encode_scale.repeat_interleave(16, dim=1)
+    clamped = rn.scaled.clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX) / enc
+    clamp_bias = (((clamped.double() * x.double()).sum() - xx) / xx).item()
+    # E[MS-EDEN single-draw MSE] = the ideal reconstruction's + the scale draw's variance.
+    lo, hi, frac = _e4m3_neighbours(ref.corrected_scale)
+    scale_var = frac * (1 - frac) * ((hi - lo) / s_enc).pow(2)
+    ideal_err = (ref.ideal_dequant - x).pow(2)
+    q = decode_fp4_codes(rn.codes)
+    predicted = (ideal_err + scale_var.repeat_interleave(16, dim=1) * q.pow(2)).mean()
+    print(
+        f"RMSE(ideal, x) {ideal_err.mean().sqrt():.4e}; MS-EDEN predicted rmse_single "
+        f"{predicted.sqrt():.4e}; clamp ip_bias_rel {clamp_bias:+.2e}"
+    )
+
+    # TransformerEngine's assertion: the averaged SR dequant is closer to x than RN is.
+    assert sr["rmse_mean"] < rn_["rmse_single"], "mean of SR draws must beat RN"
+    bound = 5 * sr["se"].norm() + 1e-5 * clamped.norm()
+    assert (sr["mean"] - clamped).norm() <= bound, (
+        "mean of SR draws is biased away from the clamped input"
+    )
+    assert abs(sr["ip_bias"] - clamp_bias) <= 5 * sr["ip_se"], (
+        f"SR <x, dq> bias {sr['ip_bias']:+.2e} +- {sr['ip_se']:.1e} "
+        f"vs clamp {clamp_bias:+.2e}"
+    )
+    for name, s in stats.items():
+        if not name.startswith("MS-EDEN"):
+            continue
+        bound = 5 * s["se"].norm() + 1e-5 * ref.ideal_dequant.norm()
+        assert (s["mean"] - ref.ideal_dequant).norm() <= bound, (
+            f"{name}: mean of draws is biased away from the unrounded Eden target"
+        )
+        assert abs(s["ip_bias"]) <= 5 * s["ip_se"], (
+            f"{name}: <x, dq> bias {s['ip_bias']:+.2e} +- {s['ip_se']:.1e}"
+        )
+        assert abs(s["mse"] - predicted) <= 5 * s["mse_se"], (
+            f"{name}: single-draw MSE {s['mse']:.4e} +- {s['mse_se']:.1e} vs ideal + "
+            f"scale variance {predicted:.4e}"
+        )
+        assert s["rmse_single"] < sr["rmse_single"], f"{name}: not below per-element SR"
+        # E[dq] is the ideal reconstruction, a per-block rescaling of RN's that cannot
+        # remove a rounding error uncorrelated with the block (SR's rmse_mean_vs_ideal is
+        # that distance), so no number of draws brings the mean near x. Half of RN's RMSE
+        # separates it from SR's mean, already at RN / 5 after 64 draws.
+        assert s["rmse_mean"] >= 0.5 * rn_["rmse_single"], (
+            f"{name}: mean of draws must not converge on x"
+        )
+    if "MS-EDEN fast" in stats:
+        fast, default = stats["MS-EDEN fast"], stats["MS-EDEN default"]
+        se = (fast["se"].pow(2) + default["se"].pow(2)).sqrt()
+        assert (fast["mean"] - default["mean"]).norm() <= 5 * se.norm(), (
+            "fast and default means of draws disagree"
+        )
+        for key, se_key in (("ip_bias", "ip_se"), ("mse", "mse_se")):
+            assert abs(fast[key] - default[key]) <= 5 * math.hypot(
+                fast[se_key], default[se_key]
+            ), f"fast and default {key} disagree"
+
+
+@_needs_ms_eden
 @_skip_no_cutedsl
 @pytest.mark.parametrize("group_sizes,hidden", [([1408] * 4, 1408), ([2048] * 4, 2048)])
 @torch.no_grad()
