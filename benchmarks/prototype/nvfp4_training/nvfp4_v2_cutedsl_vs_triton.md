@@ -15,7 +15,11 @@ benches in this directory. Compare numbers within this file only; the tables in
   within 0.4% and 0.7%; the `group_row_rht_col_rht_amax`, `group_row_cast_quantize` and
   `group_row_cast_col_rht_amax` and `group_row_cast_col_rht_quantize` tables likewise on
   2026-09-23 on a third such node (GPUs 0-2; the first within 0.9% of the 2026-09-16 record,
-  the other three on kernels changed that day, their Triton columns within 0.5%). SM-bound kernels run about 1.6x slower than at the 1965 MHz
+  the other three on kernels changed that day, their Triton columns within 0.5%); the
+  `group_col_rht_requant_amax` and `group_col_rht_requantize` tables likewise on 2026-09-23
+  on a fourth such node (GPU 1; both on kernels changed that day, their 16B and 671B Triton
+  columns within 1.6% of the 2026-09-16 record, the launch-bound debug-model rows 1.5-5.3%
+  faster). SM-bound kernels run about 1.6x slower than at the 1965 MHz
   maximum; memory-bound rows do not scale with the SM clock. Most of these kernels are
   SM-bound at this clock on both backends, so the speedup, not the absolute time, is the
   clock-portable number.
@@ -64,8 +68,8 @@ and are accepted by the distribution tests described under the kernel.
 | row_rht_col_rht_amax | yes | 5.04-5.20x | 5.63-5.74x | 5291-5607 |
 | row_rht_col_rht_quantize_ms_eden | yes | 2.61-2.62x | 2.62-2.63x | 2067-2108 |
 | row_rht_col_rht_quantize_ms_eden, `fast_path=True` | codes only | 3.52-3.56x | 3.64-3.67x | 2868-2938 |
-| col_rht_requant_amax | yes | 1.87-1.89x | 2.39-2.41x | 991-1000 |
-| col_rht_requantize | yes | 1.85-1.88x | 2.06-2.29x | 1290-1441 |
+| col_rht_requant_amax | yes | 1.91-1.92x | 2.54-2.57x | 1059-1070 |
+| col_rht_requantize | yes | 1.87-1.90x | 2.12-2.32x | 1333-1462 |
 | col_cast_requant_amax | yes | 2.20-2.21x | 4.58-4.78x | 3970-4135 |
 | col_cast_requantize | yes | 5.00-5.25x | 5.62-5.65x | 1408-1411 |
 | row_cast_col_rht_amax | yes | 4.63-4.94x | 5.51-5.77x | 6093-6572 |
@@ -294,21 +298,29 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_col_rht_requant_amax
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 9.70 | 15.86 | 1.64x | 15.2 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 9.52 | 15.53 | 1.63x | 15.5 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 13.94 | 26.12 | 1.87x | 465.4 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 13.78 | 26.09 | 1.89x | 471.0 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 33.03 | 79.72 | 2.41x | 1000.0 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 33.33 | 79.73 | 2.39x | 991.1 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 9.43 | 15.03 | 1.59x | 15.6 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 9.45 | 15.20 | 1.61x | 15.6 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 13.49 | 25.73 | 1.91x | 480.8 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 13.35 | 25.69 | 1.92x | 486.0 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 30.87 | 79.30 | 2.57x | 1070.0 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 31.20 | 79.29 | 2.54x | 1058.6 |
 
 - The CuteDSL op is its kernel plus one fill (1.7 us); the Triton op adds a sign-matrix
-  build to the fill, 7.4 us. Kernel-only 1.50-2.28x over the four large rows.
+  build to the fill, 7.4 us. Kernel-only 1.55-2.45x over the four large rows.
 - Issue-bound in the SIMT dequantize producer: ~1.2k cycles per tile against the 512-cycle
-  floor of its eight UMMAs (tensor pipe ~42% active); 991-1000 GB/s at 671B, 12-13% of
-  peak. The debug model pays the ring's three-tile prologue once per CTA. REG 38, no
+  floor of its eight UMMAs (tensor pipe ~42% active); 1059-1070 GB/s at 671B, 13% of
+  peak. The debug model pays the ring's three-tile prologue once per CTA. REG 48, no
   spills. Not shipped: a three-slot ring of its own, 1.04-1.10x faster on this op but
   slower on the requantize op that shares the producer; an in-kernel removal of the fill,
   bitwise, +2% at 671B.
+- The producer widens and block-scales each e2m1 element with one `fma.rn.f32.f16` (the
+  code and the f16 half of the E4M3 scale pair as the factors, `-0.0` as the addend: at
+  most 2 + 4 significant bits, so the one rounding is exact and every zero keeps its sign)
+  in place of a `cvt.f32.f16` and a `mul.f32x2` by the block scale: per code word 4
+  F2FP.E2M1 + 8 HADD2.F32 + 8 FMUL2 + 4 F2FP.BF16 = 24 SASS instructions become 4 + 8 FHFMA
+  + 4 FMUL2 + 4 = 20. Against the same tree without it, timed back to back on one GPU: 16B
+  13.86 / 13.65 us, 671B 32.83 / 33.24 us, i.e. -2.2 .. -6.1% (three-pass spreads <= 0.4%);
+  the launch-bound debug-model rows +1%. Amaxes unchanged.
 
 ### group_col_rht_requantize
 
@@ -327,18 +339,23 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_col_rht_requantize
 
 | model | projection | E | M | N | cutedsl_us | triton_us | speedup | cutedsl_gbps |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.75 | 13.50 | 1.54x | 33.7 |
-| debugmodel | down (w2) | 4 | 256 | 256 | 8.74 | 13.41 | 1.53x | 33.7 |
-| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 15.32 | 28.30 | 1.85x | 847.2 |
-| 16B | down (w2) | 4 | 2048 | 1408 | 15.06 | 28.33 | 1.88x | 861.6 |
-| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 45.83 | 105.11 | 2.29x | 1441.4 |
-| 671B | down (w2) | 4 | 7168 | 2048 | 51.20 | 105.33 | 2.06x | 1290.3 |
+| debugmodel | gate/up (w1/w3) | 4 | 256 | 256 | 8.76 | 13.12 | 1.50x | 33.7 |
+| debugmodel | down (w2) | 4 | 256 | 256 | 8.74 | 13.20 | 1.51x | 33.7 |
+| 16B | gate/up (w1/w3) | 4 | 1408 | 2048 | 15.10 | 28.27 | 1.87x | 859.5 |
+| 16B | down (w2) | 4 | 2048 | 1408 | 14.85 | 28.22 | 1.90x | 873.9 |
+| 671B | gate/up (w1/w3) | 4 | 2048 | 7168 | 45.20 | 104.94 | 2.32x | 1461.6 |
+| 671B | down (w2) | 4 | 7168 | 2048 | 49.54 | 105.14 | 2.12x | 1333.4 |
 
 - The CuteDSL op is its one kernel; the Triton op adds a sign-matrix build, 5.6-6.2 us.
-  Kernel-only 1.47-2.17x over the four large rows.
+  Kernel-only 1.49-2.20x over the four large rows.
 - Issue-bound in the same producer with the RTNE epilogue on top: ~1.9k cycles per tile at
-  671B gate/up and ~2.3k at 671B down against the 512-cycle floor; 1290-1441 GB/s at 671B,
-  16-18% of peak. REG 94, no spills.
+  671B gate/up and ~2.3k at 671B down against the 512-cycle floor; 1333-1462 GB/s at 671B,
+  17-18% of peak. REG 96, no spills.
+- Shares the producer's `fma.rn.f32.f16` dequant above (per code word 24 -> 20 SASS
+  instructions; the RTNE epilogue is unchanged). Against the same tree without it, timed
+  back to back on one GPU: 16B 15.27 / 15.04 us, 671B 45.78 / 51.13 us, i.e. -1.1 .. -3.1%
+  (three-pass spreads <= 0.3%); the launch-bound debug-model rows +0.7 .. +1.0%. Codes and
+  scales unchanged.
 
 ### group_col_cast_requant_amax
 
