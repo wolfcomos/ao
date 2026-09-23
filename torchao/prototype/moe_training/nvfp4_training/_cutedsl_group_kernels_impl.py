@@ -6171,7 +6171,7 @@ class _Tcgen05GroupRowCastColRhtQuantize:
         mColFP4: cute.Tensor,  # (hidden, tokens // 8) u32 columnwise codes
         mColSF: cute.Tensor,  # flat u32 concatenation of per-group swizzled scales
         mRowFP4: cute.Tensor,  # (tokens, hidden // 16) u64: the row code pair per store
-        mRowSF: cute.Tensor,  # (tokens // 128, hidden // 64, 32, 16) e4m3
+        mRowSF: cute.Tensor,  # (tokens // 128, hidden // 64, 32, 4) u32 view of the e4m3 scales
         row_amax_t: cute.Tensor,  # (num_tensors,) f32
         col_amax_t: cute.Tensor,  # (num_tensors,) f32
         offsets_t: cute.Tensor,
@@ -6554,12 +6554,31 @@ class _Tcgen05GroupRowCastColRhtQuantize:
             t0 = (r_local // cutlass.Int32(ROW_HB)) ^ hb4
             # The lane's swizzled scale bytes: ``_store_sf_byte``'s ``(r // 128, c // 4,
             # r % 32, (r % 128 // 32) * 4 + c % 4)`` at ``r = token + 32 p + t0``,
-            # ``c = 8 tile_m + hb`` is ``(tile_n, 2 tile_m + hb // 4, t0, 4 p + hb % 4)``.
+            # ``c = 8 tile_m + hb`` is ``(tile_n, 2 tile_m + hb // 4, t0, 4 p + hb % 4)``:
+            # word ``p`` of the row holds the lane quad's bytes of pass ``p``, so the quad
+            # transposes its 4 x 4 bytes and lane ``hb % 4`` stores word ``hb % 4``.
             sf_lane = hb % cutlass.Int32(4)
+            # 4x4 byte transpose across the quad: xor-1 partners merge even/odd bytes, xor-2
+            # partners merge the low/high halves (prmt selectors over the pair {peer, own}).
+            sel1 = cutlass.Uint32(
+                cutlass.select_(
+                    hb % cutlass.Int32(2) == cutlass.Int32(1),
+                    cutlass.Uint32(0x3715),
+                    cutlass.Uint32(0x6240),
+                )
+            )
+            sel2 = cutlass.Uint32(
+                cutlass.select_(
+                    sf_lane // cutlass.Int32(2) == cutlass.Int32(1),
+                    cutlass.Uint32(0x3276),
+                    cutlass.Uint32(0x5410),
+                )
+            )
 
             blk = cute.make_rmem_tensor((16,), cutlass.Float32)
             rBlk = cute.make_rmem_tensor((16,), cutlass.BFloat16)
             rPair = cute.make_rmem_tensor((2,), cutlass.Uint32)
+            rSF = cute.make_rmem_tensor((ROW_PASSES,), cutlass.Float8E4M3FN)
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, RHT128_ROWCAST_MAINLOOP_STAGES
             )
@@ -6604,7 +6623,15 @@ class _Tcgen05GroupRowCastColRhtQuantize:
                     rPair[1] = w1
                     pair64 = cute.recast_tensor(rPair, cutlass.Uint64)
                     gRow[tok] = pair64[0]
-                    gSF[cutlass.Int32(4 * p) + sf_lane] = sf
+                    rSF[p] = sf
+                word = cute.recast_tensor(rSF, cutlass.Uint32)[0]
+                word = cutlass.Uint32(
+                    cute.arch.prmt(word, cute.arch.shuffle_sync_bfly(word, 1), sel1)
+                )
+                word = cutlass.Uint32(
+                    cute.arch.prmt(word, cute.arch.shuffle_sync_bfly(word, 2), sel2)
+                )
+                gSF[sf_lane] = word
                 ab_pipeline.consumer_release(
                     ab_consumer_state, pipeline.PipelineOp.AsyncThread
                 )
@@ -6647,7 +6674,7 @@ def _compile_group_row_cast_col_rht_quantize_kernel(device_idx: int, fast_math: 
             assumed_align=16,
         ),
         make_fake_tensor(
-            cutlass.Float8E4M3FN, (free(), free(), 32, 16), stride=(free(), 512, 16, 1)
+            cutlass.Uint32, (free(), free(), 32, 4), stride=(free(), 128, 4, 1)
         ),
         make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
         make_fake_tensor(cutlass.Float32, (free(),), stride=(1,)),
@@ -6708,7 +6735,7 @@ def _cutedsl_group_row_cast_col_rht_quantize_impl(
         col_fp4,
         col_sf.view(torch.uint32).flatten(),
         row_fp4.view(torch.uint64),
-        row_sf,
+        row_sf.view(torch.uint32),
         row_global_amax,
         col_global_amax,
         offsets,
