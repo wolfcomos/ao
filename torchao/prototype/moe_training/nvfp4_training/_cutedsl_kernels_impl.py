@@ -685,6 +685,29 @@ def _abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
 
 
 @dsl_user_op
+def _max3_abs_f32(
+    a: cutlass.Float32, b: cutlass.Float32, c: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """max(|a|, |b|, |c|) in one instruction (PTX 8.8 three-input max with the .abs source
+    modifier, sm_100+); .NaN propagates a NaN input as ``_max_f32`` does."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                a.ir_value(loc=loc, ip=ip),
+                b.ir_value(loc=loc, ip=ip),
+                c.ir_value(loc=loc, ip=ip),
+            ],
+            "max.NaN.abs.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _cvt_rn_e2m1x8_f32(
     v0: cutlass.Float32,
     v1: cutlass.Float32,

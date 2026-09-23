@@ -106,6 +106,7 @@ from ._cutedsl_kernels_impl import (
     _get_num_sms,
     _get_rht_buffer,
     _get_sr_rng_buffer,
+    _max3_abs_f32,
     _max_f32,
     _min_f32,
     _mul_f32x8,
@@ -1852,8 +1853,15 @@ def _rht128_tile_amax(acc, tidx):
     for u in cutlass.range_constexpr(RHT128_DIM // RHT128_EPI_TILE[1]):
         cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, 0, u)], tTR_rAcc)
         vals = tTR_rAcc.load().reshape((16,))
-        for i in cutlass.range_constexpr(16):
-            tile_max = _max_f32(tile_max, _abs_f32(vals[i]))
+        # Depth-3 tree of three-input abs-maxes: five over vals[0:15], two over those plus
+        # vals[15] and the running tile_max, one root. ptxas already fused the old serial
+        # abs/max chain into 8 FMNMX3 per sub-tile; the tree keeps that count but cuts the
+        # dependency depth from 8 to 3 so the sub-tiles overlap. Max over magnitudes is
+        # exact, so the grouping does not change the result.
+        m = [_max3_abs_f32(vals[i], vals[i + 1], vals[i + 2]) for i in range(0, 15, 3)]
+        tile_max = _max3_abs_f32(
+            _max3_abs_f32(m[0], m[1], m[2]), _max3_abs_f32(m[3], m[4], vals[15]), tile_max
+        )
     return tile_max
 
 
