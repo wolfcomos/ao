@@ -2023,6 +2023,24 @@ def _rht128_signed_operand_row(sign_t, b_base, j, lane):
         ).store(st2.load())
 
 
+@dsl_user_op
+def _l2_evict_first_policy(*, loc=None, ip=None) -> cutlass.Int64:
+    """A ``createpolicy.fractional.L2::evict_first`` descriptor for a TMA load's
+    ``.L2::cache_hint``: the tile is read once, so it should not displace lines the
+    other CTAs are about to read."""
+    return cutlass.Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 class _Tcgen05GroupRowRhtColRhtAmax:
     """Per-group ``max|dy @ R_n|`` and ``max|dy.t() @ R_m|`` in one pass over ``dy``.
 
@@ -2275,6 +2293,9 @@ class _Tcgen05GroupRowRhtColRhtAmax:
 
         # ==================== TMA warp ====================
         if warp_idx == TMA_WARP:
+            # dy streams through once: mark the loads evict-first so the 128x128 tiles
+            # do not push the resident R^T operands and the other CTAs' tiles out of L2.
+            policy = _l2_evict_first_policy()
             for i in cutlass.range(n_my, unroll=1):
                 t = t_begin + i
                 tile_n = t // tiles_in_m
@@ -2285,6 +2306,7 @@ class _Tcgen05GroupRowRhtColRhtAmax:
                     tAgA[(None, tile_m, tile_n, 0)],
                     tAsA[(None, handle.index)],
                     tma_bar_ptr=handle.barrier,
+                    cache_policy=policy,
                 )
             ab_producer.tail()
 
