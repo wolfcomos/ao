@@ -2596,14 +2596,18 @@ def _ms_eden_block16_corrected(
     both roundings (software word, hardware ``cvt.rs``) consume the same value.
 
     ``approx_div`` (``FAST_PATH`` only) takes the correction ratio through
-    ``div.approx`` instead of Triton's ``div.full``: the ratio feeds only the scale, which
-    the stochastic rounding moves by a whole E4M3 step anyway, and the two quotients
-    agree to a few ulp (about 2^-20 of that step), while the codes and the ``enc`` they
-    come from stay bitwise.
+    ``div.approx`` instead of Triton's ``div.full`` and its select through
+    ``_ms_eden_corr_fast``: the ratio feeds only the scale, which the stochastic rounding
+    moves by a whole E4M3 step anyway, and the two quotients agree to a few ulp (about
+    2^-20 of that step), while the codes and the ``enc`` they come from stay bitwise.
 
     ``fast_dots`` (``FAST_PATH`` only) takes ``<v, v>`` through ``_dot16_chain_fast``
     and ``<v, q>`` as ``<e, q> * enc`` through ``_dot16_e_q_bf16`` on the bf16x2-decoded
-    codes, adding the two chain pairs in one packed add.
+    codes, adding the two chain pairs in one packed add. ``<e, q>`` on the unscaled ``e``
+    overflows to inf where ``<v, q>`` stays finite once a block's sum of |e| x |q| reaches
+    2^128 (from |e| ~ 2^128 / 96, about 3.5e36, for sixteen saturated codes);
+    ``_ms_eden_corr_fast`` treats the zero ratio ``rcp.approx.ftz`` makes of that inf as
+    the undefined case.
 
     ``defer_ratio`` (``FAST_PATH`` only, with ``approx_div``) stops at the division's
     ``MUFU.RCP`` and returns ``(w0, w1, sf8, <v, v>, rcp(<v, q>))``; the caller finishes the
@@ -2649,11 +2653,10 @@ def _ms_eden_block16_corrected(
     if cutlass.const_expr(approx_div):
         if cutlass.const_expr(defer_ratio):
             return w0, w1, sf8, dot_sq, _rcp_approx_f32(dot_cross)
-        ratio = _div_approx_f32(dot_sq, dot_cross)
-    else:
-        ratio = _div_full_f32(dot_sq, dot_cross)
+        return w0, w1, sf8 * _ms_eden_corr_fast(_div_approx_f32(dot_sq, dot_cross))
+    ratio = _div_full_f32(dot_sq, dot_cross)
     # False for inf and NaN, as Triton's ``< inf``; a zero ``dot_cross`` makes the ratio
-    # inf or NaN (both divisions: 1 / 0 is inf), so Triton's ``!= 0`` guard is implied.
+    # inf or NaN (1 / 0 is inf), so Triton's ``!= 0`` guard is implied.
     finite = _abs_f32(ratio) <= cutlass.Float32(FP32_MAX)
     corr = cutlass.Float32(cutlass.select_(finite, ratio, cutlass.Float32(1.0)))
     # ONE RN multiply of the widened E4M3 scale (no clamp), as Triton's
@@ -2672,15 +2675,28 @@ def _ms_eden_block16(vals, enc_over_fp4max, dec, rbits):
     return w0, w1, _sr_e4m3_byte(corrected, rbits)
 
 
+def _ms_eden_corr_fast(ratio):
+    """``FAST_PATH`` select of the correction: ``ratio`` where ``0 < |ratio| <= FP32_MAX``,
+    else 1.0. The default select passes a zero ratio, which no genuine block produces
+    (``<v, v> = 0`` zeroes every code, so ``<v, q> = 0`` and the ratio is NaN) -- but the
+    fast cross dot ``<e, q>`` overflows to inf on a block whose sum of |e| x |q| reaches
+    2^128 (bf16 values from ~2^128 / 96, about 3.5e36), ``rcp.approx.ftz`` of that inf is
+    0 and ``dot_sq * 0`` is a finite 0 that would zero the scale byte. Rejected with inf
+    and NaN, it leaves the block its uncorrected E4M3 scale, Triton's own fallback for an
+    undefined ratio."""
+    finite = _abs_f32(ratio) <= cutlass.Float32(FP32_MAX)
+    nonzero = ratio != cutlass.Float32(0.0)
+    return cutlass.Float32(
+        cutlass.select_(finite & nonzero, ratio, cutlass.Float32(1.0))
+    )
+
+
 def _ms_eden_corr_deferred(sf8, dot_sq, rcp):
     """``_ms_eden_block16_corrected``'s tail under ``defer_ratio``: the ``FMUL.FTZ`` that
-    ``div.approx.ftz`` puts after its ``MUFU.RCP``, then the unchanged finiteness select and
-    the one RN multiply of the widened E4M3 scale. Instruction for instruction and operand
-    for operand what the undeferred ``FAST_PATH`` tail is."""
-    ratio = _mul_ftz_f32(dot_sq, rcp)
-    finite = _abs_f32(ratio) <= cutlass.Float32(FP32_MAX)
-    corr = cutlass.Float32(cutlass.select_(finite, ratio, cutlass.Float32(1.0)))
-    return sf8 * corr
+    ``div.approx.ftz`` puts after its ``MUFU.RCP``, then the ``FAST_PATH`` select
+    (``_ms_eden_corr_fast``) and the one RN multiply of the widened E4M3 scale. Instruction
+    for instruction and operand for operand what the undeferred ``FAST_PATH`` tail is."""
+    return sf8 * _ms_eden_corr_fast(_mul_ftz_f32(dot_sq, rcp))
 
 
 @cute.jit

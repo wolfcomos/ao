@@ -64,8 +64,11 @@ def cutedsl_group_row_rht_col_rht_quantize_ms_eden(
     16 scales of a row (``randint4x``) and one ``cvt.rs.satfinite.e4m3x4.f32`` for the four
     scales a warp holds, a different random-bit construction from the software rounding. Its
     scale bytes are therefore not bitwise with the Triton op's -- each lands on one of the two
-    E4M3 neighbours of the same corrected scale -- while the codes are identical; ``False`` (the
-    default) is bitwise with the Triton op.
+    E4M3 neighbours of the same corrected scale -- while the codes are identical. That holds for
+    blocks whose rotated values keep the fast cross dot finite (guaranteed for |value| below
+    ~3.5e36, the onset for a block of sixteen saturated codes; blocks with fewer large values
+    overflow later); where it overflows, the fast path stores the uncorrected E4M3 scale, exact
+    under the stochastic rounding. ``False`` (the default) is bitwise with the Triton op.
 
     Returns ``(row_fp4_rht_dy, row_sf_rht_dy, col_fp4_rht_dy_t, col_sf_rht_dy_t)`` -- rowwise
     first: ``(psl, hidden//2)`` uint8, ``(psl, hidden//16)`` float8_e4m3fn (a view of the

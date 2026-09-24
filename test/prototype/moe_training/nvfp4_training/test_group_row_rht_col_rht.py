@@ -33,6 +33,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 from ._assertions import assert_codes_bitwise, assert_scales_adjacent
 from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
 from .nvfp4_reference import (
+    decode_fp4_codes,
     reference_group_row_rht_col_rht_amax,
     reference_row_rht_col_rht_amax,
 )
@@ -144,6 +145,23 @@ def _e4m3_neighbours(corrected):
     lo = (bits - frac20).view(torch.float32) * 2.0**120
     hi = (bits - frac20 + (1 << 20)).view(torch.float32) * 2.0**120
     return lo, hi, frac20.float() / 2.0**20
+
+
+def _fast_cross_dot_overflows(rht, codes):
+    """The 1x16 blocks whose ``FAST_PATH`` cross dot is not finite: ``_dot16_e_q_bf16``
+    forms ``<e, q>`` on the unscaled bf16 values in f32 down two 8-deep chains (even and odd
+    elements) that the kernel adds ahead of the encode multiply, so it overflows once the
+    block's sum of |e| x |q| reaches 2^128 (from |e| ~ 2^128 / 96, about 3.5e36, for sixteen
+    saturated codes) where Triton's ``<v, q>`` of the scaled values stays finite. Every
+    product is exact (bf16 x E2M1), so the same f32 additions reproduce the chains bit for
+    bit."""
+    rows, cols = rht.shape
+    e = rht.float().reshape(rows, cols // 16, 8, 2)
+    q = decode_fp4_codes(codes).reshape(rows, cols // 16, 8, 2)
+    acc = torch.zeros_like(e[:, :, 0])
+    for k in range(8):
+        acc = acc + e[:, :, k] * q[:, :, k]
+    return ~torch.isfinite(acc[..., 0] + acc[..., 1])
 
 
 # --- §11.2 ------------------------------------------------------------------
@@ -720,6 +738,68 @@ def test_fast_path_scales_are_neighbours_of_the_default_path(group_sizes):
         ref_col_scale.to(torch.float8_e4m3fn),
         "col scales",
     )
+
+
+@_needs_ms_eden
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_fast_path_keeps_the_uncorrected_scale_where_its_cross_dot_overflows():
+    """A block whose sum of |e| x |q| reaches 2^128 (rotated values from ~3.5e36) overflows
+    the fast cross dot, formed on the unscaled bf16 values (``_fast_cross_dot_overflows``),
+    where Triton's ``<v, q>`` stays finite; ``rcp.approx.ftz`` of that inf is 0, so the ratio
+    arrives as a finite 0. A select that rejected only inf and NaN kept it and stored the
+    block's scale byte as 0x00 -- the whole block dequantized to zero, codes intact. The fast
+    select rejects the zero too, so such a block keeps its uncorrected E4M3 scale (a
+    correction of 1.0, Triton's fallback for an undefined ratio; on the grid, so the hardware
+    rounding cannot move it) while every other scale stays one E4M3 step from the default
+    path's. +-1e37 planted along one row's 128-column segment and one column's 128-row
+    segment overflow blocks in both epilogues with both group amaxes finite; the default path
+    stays bitwise with the Triton op here."""
+    from torchao.prototype.mx_formats.utils import from_blocked
+
+    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+
+    M, N = 256, 512
+    dy, offs = _packed([M], N, seed=3)
+    dy[5, :128] = _signs(seed=4).to(torch.bfloat16) * 1e37
+    dy[128:, 300] = _signs(seed=5).to(torch.bfloat16) * 1e37
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 1)
+    assert torch.isfinite(ar).all() and torch.isfinite(ac).all()
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    fast = _ms_eden_fast(dy, ar, ac, d, w, offs, 1, rng)
+    default = _ms_eden("cutedsl", dy, ar, ac, d, w, offs, 1, rng)
+    for got, ref in zip(default, _ms_eden("triton", dy, ar, ac, d, w, offs, 1, rng)):
+        assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+    row_rht = reference_dynamic_rht(dy, d, transpose=False)
+    col_rht = reference_dynamic_rht(dy, w, transpose=True)
+    row_ref = reference_ms_eden(row_rht, ar[0])
+    col_ref = reference_ms_eden(col_rht, ac[0])
+    assert_codes_bitwise(fast[0], row_ref.codes, "row codes")
+    assert_codes_bitwise(fast[2], col_ref.codes, "col codes")
+    assert torch.equal(fast[0], default[0]) and torch.equal(fast[2], default[2])
+
+    for got, base, rht, ref, (rows, cols), label in (
+        (fast[1], default[1], row_rht, row_ref, (M, N // 16), "rowwise"),
+        (fast[3], default[3], col_rht, col_ref, (N, M // 16), "colwise"),
+    ):
+        got = from_blocked(got, rows, cols).view(torch.uint8)
+        base = from_blocked(base, rows, cols).view(torch.uint8)
+        zeroed = (got == 0) & (base != 0)
+        assert not zeroed.any(), (
+            f"{label}: {int(zeroed.sum())} fast scale bytes are 0x00 where the default "
+            "path's are not; (block, fast, default) = "
+            f"{[(r, c, hex(got[r, c]), hex(base[r, c])) for r, c in zeroed.nonzero()[:4].tolist()]}"
+        )
+        overflow = _fast_cross_dot_overflows(rht, ref.codes)
+        assert overflow.any(), f"{label}: no block overflows the fast cross dot"
+        uncorrected = ref.block_scale.to(torch.float8_e4m3fn).view(torch.uint8)
+        assert torch.equal(got[overflow], uncorrected[overflow]), (
+            f"{label}: an overflowed block's fast scale is not its uncorrected E4M3 scale"
+        )
+        assert_scales_adjacent(
+            got[~overflow], base[~overflow], f"{label} scales vs the default path"
+        )
 
 
 @_needs_ms_eden

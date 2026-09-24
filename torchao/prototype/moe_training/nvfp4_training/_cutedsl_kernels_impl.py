@@ -4516,6 +4516,11 @@ def _dot16_e_q_bf16(
     Each product is exact (8 x 3 significant bits fit f32), so versus ``<v, q>`` with
     ``v = RN(e * enc)`` the only differences are the missing per-term rounding and the
     summation order: ``<e, q> * enc`` moves the corrected scale by float rounding only.
+    The one exception is range: ``<e, q>`` on the unscaled ``e`` overflows to inf where
+    ``<v, q>`` stays finite once a block's sum of |e| x |q| (both chains added) reaches
+    2^128, from |e| ~ 2^128 / 96 (about 3.5e36) for sixteen saturated codes; the fast
+    select (``_ms_eden_corr_fast``) treats the zero ratio ``rcp.approx.ftz`` makes of it
+    as the undefined case.
     """
     rst = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32()] * 2),
