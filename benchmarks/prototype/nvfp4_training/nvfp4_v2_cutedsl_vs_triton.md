@@ -221,7 +221,11 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   (`test_fast_path_*`): every scale lands on one of the reference's two E4M3 neighbours,
   and the round-up rate equals the fractional position within 0.01 per bin over 2^20
   scales per axis. The tests also check unbiasedness over 64 draws, SQNR within 0.1 dB of
-  the default path, determinism, and rng-slice isolation.
+  the default path, determinism, and rng-slice isolation. The neighbour statement holds
+  for blocks whose rotated values keep the fast cross dot finite (guaranteed for |value|
+  below ~3.5e36, the onset for a block of sixteen saturated codes); where it overflows the
+  fast path stores the uncorrected E4M3 scale, exact under the stochastic rounding (see the
+  aed14e22e bullet below).
 - 26c3f8116 feeds the unclamped scaled values into the correction on both backends (the
   clamped ones hid the saturated amax element on half the blocks, a one-sided ~0.3% shrink
   of the dequantized operand overall, ~0.7% on those blocks). Against the fe57e17d5 record
@@ -289,6 +293,35 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quanti
   unchanged). At full clock on GB300 (an internal bench run on f6f0e0999, before
   these three commits) fast over default was 0.83-0.85, so the full-clock ratio after them
   is projected at ~0.73-0.78, not measured.
+- aed14e22e guards the fast path's correction against its own cross-dot overflow. The fast
+  cross dot is `<e, q> * enc` on the unscaled bf16 values (the bf16 lever of 4496c9da9),
+  where the default path and Triton form `<v, q>` on the bounded scaled values: once a
+  block's sum of |e| x |q| reaches 2^128 (rotated values from ~3.5e36 for sixteen saturated
+  codes, the group amax still finite) the two-chain sum overflows to inf, `rcp.approx.ftz`
+  of it is 0, the ratio arrives as a finite 0 that the finiteness select kept, and the
+  scale byte was stored as 0x00 -- the block dequantized to zero, codes intact (at
+  874b4ba11: 7 of the 8 rowwise scales of a planted +-1e37 segment 0x00 against Triton's
+  0x71..0x78). The fast select is now `0 < |ratio| <= FP32_MAX ? ratio : 1.0`
+  (`_ms_eden_corr_fast`, both fast sites): a genuine ratio is never 0, so the overflowed
+  block keeps its uncorrected E4M3 scale, Triton's fallback for an undefined ratio; the
+  default select is untouched and the default kernel's cubin byte-identical. Fast SASS
+  3256 to 3272 instructions (`FSETP.NEU` +8, `FSEL` +7: the PTX carries two `selp` per
+  site; the two Philox-arm block-0 tails merge into one select and scale multiply after
+  the branch, hence `FSETP.GTU` -1, `FMUL` -1 and `FADD` +2 for the |ratio| the compare no
+  longer folds; register shuffles net +1), REG 96, no spills. No fast or default output
+  byte changes at the five distinct shapes of this table's six rows and two rng states
+  (80/80 tensors byte-identical, same inputs). Measured on a GB200 at its 2062 MHz
+  application clock (uncapped node: the table above and the three bullets above are at the
+  1200 MHz cap, so only the paired deltas compare), paired three-pass medians pooled over
+  four interleaved base/fix rounds on one GPU: 671B down 630.85 to 632.46 us (+0.26%),
+  671B gate/up 189.23 to 190.34 (+0.59%), 16B down 83.62 to 84.05 (+0.51%), 16B gate/up
+  58.45 to 58.72 (+0.46%); the Triton control within 0.1% at those rows. The two 671B rows
+  were bimodal on that GPU on both trees (12-pass spreads 5-8%), so their deltas carry that
+  noise; a sequential three-pass round on a second GPU of the same node, where they were
+  not (spreads 0.05-0.4% base, 0.4-1.9% fix), gives 671B down 621.67 to 629.13 (+1.20%),
+  671B gate/up 185.19 to 186.67 (+0.80%), 16B down 79.38 to 79.88 (+0.63%), 16B gate/up
+  58.07 to 58.49 (+0.73%), the Triton control within 0.2%. Together: the extra select costs
+  +0.5..+1.2% of the fast path. The 1200 MHz table above is not re-measured.
 
 ### group_col_rht_requant_amax
 
