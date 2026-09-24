@@ -621,6 +621,36 @@ def test_cutedsl_vs_triton_interchangeable(M, N, use_fast_math):
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
+@_skip_no_triton
+@_skip_no_cutedsl
+@pytest.mark.parametrize("use_fast_math", [False, True], ids=["exact", "fast"])
+@torch.no_grad()
+def test_cutedsl_vs_triton_interchangeable_on_nan_blocks(use_fast_math):
+    """A NaN in ``A`` is dropped from its rowwise block's amax on both backends (Triton's
+    ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their scale; the RHT-16
+    spreads it over its whole columnwise block, which stays NaN on both. Finite global
+    amaxes, since both backends' NaN-propagating amax would hide the block."""
+    torch.manual_seed(0)
+    A = torch.randn(_M_BOTH, _N_BOTH, dtype=torch.bfloat16, device="cuda")
+    A[0, 0] = float("nan")
+    A[1, _N_BOTH - 1] = float("nan")
+    A[_M_BOTH - 1, 16:32] = float("nan")
+    A[2, 40] = float("inf")
+    rht = reference_rht(A, _HARDCODED_SIGN_VECTOR)
+    kwargs = dict(
+        col_amax=torch.nan_to_num(rht.float(), 0.0, 0.0, 0.0).abs().max(),
+        row_amax=torch.nan_to_num(A.float(), 0.0, 0.0, 0.0).abs().max(),
+        sign_vector=_HARDCODED_SIGN_VECTOR,
+        use_fast_math=use_fast_math,
+    )
+    cutedsl = _quantize_row_col("cutedsl", A, **kwargs)
+    triton_out = _quantize_row_col("triton", A, **kwargs)
+    for name, c, t in zip(("qd", "sfd", "qa", "sfa"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tests — triton only (RS statistics, CUDA graph capture)
 # ---------------------------------------------------------------------------

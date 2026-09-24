@@ -501,6 +501,7 @@ if has_triton():
         BLOCK_M: tl.constexpr,
         FAST_MATH: tl.constexpr = False,
         FP8_E4M3_MAX: tl.constexpr = 448.0,
+        CLAMP: tl.constexpr = True,
     ):
         """Compute per-vector FP8 scale factors and scaled FP32 values ready for FP4 packing.
 
@@ -510,6 +511,11 @@ if has_triton():
         the other half of TE's fast math -- consuming the RHT accumulator without
         rounding it through bfloat16 -- belongs to the caller, because only the
         columnwise path has an accumulator.
+
+        CLAMP=False returns the scaled values unclamped, for MS-EDEN's correction
+        (``_ms_eden_correction_with_sr``), whose kernel clamps its own copy for the
+        packer; every other caller packs the values, where ``cvt.rn.satfinite`` saturates
+        anyway.
         """
         FP4_E2M1_MAX: tl.constexpr = 6.0
         FP32_MAX: tl.constexpr = torch.finfo(torch.float32).max
@@ -540,7 +546,8 @@ if has_triton():
             encode_scale = tl.minimum(tl.div_rn(encode_num, denom), FP32_MAX)
 
         scaled = a_vecs * encode_scale
-        scaled = tl.clamp(scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
+        if CLAMP:
+            scaled = tl.clamp(scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
         scaled = tl.reshape(scaled, [BLOCK_N, BLOCK_M])
         return scale_inv, scaled
 

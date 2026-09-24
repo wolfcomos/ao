@@ -74,10 +74,12 @@ def _maybe_sm100(fn):
     return fn
 
 
-def _group_rht_amax(kernel, A, sign_vector, offsets, num_tensors, psl, hidden, rep):
+def _group_rht_amax(
+    kernel, A, sign_vector, offsets, num_tensors, psl, hidden, rep, **kwargs
+):
     """Dispatch to a backend's grouped RHT amax op; returns ``(col_amax, row_amax)``."""
     op = triton_group_rht_amax if kernel == "triton" else cutedsl_group_rht_amax
-    return op(A, list(sign_vector), offsets, num_tensors, psl, hidden, rep)
+    return op(A, list(sign_vector), offsets, num_tensors, psl, hidden, rep, **kwargs)
 
 
 def _skip_if_unsupported_groups(kernel: str, num_tensors: int) -> None:
@@ -274,6 +276,28 @@ def test_group_rht_amax_register_fake_shapes():
     assert row.shape == (num_tensors,)
     assert col.dtype == torch.float32
     assert row.dtype == torch.float32
+    # The dynamic-RHT kwargs reach both ops' fake kernels.
+    with FakeTensorMode():
+        A = torch.empty((512, 256), dtype=torch.bfloat16, device="cuda")
+        offsets = torch.empty((num_tensors,), dtype=torch.int32, device="cuda")
+        signs = torch.empty((128,), dtype=torch.int8, device="cuda")
+        ops = [triton_group_rht_amax]
+        if cutedsl_nvfp4_kernels_available():
+            ops.append(cutedsl_group_rht_amax)
+        for op in ops:
+            col, row = op(
+                A,
+                [],
+                offsets,
+                num_tensors,
+                512,
+                256,
+                1,
+                sign_tensor=signs,
+                dynamic_rht=True,
+            )
+            assert col.shape == (num_tensors,)
+            assert row.shape == (num_tensors,)
 
 
 @_maybe_sm100
@@ -328,15 +352,17 @@ def _dynamic_signs(seed, n=128):
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @pytest.mark.parametrize("groups", [(256,), (128, 128), (256, 128, 384, 128)])
 @torch.no_grad()
-def test_group_rht_amax_dynamic_matches_the_reference(groups):
+def test_group_rht_amax_dynamic_matches_the_reference(kernel, groups):
     device = torch.device("cuda", 0)
     hidden_size = 512
     A, offsets, _ = _build_packed(groups, hidden_size, device, seed=223)
     signs = _dynamic_signs(0)
 
-    col, row = triton_group_rht_amax(
+    col, row = _group_rht_amax(
+        kernel,
         A,
         [],
         offsets,
@@ -355,8 +381,9 @@ def test_group_rht_amax_dynamic_matches_the_reference(groups):
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_amax_dynamic_follows_an_in_place_resample():
+def test_group_rht_amax_dynamic_follows_an_in_place_resample(kernel):
     """The failure mode dynamic_rht exists to prevent.
 
     The cadence manager updates the sign buffer with ``copy_`` so its address survives
@@ -370,8 +397,17 @@ def test_group_rht_amax_dynamic_follows_an_in_place_resample():
     signs = _dynamic_signs(0)
 
     def run():
-        return triton_group_rht_amax(
-            A, [], offsets, 1, A.shape[0], 512, 1, sign_tensor=signs, dynamic_rht=True
+        return _group_rht_amax(
+            kernel,
+            A,
+            [],
+            offsets,
+            1,
+            A.shape[0],
+            512,
+            1,
+            sign_tensor=signs,
+            dynamic_rht=True,
         )
 
     before_col, before_row = run()
@@ -383,8 +419,9 @@ def test_group_rht_amax_dynamic_follows_an_in_place_resample():
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_amax_dynamic_excludes_padded_rows():
+def test_group_rht_amax_dynamic_excludes_padded_rows(kernel):
     """Rows past logical_packed_length are uninitialized capacity, never data."""
     device = torch.device("cuda", 0)
     groups = (128, 128)
@@ -392,7 +429,8 @@ def test_group_rht_amax_dynamic_excludes_padded_rows():
     capacity = torch.full((512, 512), float("inf"), device=device, dtype=torch.bfloat16)
     capacity[:256] = A
 
-    got = triton_group_rht_amax(
+    got = _group_rht_amax(
+        kernel,
         capacity,
         [],
         offsets,
@@ -408,12 +446,76 @@ def test_group_rht_amax_dynamic_excludes_padded_rows():
 
 
 @_maybe_sm100
+@pytest.mark.parametrize("kernel", _KERNELS)
 @torch.no_grad()
-def test_group_rht_amax_rejects_an_inconsistent_sign_pair():
+def test_group_rht_amax_rejects_an_inconsistent_sign_pair(kernel):
     device = torch.device("cuda", 0)
     A, offsets, _ = _build_packed((128,), 256, device, seed=7)
-    args = (A, list(_HARDCODED_SIGN_VECTOR), offsets, 1, A.shape[0], 256, 1)
+    args = (kernel, A, list(_HARDCODED_SIGN_VECTOR), offsets, 1, A.shape[0], 256, 1)
     with pytest.raises(ValueError, match="dynamic_rht=True requires a sign_tensor"):
-        triton_group_rht_amax(*args, dynamic_rht=True)
+        _group_rht_amax(*args, dynamic_rht=True)
     with pytest.raises(ValueError, match="only used when dynamic_rht=True"):
-        triton_group_rht_amax(*args, sign_tensor=_dynamic_signs(0))
+        _group_rht_amax(*args, sign_tensor=_dynamic_signs(0))
+
+
+# (groups, hidden_size, spare capacity rows) -- the spare rows hold NaN and must never be
+# read; ``max_groups`` is the cutedsl group cap, ``hidden_7168`` gives each CTA several tiles.
+_DYNAMIC_BITWISE_CASES = [
+    pytest.param((128, 256, 384, 128), 1024, 0, id="ragged"),
+    pytest.param((256,), 512, 0, id="single"),
+    pytest.param((128,) * 64, 128, 0, id="max_groups"),
+    pytest.param((256, 0, 384), 512, 0, id="empty_group"),
+    pytest.param((128, 128), 512, 256, id="capacity_tail"),
+    pytest.param((3072, 0, 1024, 2048, 128, 896), 7168, 512, id="hidden_7168"),
+]
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@pytest.mark.parametrize("sign_dtype", [torch.int8, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("groups, hidden_size, spare_rows", _DYNAMIC_BITWISE_CASES)
+@torch.no_grad()
+def test_cutedsl_group_rht_amax_dynamic_matches_triton(
+    groups, hidden_size, spare_rows, sign_dtype
+):
+    """Both amaxes are bitwise equal to the Triton op's on the RHT-128 dynamic path."""
+    device = torch.device("cuda", 0)
+    A, offsets, _ = _build_packed(groups, hidden_size, device, seed=31)
+    capacity = torch.full(
+        (A.shape[0] + spare_rows, hidden_size),
+        float("nan"),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    capacity[: A.shape[0]] = A
+    signs = _dynamic_signs(0).to(sign_dtype)
+    args = (capacity, [], offsets, len(groups), capacity.shape[0], hidden_size, 1)
+    kwargs = dict(
+        logical_packed_length=offsets[-1:], sign_tensor=signs, dynamic_rht=True
+    )
+
+    expected = _group_rht_amax("triton", *args, **kwargs)
+    got = _group_rht_amax("cutedsl", *args, **kwargs)
+    for name, e, g in zip(("col_amax", "row_amax"), expected, got):
+        assert torch.equal(e, g), f"{name} differs from the Triton op"
+
+
+@_maybe_sm100
+@_skip_no_cutedsl
+@torch.no_grad()
+def test_cutedsl_group_rht_amax_dynamic_rejects_a_16_sign_tensor():
+    """Only the (128,) sign buffer is served on the dynamic path (Triton also takes (16,))."""
+    device = torch.device("cuda", 0)
+    A, offsets, _ = _build_packed((128,), 256, device, seed=7)
+    with pytest.raises(ValueError, match=r"sign_tensor must be a \(128,\) tensor"):
+        cutedsl_group_rht_amax(
+            A,
+            [],
+            offsets,
+            1,
+            A.shape[0],
+            256,
+            1,
+            sign_tensor=_dynamic_signs(0, n=16),
+            dynamic_rht=True,
+        )

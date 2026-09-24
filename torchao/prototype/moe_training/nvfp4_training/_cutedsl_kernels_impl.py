@@ -7,6 +7,17 @@ Two kernels, both built on the same single A load shared by two consumers (the M
 does the columnwise RHT, a row warp group reads the same tile):
   - _Tcgen05RowColFused: quantizes col=RHT(A.t()) and row=A to NVFP4.
   - _Tcgen05RhtAmax: reduces col=max|RHT(A.t())|, row=max|A|.
+
+A third kernel, ``_RowCastQuantize`` (end of file), is the rowwise 1x16 weight cast of a
+dense expert stack on plain CUDA cores -- no MMA/TMA -- reusing the rowwise helper chain.
+
+A fourth, ``_RequantAmax`` (after it), is the per-expert amax of the dequantized packed
+weight (§11.6), the same kind of streaming kernel over the codes and scales that cast
+wrote; it decodes nothing but each block's largest code.
+
+A fifth, ``_Requantize`` (last), is the columnwise 1x16 requantize of that packed weight
+(§11.7): it rebuilds each ``W_qdq`` tile into SMEM and quantizes it down the columns on
+CUDA cores, so the transpose keeps the sign of every zero.
 """
 
 import functools
@@ -361,6 +372,23 @@ def _div_rn_f32(
 
 
 @dsl_user_op
+def _rcp_rn_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """RN(1/a): the value ``_div_rn_f32(1.0, a)`` yields (both are correctly rounded),
+    without the division's slow-path fixups."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip)],
+            "rcp.rn.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _bf16lo_to_f32(w: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
     """Widen the low bf16 of a packed pair to f32, in one instruction.
 
@@ -420,6 +448,24 @@ def _mulhi_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _mulwide_u32(a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None):
+    """(lo, hi) words of a 32x32 unsigned multiply, one instruction."""
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b64 w;\nmul.wide.u32 w, $2, $3;\nmov.b64 {$0, $1}, w;\n}",
+        "=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [0], loc=loc, ip=ip)),
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [1], loc=loc, ip=ip)),
+    )
+
+
 # Philox-4x32-10 (PHILOX_KEY_A/B, PHILOX_ROUND_A/B, 10 rounds).
 # The generator is the same one triton.language.random uses, but the counter is not:
 # every kernel here draws through philox4_all, one counter per 16-element block with all
@@ -462,7 +508,7 @@ def philox_prep(seed_lo, seed_hi, offset_base):
     return sched, c0_r2, c1_r2, c3_r1
 
 
-def philox4_all(state, chunk_counter):
+def philox4_all(state, chunk_counter, wide: bool = False):
     """The four random words a 16-element chunk needs, from a single Philox draw.
 
     These kernels once reproduced triton's counter stride, drawing one word per packed
@@ -475,20 +521,57 @@ def philox4_all(state, chunk_counter):
     per-thread value: these kernels are persistent, and the grouped one schedules through
     CLC, so visit order is not fixed and a running counter would make the output depend on
     scheduling rather than on position.
+
+    ``wide`` (trace-time) draws each (mul.hi, mul.lo) pair as one wide multiply, as
+    ``philox_word0`` does (values identical); the MS-EDEN FAST_PATH draws take it.
     """
     sched, c0_r2, c1_r2, c3_r1 = state
     A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
     c0_r1 = chunk_counter ^ sched[0][0]
     c0, c1 = c0_r2, c1_r2
-    c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
-    c3 = A * c0_r1
+    if wide:
+        lo, hi = _mulwide_u32(A, c0_r1)
+        c2 = hi ^ c3_r1 ^ sched[1][1]
+        c3 = lo
+    else:
+        c2 = _mulhi_u32(A, c0_r1) ^ c3_r1 ^ sched[1][1]
+        c3 = A * c0_r1
     for r in range(2, PHILOX_ROUNDS):
         _c0, _c2 = c0, c2
-        c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
-        c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
-        c1 = B * _c2
-        c3 = A * _c0
+        if wide:
+            lo_b, hi_b = _mulwide_u32(B, _c2)
+            lo_a, hi_a = _mulwide_u32(A, _c0)
+            c0 = hi_b ^ c1 ^ sched[r][0]
+            c2 = hi_a ^ c3 ^ sched[r][1]
+            c1 = lo_b
+            c3 = lo_a
+        else:
+            c0 = _mulhi_u32(B, _c2) ^ c1 ^ sched[r][0]
+            c2 = _mulhi_u32(A, _c0) ^ c3 ^ sched[r][1]
+            c1 = B * _c2
+            c3 = A * _c0
     return c0, c1, c2, c3
+
+
+def philox_word0(state, chunk_counter):
+    """``philox4_all(state, chunk_counter)[0]``: the same generator with each (mul.hi, mul.lo)
+    pair drawn as one wide multiply (values identical)."""
+    sched, c0_r2, c1_r2, c3_r1 = state
+    A, B = cutlass.Uint32(_PHILOX_ROUND_A), cutlass.Uint32(_PHILOX_ROUND_B)
+    c0_r1 = chunk_counter ^ sched[0][0]
+    c0, c1 = c0_r2, c1_r2
+    lo, hi = _mulwide_u32(A, c0_r1)
+    c2 = hi ^ c3_r1 ^ sched[1][1]
+    c3 = lo
+    for r in range(2, PHILOX_ROUNDS):
+        _c0, _c2 = c0, c2
+        lo_b, hi_b = _mulwide_u32(B, _c2)
+        lo_a, hi_a = _mulwide_u32(A, _c0)
+        c0 = hi_b ^ c1 ^ sched[r][0]
+        c2 = hi_a ^ c3 ^ sched[r][1]
+        c1 = lo_b
+        c3 = lo_a
+    return c0
 
 
 @dsl_user_op
@@ -528,6 +611,27 @@ def _max_f32(
 
 
 @dsl_user_op
+def _maxnum_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """IEEE-754 maxNum: a NaN operand is dropped, as Triton's ``tl.max`` (arith.maxnumf ->
+    ``max.f32``) drops it, so only an all-NaN block stays NaN. Used for the BLOCK amax;
+    ``_max_f32`` (.NaN) stays for the expert/global amax whose Triton twins re-inject NaN
+    after ``tl.max``."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "max.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
 def _atom_max_f32_nonneg(
     addr: cutlass.Pointer, val: cutlass.Float32, *, loc=None, ip=None
 ) -> cutlass.Float32:
@@ -557,6 +661,35 @@ def _atom_max_f32_nonneg(
 
 
 @dsl_user_op
+def _st_global_v4_u32(
+    addr: cutlass.Int64,
+    a: cutlass.Uint32,
+    b: cutlass.Uint32,
+    c: cutlass.Uint32,
+    d: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """One 16-byte global store of four u32 at byte address ``addr`` (16-byte aligned)."""
+    llvm.inline_asm(
+        None,
+        [
+            addr.ir_value(loc=loc, ip=ip),
+            a.ir_value(loc=loc, ip=ip),
+            b.ir_value(loc=loc, ip=ip),
+            c.ir_value(loc=loc, ip=ip),
+            d.ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def _abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
     """Absolute value of float32."""
     return cutlass.Float32(
@@ -565,6 +698,590 @@ def _abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
             [a.ir_value(loc=loc, ip=ip)],
             "abs.f32 $0, $1;",
             "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _max3_abs_f32(
+    a: cutlass.Float32, b: cutlass.Float32, c: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """max(|a|, |b|, |c|) in one instruction (PTX 8.8 three-input max with the .abs source
+    modifier, sm_100+); .NaN propagates a NaN input as ``_max_f32`` does."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                a.ir_value(loc=loc, ip=ip),
+                b.ir_value(loc=loc, ip=ip),
+                c.ir_value(loc=loc, ip=ip),
+            ],
+            "max.NaN.abs.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_rn_e2m1x8_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Pack eight already scaled values to FP4, RTNE (the second half of
+    ``_mul_cvt_rn_e2m1x8_acc_f32``; ``satfinite`` takes anything past +-6 to 6): even
+    element in the low nibble, odd in the high."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v0.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v3.ir_value(loc=loc, ip=ip),
+                v4.ir_value(loc=loc, ip=ip),
+                v5.ir_value(loc=loc, ip=ip),
+                v6.ir_value(loc=loc, ip=ip),
+                v7.ir_value(loc=loc, ip=ip),
+            ],
+            (
+                "{\n"
+                ".reg .b8 b0, b1, b2, b3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b0, $2, $1;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b1, $4, $3;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b2, $6, $5;\n"
+                "cvt.rn.satfinite.e2m1x2.f32 b3, $8, $7;\n"
+                "mov.b32 $0, {b0, b1, b2, b3};\n"
+                "}"
+            ),
+            "=r,f,f,f,f,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_e2m1x8_to_f32(word: cutlass.Uint32, *, loc=None, ip=None):
+    """Exact decode of one packed-FP4 word to eight f32, element k = nibble k.
+
+    The multi-output form the DSL itself uses (``cute.arch.cvt_f4e2m1x8_to_f16x8``): one
+    ``inline_asm`` returning a literal struct, one ``extractvalue`` per element.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [word.ir_value(loc=loc, ip=ip)],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            ".reg .b32 p0, p1, p2, p3;\n"
+            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
+            "mov.b32 {b0, b1, b2, b3}, $8;\n"
+            "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
+            "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
+            "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
+            "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "mov.b32 {l0, h0}, p0;\n"
+            "mov.b32 {l1, h1}, p1;\n"
+            "mov.b32 {l2, h2}, p2;\n"
+            "mov.b32 {l3, h3}, p3;\n"
+            "cvt.f32.f16 $0, l0;\n"
+            "cvt.f32.f16 $1, h0;\n"
+            "cvt.f32.f16 $2, l1;\n"
+            "cvt.f32.f16 $3, h1;\n"
+            "cvt.f32.f16 $4, l2;\n"
+            "cvt.f32.f16 $5, h2;\n"
+            "cvt.f32.f16 $6, l3;\n"
+            "cvt.f32.f16 $7, h3;\n"
+            "}"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
+        for k in range(8)
+    )
+
+
+@dsl_user_op
+def _e4m3x2_to_f16x2(h: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """Two E4M3 bytes in the low 16 bits of ``h`` -> packed f16x2, low byte in the
+    low half. Widening, so exact for every E4M3 value (subnormals included) and
+    NaN-preserving -- the route the Triton ``convert_4xfp4_packed_to_8xfp32``
+    takes for the codes."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [h.ir_value(loc=loc, ip=ip)],
+            ("{\n.reg .b16 h;\ncvt.u16.u32 h, $1;\ncvt.rn.f16x2.e4m3x2 $0, h;\n}"),
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16lo_to_f32(p: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """f32 of the low f16 half of ``p`` (exact widening)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [p.ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\ncvt.f32.f16 $0, lo;\n}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _f16hi_to_f32(p: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
+    """f32 of the high f16 half of ``p`` (exact widening)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [p.ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\ncvt.f32.f16 $0, hi;\n}",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _max_f16x2(
+    a: cutlass.Uint32, b: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
+    """Packed f16x2 max of two ``f16x2`` words; NaN-propagating like ``_max_f32``."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "max.NaN.f16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _max_abs_bf16x2_x8(
+    w0: cutlass.Uint32,
+    w1: cutlass.Uint32,
+    w2: cutlass.Uint32,
+    w3: cutlass.Uint32,
+    w4: cutlass.Uint32,
+    w5: cutlass.Uint32,
+    w6: cutlass.Uint32,
+    w7: cutlass.Uint32,
+    nan: cutlass.Constexpr = True,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Per-half ``max|.|`` of eight packed bf16 pairs, as a packed pair with junk signs.
+
+    ``max{.NaN}.xorsign.abs.bf16x2`` keeps the larger magnitude of each half exactly (a
+    comparison, no rounding) and sets the result's sign to the XOR of the input signs --
+    junk the callers clear (``& 0x7FFF7FFF`` on the packed word, ``_abs_f32`` on the
+    halves widened with ``_bf16lo_to_f32`` / ``_bf16hi_to_f32``). With ``.NaN``
+    (``nan=True``, the tile / global amax) any NaN input makes a NaN as ``max.NaN.f32``
+    does; without it (the block amax) a NaN half is dropped as ``_maxnum_f32`` drops it
+    and only a both-NaN half stays NaN. Seven ``HMNMX2`` over the eight words replace
+    the sixteen ``abs.f32`` and the f32 max chain of the scalar path.
+    """
+    op = "max.NaN.xorsign.abs.bf16x2" if nan else "max.xorsign.abs.bf16x2"
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [w.ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3, w4, w5, w6, w7)],
+            (
+                "{\n"
+                ".reg .b32 m0, m1, m2, m3;\n"
+                f"{op} m0, $1, $2;\n"
+                f"{op} m1, $3, $4;\n"
+                f"{op} m2, $5, $6;\n"
+                f"{op} m3, $7, $8;\n"
+                f"{op} m0, m0, m1;\n"
+                f"{op} m2, m2, m3;\n"
+                f"{op} $0, m0, m2;\n"
+                "}"
+            ),
+            "=r,r,r,r,r,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _dequant_e2m1x8_bf16x2x4(
+    word: cutlass.Uint32,
+    sf: cutlass.Float32,
+    gds: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Dequantize one packed-FP4 word to four packed bf16x2 words: ``bf16((q_k * sf) * gds)``.
+
+    Triton's ``_reconstruct_qdq_weight_tile`` order, instruction for instruction: exact
+    e2m1 decode, ``mul.rn.f32`` by the block scale (an exact product), ``mul.rn.f32`` by
+    the per-tensor decode scale (the one rounding), ``cvt.rn.bf16x2.f32``. Word k holds
+    elements ``2k`` (low half) and ``2k + 1`` (high half). Multi-output form as
+    ``_cvt_e2m1x8_to_f32``.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [
+            word.ir_value(loc=loc, ip=ip),
+            sf.ir_value(loc=loc, ip=ip),
+            gds.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            ".reg .b32 p0, p1, p2, p3;\n"
+            ".reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;\n"
+            ".reg .f32 q0, q1, q2, q3, q4, q5, q6, q7;\n"
+            "mov.b32 {b0, b1, b2, b3}, $4;\n"
+            "cvt.rn.f16x2.e2m1x2 p0, b0;\n"
+            "cvt.rn.f16x2.e2m1x2 p1, b1;\n"
+            "cvt.rn.f16x2.e2m1x2 p2, b2;\n"
+            "cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "mov.b32 {l0, h0}, p0;\n"
+            "mov.b32 {l1, h1}, p1;\n"
+            "mov.b32 {l2, h2}, p2;\n"
+            "mov.b32 {l3, h3}, p3;\n"
+            "cvt.f32.f16 q0, l0;\n"
+            "cvt.f32.f16 q1, h0;\n"
+            "cvt.f32.f16 q2, l1;\n"
+            "cvt.f32.f16 q3, h1;\n"
+            "cvt.f32.f16 q4, l2;\n"
+            "cvt.f32.f16 q5, h2;\n"
+            "cvt.f32.f16 q6, l3;\n"
+            "cvt.f32.f16 q7, h3;\n"
+            "mul.rn.f32 q0, q0, $5;\n"
+            "mul.rn.f32 q1, q1, $5;\n"
+            "mul.rn.f32 q2, q2, $5;\n"
+            "mul.rn.f32 q3, q3, $5;\n"
+            "mul.rn.f32 q4, q4, $5;\n"
+            "mul.rn.f32 q5, q5, $5;\n"
+            "mul.rn.f32 q6, q6, $5;\n"
+            "mul.rn.f32 q7, q7, $5;\n"
+            "mul.rn.f32 q0, q0, $6;\n"
+            "mul.rn.f32 q1, q1, $6;\n"
+            "mul.rn.f32 q2, q2, $6;\n"
+            "mul.rn.f32 q3, q3, $6;\n"
+            "mul.rn.f32 q4, q4, $6;\n"
+            "mul.rn.f32 q5, q5, $6;\n"
+            "mul.rn.f32 q6, q6, $6;\n"
+            "mul.rn.f32 q7, q7, $6;\n"
+            "cvt.rn.bf16x2.f32 $0, q1, q0;\n"
+            "cvt.rn.bf16x2.f32 $1, q3, q2;\n"
+            "cvt.rn.bf16x2.f32 $2, q5, q4;\n"
+            "cvt.rn.bf16x2.f32 $3, q7, q6;\n"
+            "}"
+        ),
+        "=r,=r,=r,=r,r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [k], loc=loc, ip=ip))
+        for k in range(4)
+    )
+
+
+@dsl_user_op
+def _bf16round_f32x8(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    v4: cutlass.Float32,
+    v5: cutlass.Float32,
+    v6: cutlass.Float32,
+    v7: cutlass.Float32,
+    zero: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Triton's ``f32(bf16(acc))`` for eight raw accumulators, one instruction each.
+
+    ``cvt.rn.bf16x2.f32 e, v, 0.0`` puts RTNE bf16(v) in the high half and bf16(+0) = 0 in
+    the low half, so the packed word already is the exact f32 widening: no shift or mask.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [
+            v0.ir_value(loc=loc, ip=ip),
+            v1.ir_value(loc=loc, ip=ip),
+            v2.ir_value(loc=loc, ip=ip),
+            v3.ir_value(loc=loc, ip=ip),
+            v4.ir_value(loc=loc, ip=ip),
+            v5.ir_value(loc=loc, ip=ip),
+            v6.ir_value(loc=loc, ip=ip),
+            v7.ir_value(loc=loc, ip=ip),
+            zero.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b32 e0, e1, e2, e3, e4, e5, e6, e7;\n"
+            "cvt.rn.bf16x2.f32 e0, $8, $16;\n"
+            "cvt.rn.bf16x2.f32 e1, $9, $16;\n"
+            "cvt.rn.bf16x2.f32 e2, $10, $16;\n"
+            "cvt.rn.bf16x2.f32 e3, $11, $16;\n"
+            "cvt.rn.bf16x2.f32 e4, $12, $16;\n"
+            "cvt.rn.bf16x2.f32 e5, $13, $16;\n"
+            "cvt.rn.bf16x2.f32 e6, $14, $16;\n"
+            "cvt.rn.bf16x2.f32 e7, $15, $16;\n"
+            "mov.b32 $0, e0;\n"
+            "mov.b32 $1, e1;\n"
+            "mov.b32 $2, e2;\n"
+            "mov.b32 $3, e3;\n"
+            "mov.b32 $4, e4;\n"
+            "mov.b32 $5, e5;\n"
+            "mov.b32 $6, e6;\n"
+            "mov.b32 $7, e7;\n"
+            "}"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
+        for k in range(8)
+    )
+
+
+@dsl_user_op
+def _mul_f32x8(
+    e0: cutlass.Float32,
+    e1: cutlass.Float32,
+    e2: cutlass.Float32,
+    e3: cutlass.Float32,
+    e4: cutlass.Float32,
+    e5: cutlass.Float32,
+    e6: cutlass.Float32,
+    e7: cutlass.Float32,
+    enc: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Triton's ``x * encode`` for eight bf16-exact f32 values, unclamped.
+
+    The multiply of ``_mul_cvt_rn_e2m1x8_acc_f32`` (its bf16 round-through is
+    ``_bf16round_f32x8``'s here) returning the scaled values instead of packing them:
+    ``mul.rn.f32x2`` (``.rn`` forbids any fusion). No clamp: MS-EDEN's correction takes the
+    unclamped values (Triton's ``_ms_eden_correction_with_sr``), and the code conversion
+    saturates in ``cvt.rn.satfinite`` on its own.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8),
+        [
+            e0.ir_value(loc=loc, ip=ip),
+            e1.ir_value(loc=loc, ip=ip),
+            e2.ir_value(loc=loc, ip=ip),
+            e3.ir_value(loc=loc, ip=ip),
+            e4.ir_value(loc=loc, ip=ip),
+            e5.ir_value(loc=loc, ip=ip),
+            e6.ir_value(loc=loc, ip=ip),
+            e7.ir_value(loc=loc, ip=ip),
+            enc.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b64 s2, p01, p23, p45, p67;\n"
+            "mov.b64 s2, {$16, $16};\n"
+            "mov.b64 p01, {$8, $9};\n"
+            "mov.b64 p23, {$10, $11};\n"
+            "mov.b64 p45, {$12, $13};\n"
+            "mov.b64 p67, {$14, $15};\n"
+            "mul.rn.f32x2 p01, p01, s2;\n"
+            "mul.rn.f32x2 p23, p23, s2;\n"
+            "mul.rn.f32x2 p45, p45, s2;\n"
+            "mul.rn.f32x2 p67, p67, s2;\n"
+            "mov.b64 {$0, $1}, p01;\n"
+            "mov.b64 {$2, $3}, p23;\n"
+            "mov.b64 {$4, $5}, p45;\n"
+            "mov.b64 {$6, $7}, p67;\n"
+            "}"
+        ),
+        "=f,=f,=f,=f,=f,=f,=f,=f,f,f,f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [k], loc=loc, ip=ip))
+        for k in range(8)
+    )
+
+
+@dsl_user_op
+def _div_full_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """Triton's plain ``/``: the approximate (<= 2 ulp) ``div.full.f32``, not ``div.rn``."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "div.full.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _div_approx_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """``a * rcp.approx(b)``: one ``MUFU.RCP`` and one ``FMUL`` (<= 2 ulp, like
+    ``div.full.f32``, which spends six more SASS on its range pre-scale and denormal test).
+    ``1 / 0`` is inf, so a zero ``b`` yields inf or NaN, never a finite quotient."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "div.approx.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _sr_e4m3_byte(
+    corrected: cutlass.Float32, rbits: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
+    """Stochastically round an f32 onto the E4M3 grid, Triton's bit trick op for op, and
+    return the E4M3 byte.
+
+    Shift by 2^-120 so the E4M3 grid (subnormals included) lands on multiples of 2^20 in
+    the f32 bit pattern, add 20 random bits, truncate. Bits 26:20 of the truncated word are
+    exactly the byte's (exp4 | mant3) -- subnormals included, exp field 0 -- and a second
+    shift puts the sign bit beside them (``lop3`` 0xE4 = bit-select: bits 6:0 from the
+    first shift, bit 7 from the second), so the shift back and the narrowing cvt are not
+    needed. ``mul.rn.f32`` without ``.ftz``: E4M3-subnormal scales pass through f32
+    subnormals here.
+
+    ``min.f32`` against 448 first, the largest finite E4M3: Triton's saturating fp8
+    store returns 448 for anything the rounding lands past it, and 448 sits on the grid,
+    so the rounding leaves it there; without the ``min`` these bits would read as the
+    NaN pattern (480) or wrap (512 and up). In contract -- a group's amax at least its
+    blocks' amax -- the value never gets there: the stored scale is at most 256, and the
+    correction ``<v, v> / <v, q>`` is the ``v * q``-weighted mean of the per-element
+    ratios ``v / q`` (an element that rounds to code 0 adds only its ``v^2 <= 1/16`` to
+    the numerator). With a normal stored scale the amax element lands in [5.625, 6.375]
+    (E4M3 rounds within 2^-4 of the target 6; past 6 it saturates to code 6, which is
+    what the correction repays), so it weighs at least 33 at a ratio of at most 17/16;
+    every element at or above 3/4 is at most 5/4 of its RTNE code, and the elements
+    between 1/4 and 3/4 (code 1/2, ratio below 3/2) weigh at most 3/8 each. The maximum
+    is 415.64/338.25 = 1.2288, fifteen elements at the 5.0 tie beside a 6.375: corrected
+    at most 314.58, its stochastic round-up at most 320. With a subnormal stored scale
+    (below 2^-6) the amax element still lands at 3 or above, so the same mean stays below
+    2 and the corrected value far below 448. An amax below a block's own caps that
+    block's scale at 256 while its elements scale past 6 without bound, and the
+    corrected value follows; the ``min`` keeps that case at Triton's 448.
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [corrected.ir_value(loc=loc, ip=ip), rbits.ir_value(loc=loc, ip=ip)],
+            (
+                "{\n"
+                ".reg .b32 u, r, t;\n"
+                ".reg .f32 s;\n"
+                "min.f32 s, $1, 0f43E00000;\n"
+                "mul.rn.f32 s, s, 0f03800000;\n"
+                "mov.b32 u, s;\n"
+                "and.b32 r, $2, 0x000FFFFF;\n"
+                "add.u32 u, u, r;\n"
+                "shr.u32 u, u, 20;\n"
+                "shr.u32 t, u, 4;\n"
+                "lop3.b32 $0, u, t, 0x7F, 0xE4;\n"
+                "}"
+            ),
+            "=r,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_rs_e4m3x4_f32(
+    v0: cutlass.Float32,
+    v1: cutlass.Float32,
+    v2: cutlass.Float32,
+    v3: cutlass.Float32,
+    rbits: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Uint32:
+    """Hardware stochastic rounding of four f32 to E4M3, packed as the word the scale
+    store takes: ``v0`` in the low byte .. ``v3`` in the high byte (PTX operand order
+    ``{v3, v2, v1, v0}``).
+
+    A different stochastic stream from ``_sr_e4m3_byte``, not a lowering of it: the high
+    half of ``rbits`` rounds ``v3`` (bit-reversed) and ``v2``, the low half ``v1``
+    (bit-reversed) and ``v0``, 16 random bits per value (``P(up) = floor(frac20 / 16) /
+    2^16`` against the software path's 20-bit ``frac20 / 2^20``). ``satfinite`` clamps at
+    448 under any ``rbits``, NaN stays NaN, signed zero is kept (measured, sm_100a).
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                v3.ir_value(loc=loc, ip=ip),
+                v2.ir_value(loc=loc, ip=ip),
+                v1.ir_value(loc=loc, ip=ip),
+                v0.ir_value(loc=loc, ip=ip),
+                rbits.ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rs.satfinite.e4m3x4.f32 $0, {$1, $2, $3, $4}, $5;",
+            "=r,f,f,f,f,r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -675,10 +1392,11 @@ def _round_rht_amax(amax):
 
 
 def _abs_amax16(vals):
-    """Max abs over 16 f32 rmem values (the 1x16 block amax)."""
+    """Max abs over 16 f32 rmem values (the 1x16 block amax). ``_maxnum_f32`` drops a NaN
+    element as Triton's ``tl.max`` does, so the 15 finite neighbours keep their scale."""
     amax = _abs_f32(vals[0])
     for i in range(1, 16):
-        amax = _max_f32(amax, _abs_f32(vals[i]))
+        amax = _maxnum_f32(amax, _abs_f32(vals[i]))
     return amax
 
 
@@ -690,7 +1408,7 @@ def _group16_amax(amax, deltas: cutlass.Constexpr = (8, 4, 2, 1)):
     way the offsets stay inside an aligned lane group, so every lane ends with the shared
     block max."""
     for delta in deltas:
-        amax = _max_f32(amax, cute.arch.shuffle_sync_bfly(amax, delta))
+        amax = _maxnum_f32(amax, cute.arch.shuffle_sync_bfly(amax, delta))
     return amax
 
 
@@ -839,6 +1557,26 @@ def _quant16(
     return _quant16_from_amax(
         vals, amax, enc_over_fp4max, dec, sr, rb, rht_acc, fast_math
     )
+
+
+def _global_scale(amax):
+    """NVFP4 two-level scale scalars from a global amax (TE :779-785).
+
+    Returns ``(encode, decode, encode / fp4_max)``; a zero amax yields identity
+    scales so the block scales stay finite.
+    """
+    is_zero = amax == cutlass.Float32(0.0)
+    safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
+    c = _min_f32(
+        _div_rn_f32(cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe),
+        cutlass.Float32(FP32_MAX),
+    )
+    c = cutlass.Float32(
+        cutlass.select_(c == cutlass.Float32(0.0), cutlass.Float32(1.0), c)
+    )
+    enc = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), c))
+    dec = _div_rn_f32(cutlass.Float32(1.0), enc)
+    return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
 
 
 class _Tcgen05RowColFused:
@@ -1326,20 +2064,6 @@ class _Tcgen05RowColFused:
         tCrA = tiled_mma.make_fragment_A(sA)  # (MMA, M, col_groups, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB)
 
-        def _global_scale(amax):
-            is_zero = amax == cutlass.Float32(0.0)
-            safe = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), amax))
-            c = _min_f32(
-                _div_rn_f32(cutlass.Float32(FP8_E4M3_MAX * FP4_E2M1_MAX), safe),
-                cutlass.Float32(FP32_MAX),
-            )
-            c = cutlass.Float32(
-                cutlass.select_(c == cutlass.Float32(0.0), cutlass.Float32(1.0), c)
-            )
-            enc = cutlass.Float32(cutlass.select_(is_zero, cutlass.Float32(1.0), c))
-            dec = _div_rn_f32(cutlass.Float32(1.0), enc)
-            return enc, dec, enc * cutlass.Float32(1.0 / FP4_E2M1_MAX)
-
         # Ungrouped: one global scale pair for the whole launch. Grouped: the epilogues overwrite
         # these per work tile from that tile's expert; the hoisted pair still has to be computed
         # (and typed) before the loops, since the DSL rejects a name that enters a dynamic `for`
@@ -1764,7 +2488,7 @@ class _Tcgen05RowColFused:
                     # The pair is two of the 16 strips of one 16x16 block: fold them in-register,
                     # then butterfly over the 8 lanes holding the other 14.
                     amax = _group16_amax(
-                        _max_f32(_abs_amax16(blk0), _abs_amax16(blk1)), (4, 2, 1)
+                        _maxnum_f32(_abs_amax16(blk0), _abs_amax16(blk1)), (4, 2, 1)
                     )
                     # Weight mode is RTNE only (asserted at compile), so no SR draw here.
                     enc, sf = _enc_from_amax(amax, enc_over_fp4max, g_dec)
@@ -2735,3 +3459,1190 @@ def _cutedsl_group_weight_quantize_2d_impl(
     )
     # uint32 -> uint8 quadruples the last extent: (E, M, N//8) -> (E, M, N//2).
     return row_fp4.view(torch.uint8), row_sf, col_fp4.view(torch.uint8), col_sf
+
+
+# ---------------------------------------------------------------------------
+# Rowwise 1x16 weight cast (no RHT, RTNE) -- plain CUDA-core streaming kernel
+# ---------------------------------------------------------------------------
+ROW_CAST_THREADS = 128  # 16 rows x 8 blocks of 16 columns per CTA step
+
+
+class _RowCastQuantize:
+    """Per-expert rowwise 1x16 NVFP4 E2M1 cast of a dense ``(E, M, N)`` bf16 stack.
+
+    Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, by, e)`` walks the 128-row blocks
+    ``by, by + GRID_Y, ...`` of column tile ``cn`` of expert ``e``, so no CTA straddles
+    an expert and the expert's global scale is loop-invariant. Thread ``t`` owns the
+    16-column block ``b = t % 8`` of slab row ``t // 8``; eight unrolled 16-row steps
+    cover the block. Per 1x16 block the arithmetic is the fused kernel's rowwise path
+    (``_global_scale`` + ``_quant16_from_amax``, the block amax taken over the eight
+    packed bf16x2 words as loaded), so the output is the Triton op's byte for byte; only
+    the addressing is new. No MMA, TMA, SMEM or atomics.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mA: cute.Tensor,  # (E*M*N/2,) u32 = A.view(torch.uint32).view(-1)
+        mRowFP4: cute.Tensor,  # (E*M*N/8,) u32 = row_fp4.view(-1)
+        mRowSF: cute.Tensor,  # (E*M*N/16,) e4m3 = row_sf.view(-1)
+        row_amax_t: cute.Tensor,  # (E,) f32
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(mA, mRowFP4, mRowSF, row_amax_t, N, m_blocks, GRID_Y).launch(
+            grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
+            block=(ROW_CAST_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mA: cute.Tensor,
+        mRowFP4: cute.Tensor,
+        mRowSF: cute.Tensor,
+        row_amax_t: cute.Tensor,
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cn, by, e = cute.arch.block_idx()
+        b = tidx % cutlass.Int32(8)  # 16-column block within the 128-column tile
+        r_slab = tidx // cutlass.Int32(8)  # row within a 16-row step
+
+        row_bytes = cutlass.Int64(N) * cutlass.Int64(2)
+        code_pitch = cutlass.Int64(N // cutlass.Int32(2))
+        # SF bytes per 128-row block of one expert: (N // 64) atoms of 512 B.
+        sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
+        first_row = e * m_blocks * cutlass.Int32(M_TILE) + r_slab  # Int32: E*M < 2^31
+        # Byte offsets are Int64 (E*M*N*2 passes 2^31 at DeepSeek shapes). A: row pitch is a
+        # multiple of 256 B (N % 128), so every 32 B block is 16-B aligned; codes: pitch N/2 is
+        # a multiple of 64 B, so every 8 B word is 8-B aligned.
+        a_base = (
+            mA.iterator.toint()
+            + cutlass.Int64(first_row) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(2 * M_TILE) + b * cutlass.Int32(32))
+        )
+        q_base = (
+            mRowFP4.iterator.toint()
+            + cutlass.Int64(first_row) * code_pitch
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2) + b * cutlass.Int32(8))
+        )
+        # swizzled SF[r, c] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4] (the scale-factor
+        # layout above); here c = cn*8 + b, so the atom is 2*cn + b//4 and the byte
+        # within the row is b%4.
+        sf_base = (
+            e * m_blocks * sf_rb_bytes
+            + (cn * cutlass.Int32(2) + b // cutlass.Int32(4)) * cutlass.Int32(SF_BLK)
+            + r_slab * cutlass.Int32(16)
+            + b % cutlass.Int32(4)
+        )
+
+        blk = cute.make_rmem_tensor((16,), cutlass.Float32)
+        for rb in cutlass.range(by, m_blocks, GRID_Y):
+            a_blk = a_base + cutlass.Int64(rb) * (row_bytes * cutlass.Int64(M_TILE))
+            q_blk = q_base + cutlass.Int64(rb) * (code_pitch * cutlass.Int64(M_TILE))
+            sf_blk = sf_base + rb * sf_rb_bytes
+            # The eight steps go as two batches of four whose loads are all issued
+            # before the batch's first quantize, so a thread has half the row block
+            # (128 B per thread) in flight and pays two global round trips per row block
+            # instead of eight.
+            for h in cutlass.range_constexpr(2):
+                words = []
+                # r_loc = 16*s + r_slab
+                for s in cutlass.range_constexpr(4 * h, 4 * h + 4):
+                    a_addr = a_blk + cutlass.Int64(16 * s) * row_bytes
+                    # Two 16-B vector loads = the 16 bf16 of one 1x16 block, as packed u32 pairs.
+                    v0 = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            a_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4,)),
+                    ).load()
+                    v1 = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            a_addr + cutlass.Int64(16),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4,)),
+                    ).load()
+                    words.append((v0, v1))
+                if cutlass.const_expr(h == 0):
+                    # One expert per CTA: its two-level scale is computed per row block,
+                    # in the shadow of the first batch's outstanding loads (the host
+                    # passes GRID_Y = m_blocks, so once per CTA).
+                    _, dec, enc_over_fp4max = _global_scale(row_amax_t[e])
+                for s in cutlass.range_constexpr(4 * h, 4 * h + 4):
+                    v0, v1 = words[s - 4 * h]
+                    for j in cutlass.range_constexpr(4):
+                        blk[2 * j] = _bf16lo_to_f32(v0[j])
+                        blk[2 * j + 1] = _bf16hi_to_f32(v0[j])
+                        blk[8 + 2 * j] = _bf16lo_to_f32(v1[j])
+                        blk[8 + 2 * j + 1] = _bf16hi_to_f32(v1[j])
+                    # The block amax over the packed words (seven HMNMX2 over the eight
+                    # words, then the two halves; the mask clears the junk signs), the
+                    # widened values only for the multiply. NaN-dropping at both levels,
+                    # as _abs_amax16 / Triton's tl.max.
+                    mm = _max_abs_bf16x2_x8(
+                        v0[0],
+                        v0[1],
+                        v0[2],
+                        v0[3],
+                        v1[0],
+                        v1[1],
+                        v1[2],
+                        v1[3],
+                        nan=False,
+                    ) & cutlass.Uint32(0x7FFF7FFF)
+                    amax = _maxnum_f32(_bf16lo_to_f32(mm), _bf16hi_to_f32(mm))
+                    w0, w1, sf = _quant16_from_amax(blk, amax, enc_over_fp4max, dec)
+                    q_ptr = cute.make_ptr(
+                        cutlass.Uint64,
+                        q_blk + cutlass.Int64(16 * s) * code_pitch,
+                        cute.AddressSpace.gmem,
+                        assumed_align=8,
+                    )
+                    cute.make_tensor(q_ptr, cute.make_layout((1,)))[0] = cutlass.Uint64(
+                        w0
+                    ) | (cutlass.Uint64(w1) << 32)
+                    # r_loc % 32 = 16*(s % 2) + r_slab (in sf_base), r_loc // 32 = s // 2
+                    mRowSF[
+                        sf_blk + cutlass.Int32((16 * (s % 2)) * 16 + (s // 2) * 4)
+                    ] = sf
+
+
+# Every parameter is required and every caller passes it positionally: an lru_cache key is
+# the literal (args, kwargs) shape (see _compile_fused_kernel).
+@functools.lru_cache(maxsize=None)
+def _compile_row_cast_quantize_kernel(device_idx):
+    """Compile the rowwise 1x16 weight cast with symbolic extents (cached per device).
+
+    ``A`` and the codes are handed over as flat u32 views with ``assumed_align=16`` (the
+    row pitches are multiples of 256 B and 64 B, so every 32 B block and 8 B code word is
+    aligned); the scales as the flat e4m3 run of 512 B atoms. N, the per-expert 128-row
+    block count, the y-grid and E are runtime Int32 args.
+    """
+    free = cute.sym_int
+    fake_a = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16)
+    fake_rfp4 = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_rsf = make_fake_tensor(cutlass.Float8E4M3FN, (free(),), stride=(1,))
+    fake_row_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    return cute.compile(
+        _RowCastQuantize(),
+        fake_a,
+        fake_rfp4,
+        fake_rsf,
+        fake_row_amax,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_row_cast_quantize_impl(
+    A: torch.Tensor, global_amax: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dense-expert rowwise 1x16 NVFP4 E2M1 weight quantize, RTNE, no RHT.
+
+    One launch over the whole ``(E, M, N)`` stack; the expert is the grid's z coordinate
+    and ``global_amax[e]`` its only expert-dependent input. Per 1x16 block the arithmetic
+    is the fused kernel's rowwise path, so the output is bitwise the Triton op's.
+
+    Args:
+        A: (E, M, N) bfloat16, contiguous, 16-B aligned. M % 128 == 0, N % 128 == 0,
+            E*M*N < 2**32 (the flat u32 view's 32-bit extent).
+        global_amax: (E,) float32 per-expert ``A[e].float().abs().max()``.
+
+    Returns:
+        (E, M, N//2) u8 rowwise codes, (E, M//128, N//64, 32, 16) fp8 rowwise swizzled SF.
+    """
+    E, M, N = A.shape
+    # Non-differentiable op (autograd owned by the outer Function); detach so the input passed
+    # to the kernel never carries autograd state.
+    A = A.detach()
+    dev = A.device
+
+    row_fp4 = torch.empty((E, M, N // 8), dtype=torch.uint32, device=dev)
+    row_sf = torch.empty(
+        (E, M // 128, N // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    # An empty stack (E, M or N = 0) passes validation and has nothing to quantize: a zero
+    # grid dimension is a launch error here where the Triton launcher simply skips it.
+    if A.numel() == 0:
+        return row_fp4.view(torch.uint8), row_sf
+
+    m_blocks = M // M_TILE
+    GRID_Y = m_blocks
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    row_cast = _compile_row_cast_quantize_kernel(dev.index)
+    row_cast(
+        A.view(torch.uint32).view(-1),
+        row_fp4.view(-1),
+        row_sf.view(-1),
+        global_amax,
+        int(N),
+        int(m_blocks),
+        int(GRID_Y),
+        int(E),
+        stream,
+    )
+    # uint32 -> uint8 quadruples the last extent: (E, M, N//8) -> (E, M, N//2).
+    return row_fp4.view(torch.uint8), row_sf
+
+
+# ---------------------------------------------------------------------------
+# Requant amax of the packed rowwise weight (§11.6) -- plain CUDA-core streaming kernel
+# ---------------------------------------------------------------------------
+# 128 threads per 128x128 tile, 64 B of codes each as four 16 B vector loads; the lane
+# map below makes a warp's code load cover 8 rows x 64 B (8 lines) and its scale load
+# 128 contiguous bytes of one atom.
+REQUANT_AMAX_THREADS = M_TILE
+REQUANT_AMAX_WARPS = REQUANT_AMAX_THREADS // 32
+# Latency hiding comes from resident CTAs rather than in-thread unrolling: the kernel
+# holds few registers and no pipeline SMEM, so the grid is sized for this many CTAs per
+# SM (spread over the column-tile and expert grid dimensions).
+# The register file admits 12 resident CTAs; 8 keeps the grid to one wave.
+REQUANT_AMAX_CTAS_PER_SM = 8
+
+
+def _block_max_magnitude(w0, w1):
+    """Largest E2M1 magnitude in a 1x16 block, decoded to f32, from its two code words.
+
+    E2M1 magnitudes (0, .5, 1, 1.5, 2, 3, 4, 6) are monotone in the 3-bit magnitude
+    field, so the block max is the lexicographic max of those fields over the 16
+    nibbles -- found bit by bit with masks, never per nibble: ``any2`` says whether
+    some nibble has bit 2 set; the candidates for bit 1 are then those nibbles (or
+    all of them when none had bit 2), and so on for bit 0. Sign bits (nibble bit 3)
+    never enter a mask. The winning 3-bit field is decoded with a select chain.
+    """
+    bit2 = cutlass.Uint32(0x44444444)
+    bit1 = cutlass.Uint32(0x22222222)
+    zero = cutlass.Uint32(0)
+
+    t0 = w0 & bit2
+    t1 = w1 & bit2
+    any2 = (t0 | t1) != zero
+    m0 = cutlass.Uint32(cutlass.select_(any2, t0 >> 1, bit1))
+    m1 = cutlass.Uint32(cutlass.select_(any2, t1 >> 1, bit1))
+    u0 = w0 & m0
+    u1 = w1 & m1
+    any1 = (u0 | u1) != zero
+    n0 = cutlass.Uint32(cutlass.select_(any1, u0 >> 1, m0 >> 1))
+    n1 = cutlass.Uint32(cutlass.select_(any1, u1 >> 1, m1 >> 1))
+    any0 = ((w0 & n0) | (w1 & n1)) != zero
+
+    hi = cutlass.Float32(
+        cutlass.select_(
+            any1,
+            cutlass.select_(any0, cutlass.Float32(6.0), cutlass.Float32(4.0)),
+            cutlass.select_(any0, cutlass.Float32(3.0), cutlass.Float32(2.0)),
+        )
+    )
+    lo = cutlass.Float32(
+        cutlass.select_(
+            any1,
+            cutlass.select_(any0, cutlass.Float32(1.5), cutlass.Float32(1.0)),
+            cutlass.select_(any0, cutlass.Float32(0.5), cutlass.Float32(0.0)),
+        )
+    )
+    return cutlass.Float32(cutlass.select_(any2, hi, lo))
+
+
+def _block_has_max_magnitude(w0, w1):
+    """Nonzero iff some nibble of the 1x16 block (code words ``w0``, ``w1``) has the
+    largest E2M1 magnitude field, 7 (= 6.0).
+
+    ``(w & 0x7777...) + 0x1111...`` carries into bit 3 of exactly those nibbles whose
+    three magnitude bits are all set (7 + 1 = 8; a nibble never carries out), so the
+    OR of the two words masked to the bit-3 positions is nonzero iff the block holds a
+    7. The sign bits (nibble bit 3) are masked off first and never enter.
+    """
+    m7 = cutlass.Uint32(0x77777777)
+    one = cutlass.Uint32(0x11111111)
+    b8 = cutlass.Uint32(0x88888888)
+    a0 = (w0 & m7) + one
+    a1 = (w1 & m7) + one
+    return (a0 | a1) & b8
+
+
+def _load_requant_tile(tile_codes, row32_bytes, tile_sf):
+    """A thread's share of one 128x128 tile: its four 16 B code pieces (rows
+    ``32j + row_lo``, each as four u32) and the one 16 B load of its four scale words."""
+    rows = []
+    for j in range(4):
+        codes_ptr = cute.make_ptr(
+            cutlass.Uint32,
+            tile_codes + cutlass.Int64(j) * row32_bytes,
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        rows.append(cute.make_tensor(codes_ptr, cute.make_layout((4,))).load())
+    sf_ptr = cute.make_ptr(
+        cutlass.Uint32, tile_sf, cute.AddressSpace.gmem, assumed_align=16
+    )
+    return rows, cute.make_tensor(sf_ptr, cute.make_layout((4,))).load()
+
+
+class _RequantAmax:
+    """Per-expert amax of the dequantized forward weight (§11.6), streaming.
+
+    Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, y, e)`` walks the row blocks
+    ``y, y + GRID_Y, ...`` of column tile ``cn`` of expert ``e``, so no CTA ever
+    divides. A tile is 128 rows x 128 columns = 8 KB of codes plus the two
+    adjacent 512 B scale atoms.
+
+    Lane map (the kernel streams, so L1 wavefronts per byte decide its speed): lane
+    ``l`` of warp ``w`` owns 16 B piece ``p = l % 4`` (blocks ``2p, 2p+1``) of the
+    64 B row segment in rows ``32j + 8w + l//4`` for ``j = 0..3``. A warp's code
+    load then covers 8 consecutive rows x 64 B, and because the swizzled atom
+    stores row ``r``'s four scale bytes at word ``(r % 32) * 4 + r // 32``, a
+    thread's four rows are four CONSECUTIVE words -- one 16 B load, contiguous
+    across the 8 lanes of a row group.
+
+    Numerics, matching the Triton reconstruction (``hadamard_utils``
+    ``_nvfp4_dequantize`` + ``_reconstruct_qdq_weight_tile``:
+    ``bf16(f32((q * sf) * dec))``, zero for a NaN/inf amax) bit for bit while
+    doing almost none of its arithmetic:
+
+    * Per 1x16 block only the max magnitude code ``q`` is needed, and the product
+      ``p = q * |sf|`` is exact in f32 (a <= 2-bit by <= 4-bit significand product).
+    * ``x -> bf16_rtne(f32(x * dec))`` is monotone non-decreasing on ``x >= 0`` and
+      the max of a monotone function is the function of the max, so
+      ``max_i bf16((q_i * sf) * dec) == bf16((max_b p_b) * dec)`` over every block
+      of the expert. The whole reduction therefore runs on the exact products and
+      the multiply by ``dec`` plus the one bf16 rounding happen once per CTA.
+    * A NaN or inf ``global_amax`` selects zero explicitly (``_global_scale`` alone
+      would give a finite ``dec`` for NaN).
+    * "Bit for bit" holds for finite scale bytes. A NaN scale byte (0x7f / 0xff,
+      which the quantizer never emits) propagates to a NaN in both backends, with
+      different payloads (``max.NaN``'s canonical NaN here, ``float("nan")`` in
+      Triton).
+
+    Fast pass, then an exact pass only where needed (what makes it stream at the
+    memory floor instead of the ALU pipe):
+
+    * A block that holds a magnitude-7 nibble has ``q == 6.0`` exactly, so its
+      product is ``6 * |sf|`` and, ``6 * e4m3`` being exact and monotone in
+      ``|sf|``, ``max_b q_b * |sf_b| == 6 * max_b |sf_b|`` over any set of such
+      blocks. Every block whose scale is a normal e4m3 is such a block (the block
+      scale is ``RTNE_e4m3(amax_block * enc / 6)``, so the block amax lands in
+      ``[5.65, 6.4] * sf`` and rounds to 6.0), i.e. 100 % of real quantized weights.
+    * Pass 1 therefore only tests each block for a 7 (five ALU ops) and keeps the
+      f16x2 max of the thread's ``|sf|`` bytes -- but drops the whole tile from that
+      max when any of its blocks fails the test, and remembers the failure. No
+      per-block search, no branch: ptxas turns any per-tile branch here into
+      predicated straight-line code (measured on three formulations), which is why
+      the exact search is a separate loop.
+    * Pass 2 re-reads every tile of the CTA with the exact per-block search when a
+      warp vote says some lane dropped a tile. Max is idempotent, so re-reducing the
+      tiles that were fine is harmless; the dropped tiles are fully recovered. Zero
+      trips on real weights; a warp that meets a block without a 7 (an all-zero
+      block, hand-made bytes) costs pass 1 plus the old kernel (about +25 %).
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mCodes: cute.Tensor,  # (E*M*N/8,) u32 = row_fp4_w.view(torch.uint32).view(-1)
+        mSF: cute.Tensor,  # (E*M*N/64,) u32 = row_sf_w.view(torch.uint32).view(-1)
+        amax_t: cute.Tensor,  # (E,) f32
+        out_t: cute.Tensor,  # (E,) f32, zero-initialised
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(mCodes, mSF, amax_t, out_t, N, m_blocks, GRID_Y).launch(
+            grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
+            block=(REQUANT_AMAX_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        amax_t: cute.Tensor,
+        out_t: cute.Tensor,
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cn, by, e = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx % cutlass.Int32(32)
+        piece = lane % cutlass.Int32(4)  # 16 B piece of the 64 B row segment
+        row_lo = warp_idx * cutlass.Int32(8) + lane // cutlass.Int32(4)  # r % 32
+        # The two blocks of a piece are bytes 2*(p % 2), +1 of the row's scale word.
+        sf_shift = (lane % cutlass.Int32(2)) * cutlass.Int32(16)
+
+        smem = utils.SmemAllocator()
+        warp_max = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((REQUANT_AMAX_WARPS,)), 16
+        )
+
+        # SF bytes per 128-row block of one expert: (N // 64) atoms of 512 B.
+        sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
+        row_bytes = cutlass.Int64(N // cutlass.Int32(2))  # packed codes per row
+        row_block_bytes = row_bytes * cutlass.Int64(M_TILE)
+        row32_bytes = row_bytes * cutlass.Int64(32)
+
+        # Expert-, tile-column- and thread-constant parts of both addresses. Codes:
+        # row (e*M + rb*128 + 32j + row_lo), byte cn*64 + 16*piece -- 16 B aligned
+        # because N % 128 == 0 makes the row pitch a multiple of 64 B. Scales: atom
+        # (e*M//128 + rb) * (N//64) + 2*cn + piece//2, words row_lo*4 .. +3 (= rows
+        # 32j + row_lo, j = 0..3; the swizzle of the rowwise cast above).
+        codes_base = (
+            mCodes.iterator.toint()
+            + cutlass.Int64(e * m_blocks * cutlass.Int32(M_TILE) + row_lo) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2) + piece * cutlass.Int32(16))
+        )
+        sf_base = (
+            mSF.iterator.toint()
+            + cutlass.Int64(e * m_blocks) * cutlass.Int64(sf_rb_bytes)
+            + cutlass.Int64(
+                (cn * cutlass.Int32(2) + piece // cutlass.Int32(2))
+                * cutlass.Int32(SF_BLK)
+                + row_lo * cutlass.Int32(16)
+            )
+        )
+
+        zero = cutlass.Uint32(0)
+        sf_mask = cutlass.Uint32(0x7F7F)  # the two e4m3 sign bits
+
+        # Pass 1: f16x2 max of |sf| over the tiles whose blocks all hold a 7; a tile
+        # with a block lacking one is dropped here and flagged for pass 2.
+        sf_max = cutlass.Uint32(0)  # f16x2 (0.0, 0.0)
+        tiles_ok = cutlass.Uint32(0xFFFFFFFF)  # min over tiles: 0 iff one was dropped
+        for rb in cutlass.range(by, m_blocks, GRID_Y):
+            rows, sf_words = _load_requant_tile(
+                codes_base + cutlass.Int64(rb) * row_block_bytes,
+                row32_bytes,
+                sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
+            )
+
+            # min over the eight blocks: 0 iff some block has no magnitude-7 nibble. The
+            # seed is the first block's test, never a constant: ``cutlass.min`` of a
+            # Python-side Uint32 constant and a dynamic value is emitted as a SIGNED min
+            # (``min(0xFFFFFFFF, x)`` -> ``min.s32(-1, x)`` = -1 for every x without bit
+            # 31), which would silently drop that block's test.
+            tile_ok = _block_has_max_magnitude(rows[0][0], rows[0][1])
+            tile_ok = cutlass.min(
+                tile_ok, _block_has_max_magnitude(rows[0][2], rows[0][3])
+            )
+            for j in cutlass.range_constexpr(1, 4):
+                tile_ok = cutlass.min(
+                    tile_ok, _block_has_max_magnitude(rows[j][0], rows[j][1])
+                )
+                tile_ok = cutlass.min(
+                    tile_ok, _block_has_max_magnitude(rows[j][2], rows[j][3])
+                )
+            m = _e4m3x2_to_f16x2((sf_words[0] >> sf_shift) & sf_mask)
+            for j in cutlass.range_constexpr(1, 4):
+                m = _max_f16x2(m, _e4m3x2_to_f16x2((sf_words[j] >> sf_shift) & sf_mask))
+            m = cutlass.Uint32(cutlass.select_(tile_ok != zero, m, zero))
+            sf_max = _max_f16x2(sf_max, m)
+            tiles_ok = cutlass.min(tiles_ok, tile_ok)
+
+        # Pass 2: the exact per-block search over every tile of the CTA, for warps
+        # in which some lane dropped a tile (zero trips otherwise).
+        rescan = cute.arch.vote_any_sync(tiles_ok == zero)
+        rb_start = cutlass.Int32(cutlass.select_(rescan, by, m_blocks))
+        run_max = cutlass.Float32(0.0)
+        for rb in cutlass.range(rb_start, m_blocks, GRID_Y):
+            rows, sf_words = _load_requant_tile(
+                codes_base + cutlass.Int64(rb) * row_block_bytes,
+                row32_bytes,
+                sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
+            )
+
+            for j in cutlass.range_constexpr(4):
+                # |sf| for the piece's two blocks: e4m3 sign is bit 7 of each byte
+                # (NaN 0xff stays NaN as 0x7f).
+                sf2 = _e4m3x2_to_f16x2((sf_words[j] >> sf_shift) & sf_mask)
+                q_even = _block_max_magnitude(rows[j][0], rows[j][1])
+                q_odd = _block_max_magnitude(rows[j][2], rows[j][3])
+                run_max = _max_f32(run_max, q_even * _f16lo_to_f32(sf2))  # exact
+                run_max = _max_f32(run_max, q_odd * _f16hi_to_f32(sf2))
+
+        # 6 * |sf| is exact (<= 3 + 2 significant bits) and monotone: the products
+        # of every block pass 1 kept, without forming them.
+        run_max = _max_f32(run_max, cutlass.Float32(6.0) * _f16lo_to_f32(sf_max))
+        run_max = _max_f32(run_max, cutlass.Float32(6.0) * _f16hi_to_f32(sf_max))
+
+        for offset in range(5):
+            run_max = _max_f32(
+                run_max, cute.arch.shuffle_sync_bfly(run_max, 1 << (4 - offset))
+            )
+        if lane == cutlass.Int32(0):
+            warp_max[warp_idx] = run_max
+        cute.arch.sync_threads()
+        if tidx == cutlass.Int32(0):
+            cta_max = warp_max[0]
+            for w in range(1, REQUANT_AMAX_WARPS):
+                cta_max = _max_f32(cta_max, warp_max[w])
+            amax = amax_t[e]
+            _, dec, _ = _global_scale(amax)
+            t = cta_max * _abs_f32(dec)  # the one rounding, Triton's association
+            t = cutlass.Float32(cutlass.BFloat16(t))  # RTNE, as the .to(bf16)
+            # Finite iff |amax| <= FP32_MAX: the comparison is false for NaN and inf.
+            valid = _abs_f32(amax) <= cutlass.Float32(FP32_MAX)
+            t = cutlass.Float32(cutlass.select_(valid, t, cutlass.Float32(0.0)))
+            _atom_max_f32_nonneg(out_t.iterator + e, t)
+
+
+# Every parameter is required and every caller passes it positionally: an lru_cache key is
+# the literal (args, kwargs) shape (see _compile_fused_kernel).
+@functools.lru_cache(maxsize=None)
+def _compile_requant_amax_kernel(device_idx):
+    """Compile the streaming requant amax with symbolic extents (cached per device).
+
+    Both packed inputs are handed over as flat u32 views (the codes' row pitch and
+    the 512 B atoms are both multiples of 16 B, so the 16 B code loads are aligned);
+    N, the per-expert row-block count, the y-grid and E are runtime Int32 args.
+    """
+    free = cute.sym_int
+    fake_codes = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16)
+    fake_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    fake_out = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    return cute.compile(
+        _RequantAmax(),
+        fake_codes,
+        fake_sf,
+        fake_amax,
+        fake_out,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_col_cast_requant_amax_impl(
+    row_fp4_w: torch.Tensor, row_sf_w: torch.Tensor, global_amax: torch.Tensor
+) -> torch.Tensor:
+    """Per-expert ``max|bf16(dequant(row_fp4_w[e]))|`` from the rowwise NVFP4 weight.
+
+    ``row_fp4_w`` is ``(E, M, N//2)`` uint8, ``row_sf_w`` the ``(E, M//128, N//64, 32, 16)``
+    swizzled e4m3 scales, ``global_amax`` the ``(E,)`` decode amax. Both packed inputs are
+    handed over as ``assumed_align=16`` flat u32 views, so each must start at a 16 B
+    aligned address (the DSL raises a host ``ValueError`` otherwise; every producer in
+    this package allocates such buffers). Returns ``(E,)`` float32, zero-initialised
+    because the tail accumulates with atomic max.
+    """
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    dev = row_fp4_w.device
+
+    amax_w_qdq_t = torch.zeros((E,), dtype=torch.float32, device=dev)
+    # An empty stack (E, M or N = 0) passes validation and has nothing to reduce: the
+    # pre-zeroed output is the answer, as for the Triton twin, whose zero-size grid
+    # never launches.
+    if row_fp4_w.numel() == 0:
+        return amax_w_qdq_t
+
+    m_blocks = M // M_TILE
+    NUM_SMS = _get_num_sms(dev.index)
+    GRID_Y = min(
+        m_blocks, -(-REQUANT_AMAX_CTAS_PER_SM * NUM_SMS // (E * (N // M_TILE)))
+    )
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    requant_amax = _compile_requant_amax_kernel(dev.index)
+    requant_amax(
+        row_fp4_w.view(torch.uint32).view(-1),
+        row_sf_w.view(torch.uint32).view(-1),
+        global_amax,
+        amax_w_qdq_t,
+        int(N),
+        int(m_blocks),
+        int(GRID_Y),
+        int(E),
+        stream,
+    )
+    return amax_w_qdq_t
+
+
+# ---------------------------------------------------------------------------
+# Columnwise requantize of the packed rowwise weight (§11.7) -- CUDA-core SMEM transpose
+# ---------------------------------------------------------------------------
+# 128 threads per 128x128 tile: lane ``l`` of warp ``w`` rebuilds the 16 B piece
+# ``l // 8`` of weight rows ``32j + 8w + l % 8`` (four 16 B code loads plus one 16 B load
+# of the rows' scale words) into a padded bf16 SMEM tile; after the barrier thread ``t``
+# quantizes the four output rows ``4 * (t // 4) .. + 3`` over blocks ``2 * (t % 4)``,
+# ``+ 1``, reading the tile down its columns.
+REQUANTIZE_THREADS = M_TILE
+# Row pitch of the SMEM tile in u32 words: 128 bf16 columns are 64 words, padded to 68 so
+# the eight 16 B row stores of one store phase land on disjoint banks (68 % 32 == 4). The
+# words of row ``m`` are XOR-swizzled by ``16 * (m // 64) + (m // 32) % 2`` so the four
+# lanes that gather one column word from the four 32-row groups hit disjoint banks too.
+REQUANTIZE_PITCH_WORDS = M_TILE // 2 + 4
+# 34 KB of SMEM per CTA (no pipeline stages): the grid is sized for this many resident
+# CTAs per SM, and the launch bound caps the registers so they all fit.
+REQUANTIZE_CTAS_PER_SM = 5
+
+
+class _Requantize:
+    """Per-expert columnwise 1x16 NVFP4 requantization of the forward weight (§11.7).
+
+    Grid ``(N//128, GRID_Y, E)``: CTA ``(cn, y, e)`` walks the row blocks ``y, y + GRID_Y,
+    ...`` of column tile ``cn`` of expert ``e``, so both per-expert scales are
+    loop-invariant. Per tile the CTA first rebuilds ``W_qdq`` into SMEM with a lane map
+    like ``_RequantAmax``'s (lane ``l`` of warp ``w`` owns 16 B piece ``l // 8`` of rows
+    ``32j + 8w + l % 8``: a warp's code load covers 8 rows x 64 B, its scale load the
+    rows' four consecutive words) -- each thread decodes its 16 code words with
+    ``_dequant_e2m1x8_bf16x2x4`` (the Triton reconstruction op for op, including the
+    ``+0`` of a NaN / inf expert amax) and stores each as one 16 B chunk of the padded
+    row -- then, after the barrier, reads the tile down its columns: thread ``t`` owns
+    output rows ``n = 4 * (t // 4) .. + 3`` (the low and high bf16 of two adjacent column
+    words) and blocks ``2 * (t % 4)``, ``+ 1`` along ``m``, quantizes each 1x16 block with
+    the plain ``_quant16`` (the values are already bf16-exact, so no round-through) and
+    stores each row's 16 B code run as ``st.global.v4`` -- the four lanes of a row fill
+    its 64 B -- and its two adjacent scale bytes of the §11.1 swizzle as one 16-bit store.
+    No MMA: the transpose is a plain SMEM gather, so ``-0`` codes survive as Triton's
+    ``tl.trans`` keeps them.
+    """
+
+    @cute.jit
+    def __call__(
+        self,
+        mCodes: cute.Tensor,  # (E*M*N/8,) u32 = row_fp4_w.view(torch.uint32).view(-1)
+        mSF: cute.Tensor,  # (E*M*N/64,) u32 = row_sf_w.view(torch.uint32).view(-1)
+        amax_t: cute.Tensor,  # (E,) f32 global_amax
+        amax_out_t: cute.Tensor,  # (E,) f32 amax_w_qdq_t (§11.6)
+        mColFP4: cute.Tensor,  # (E*N*M/8,) u32 = col_fp4.view(-1)
+        mColSF: cute.Tensor,  # (E*N*M/16,) e4m3 = col_sf.view(-1)
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+        NUM_EXPERTS: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            mCodes, mSF, amax_t, amax_out_t, mColFP4, mColSF, N, m_blocks, GRID_Y
+        ).launch(
+            grid=(N // cutlass.Int32(M_TILE), GRID_Y, NUM_EXPERTS),
+            block=(REQUANTIZE_THREADS, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=REQUANTIZE_CTAS_PER_SM,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mCodes: cute.Tensor,
+        mSF: cute.Tensor,
+        amax_t: cute.Tensor,
+        amax_out_t: cute.Tensor,
+        mColFP4: cute.Tensor,
+        mColSF: cute.Tensor,
+        N: cutlass.Int32,
+        m_blocks: cutlass.Int32,
+        GRID_Y: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        cn, by, e = cute.arch.block_idx()
+
+        smem = utils.SmemAllocator()
+        tile = smem.allocate_array(
+            cutlass.Uint32, M_TILE * REQUANTIZE_PITCH_WORDS, byte_alignment=16
+        )
+        tile_base = tile.toint()
+        pitch_bytes = cutlass.Int32(4 * REQUANTIZE_PITCH_WORDS)
+
+        # --- producer: lane l of warp w rebuilds piece l // 8 of rows 32j + 8w + l % 8 --
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = tidx % cutlass.Int32(32)
+        piece = lane // cutlass.Int32(8)  # 16 B piece of the 64 B row segment
+        row_lo = warp_idx * cutlass.Int32(8) + lane % cutlass.Int32(8)  # m % 32
+        # The two blocks of a piece are bytes 2*(p % 2), +1 of the row's scale word.
+        sf_shift = (piece % cutlass.Int32(2)) * cutlass.Uint32(16)
+        # Codes: row (e*M + rb*128 + 32j + row_lo), bytes cn*64 + 16*piece -- 16 B aligned
+        # because N % 128 == 0 makes the row pitch a multiple of 64 B. Scales: atom
+        # (e*M//128 + rb) * (N//64) + 2*cn + piece//2, words row_lo*4 .. +3 (= rows
+        # 32j + row_lo, j = 0..3; the swizzle of the rowwise cast above).
+        row_bytes = cutlass.Int64(N // cutlass.Int32(2))
+        row_block_bytes = row_bytes * cutlass.Int64(M_TILE)
+        row32_bytes = row_bytes * cutlass.Int64(32)
+        sf_rb_bytes = (N // cutlass.Int32(64)) * cutlass.Int32(SF_BLK)
+        codes_base = (
+            mCodes.iterator.toint()
+            + cutlass.Int64(e * m_blocks * cutlass.Int32(M_TILE) + row_lo) * row_bytes
+            + cutlass.Int64(cn * cutlass.Int32(M_TILE // 2) + piece * cutlass.Int32(16))
+        )
+        sf_base = (
+            mSF.iterator.toint()
+            + cutlass.Int64(e * m_blocks) * cutlass.Int64(sf_rb_bytes)
+            + cutlass.Int64(
+                (cn * cutlass.Int32(2) + piece // cutlass.Int32(2))
+                * cutlass.Int32(SF_BLK)
+                + row_lo * cutlass.Int32(16)
+            )
+        )
+        # Row 32j + row_lo, chunks 4*piece .. +3; word p of row m lives at word
+        # p ^ (16 * (m // 64) + (m // 32) % 2) -- the chunk moves by 64 B for the upper
+        # 64 rows and the words of a pair swap for odd 32-row groups (the swizzle the
+        # column gather below relies on).
+        row_off = tile_base + row_lo * pitch_bytes
+        amax_e = amax_t[e]
+        _, gds, _ = _global_scale(amax_e)
+        # A NaN or inf global_amax reconstructs to +0, as Triton's tl.where does.
+        valid = _abs_f32(amax_e) < cutlass.Float32(float("inf"))
+        st4 = cute.make_rmem_tensor((4,), cutlass.Uint32)
+
+        # --- epilogue: thread t quantizes output rows 4j .. 4j+3 over blocks 2q, 2q+1 ----
+        q = tidx % cutlass.Int32(4)
+        j = tidx // cutlass.Int32(4)
+        _, dec, enc_over_fp4max = _global_scale(amax_out_t[e])
+        n_glob = cn * cutlass.Int32(M_TILE) + cutlass.Int32(4) * j
+        out_row_bytes = cutlass.Int64(m_blocks * cutlass.Int32(M_TILE // 2))
+        # Output row n_glob of expert e, bytes rb*64 + q*16 .. +15: 16 B aligned (64 B
+        # code rows). Row n_glob + r is r row pitches further.
+        out_base = (
+            mColFP4.iterator.toint()
+            + (cutlass.Int64(e) * cutlass.Int64(N) + cutlass.Int64(n_glob))
+            * out_row_bytes
+            + cutlass.Int64(q * cutlass.Int32(16))
+        )
+        # swizzled SF[r, c] -> [r//128, c//4, r%32, (r%128//32)*4 + c%4] of the expert's
+        # (N//128, M//64, 32, 16) tile; here r = n_glob (+r is the r-th next 16 B line)
+        # and c = rb*8 + 2*q + h, so the atom is 2*rb + q//2 and the two bytes within the
+        # row are 2*(q%2), +1.
+        sf_rows = m_blocks * cutlass.Int32(2 * SF_BLK)  # SF bytes per 128 rows
+        sf_out_base = mColSF.iterator.toint() + cutlass.Int64(
+            (e * (N // cutlass.Int32(M_TILE)) + cn) * sf_rows
+            + (q // cutlass.Int32(2)) * cutlass.Int32(SF_BLK)
+            + ((cutlass.Int32(4) * j) % cutlass.Int32(32)) * cutlass.Int32(16)
+            + ((cutlass.Int32(4) * j) // cutlass.Int32(32)) * cutlass.Int32(4)
+            + (q % cutlass.Int32(2)) * cutlass.Int32(2)
+        )
+        # Column words 2j, 2j+1 of rows 32q .. 32q+31 at their swizzled place: the pair
+        # at 8 B run (8j) ^ 64*(q//2), its two words swapped when q is odd.
+        col_base = (
+            tile_base
+            + q * (pitch_bytes * cutlass.Int32(32))
+            + ((j * cutlass.Int32(8)) ^ ((q // cutlass.Int32(2)) * cutlass.Int32(64)))
+        )
+        word_swap = (q % cutlass.Int32(2)) * cutlass.Int32(4)
+        blk_lo = cute.make_rmem_tensor((16,), cutlass.Float32)
+        blk_hi = cute.make_rmem_tensor((16,), cutlass.Float32)
+        codes = cute.make_rmem_tensor((4, 4), cutlass.Uint32)
+        sfs = cute.make_rmem_tensor((8,), cutlass.Float8E4M3FN)
+
+        for rb in cutlass.range(by, m_blocks, GRID_Y):
+            tile_codes = codes_base + cutlass.Int64(rb) * row_block_bytes
+            rows = []
+            for jr in cutlass.range_constexpr(4):
+                codes_ptr = cute.make_ptr(
+                    cutlass.Uint32,
+                    tile_codes + cutlass.Int64(jr) * row32_bytes,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                rows.append(cute.make_tensor(codes_ptr, cute.make_layout((4,))).load())
+            sf_ptr = cute.make_ptr(
+                cutlass.Uint32,
+                sf_base + cutlass.Int64(rb) * cutlass.Int64(sf_rb_bytes),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            sf_words = cute.make_tensor(sf_ptr, cute.make_layout((4,))).load()
+            for jr in cutlass.range_constexpr(4):
+                sf2 = _e4m3x2_to_f16x2(sf_words[jr] >> sf_shift)
+                sf_even = _f16lo_to_f32(sf2)
+                sf_odd = _f16hi_to_f32(sf2)
+                # Chunk 4*piece + w of row 32jr + row_lo.
+                for w in cutlass.range_constexpr(4):
+                    v0, v1, v2, v3 = _dequant_e2m1x8_bf16x2x4(
+                        rows[jr][w], sf_even if w < 2 else sf_odd, gds
+                    )
+                    if jr % 2 == 1:
+                        v0, v1, v2, v3 = v1, v0, v3, v2
+                    st4[0] = cutlass.Uint32(
+                        cutlass.select_(valid, v0, cutlass.Uint32(0))
+                    )
+                    st4[1] = cutlass.Uint32(
+                        cutlass.select_(valid, v1, cutlass.Uint32(0))
+                    )
+                    st4[2] = cutlass.Uint32(
+                        cutlass.select_(valid, v2, cutlass.Uint32(0))
+                    )
+                    st4[3] = cutlass.Uint32(
+                        cutlass.select_(valid, v3, cutlass.Uint32(0))
+                    )
+                    cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            row_off
+                            + cutlass.Int32(32 * jr) * pitch_bytes
+                            + (
+                                (piece * cutlass.Int32(64) + cutlass.Int32(16 * w))
+                                ^ cutlass.Int32(64 * (jr // 2))
+                            ),
+                            cute.AddressSpace.smem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4,)),
+                    ).store(st4.load())
+            cute.arch.sync_threads()
+
+            # Block 2q + h: rows m = 32q + 16h .. + 15 down column word 2j + a, whose low
+            # and high bf16 are output rows 4j + 2a, +1.
+            for h in cutlass.range_constexpr(2):
+                for a in cutlass.range_constexpr(2):
+                    col = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Uint32,
+                            col_base
+                            + cutlass.Int32(16 * h) * pitch_bytes
+                            + (word_swap if a == 0 else cutlass.Int32(4) - word_swap),
+                            cute.AddressSpace.smem,
+                            assumed_align=4,
+                        ),
+                        cute.make_layout((16,), stride=(REQUANTIZE_PITCH_WORDS,)),
+                    ).load()
+                    for i in cutlass.range_constexpr(16):
+                        blk_lo[i] = _bf16lo_to_f32(col[i])
+                        blk_hi[i] = _bf16hi_to_f32(col[i])
+                    w0, w1, sf_lo = _quant16(blk_lo, enc_over_fp4max, dec)
+                    codes[2 * a, 2 * h] = w0
+                    codes[2 * a, 2 * h + 1] = w1
+                    w0, w1, sf_hi = _quant16(blk_hi, enc_over_fp4max, dec)
+                    codes[2 * a + 1, 2 * h] = w0
+                    codes[2 * a + 1, 2 * h + 1] = w1
+                    sfs[4 * a + h] = sf_lo
+                    sfs[4 * a + 2 + h] = sf_hi
+            out = out_base + cutlass.Int64(rb) * cutlass.Int64(M_TILE // 2)
+            sf_out = sf_out_base + cutlass.Int64(rb * cutlass.Int32(2 * SF_BLK))
+            sf_pairs = cute.recast_tensor(sfs, cutlass.Uint16)
+            for r in cutlass.range_constexpr(4):
+                _st_global_v4_u32(
+                    out + cutlass.Int64(r) * out_row_bytes,
+                    codes[r, 0],
+                    codes[r, 1],
+                    codes[r, 2],
+                    codes[r, 3],
+                )
+                cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Uint16,
+                        sf_out + cutlass.Int64(16 * r),
+                        cute.AddressSpace.gmem,
+                        assumed_align=2,
+                    ),
+                    cute.make_layout((1,)),
+                )[0] = sf_pairs[r]
+            # The tile is reused by the next row block once every column read is done.
+            cute.arch.sync_threads()
+
+
+# Every parameter is required and every caller passes it positionally: an lru_cache key is
+# the literal (args, kwargs) shape (see _compile_fused_kernel).
+@functools.lru_cache(maxsize=None)
+def _compile_requantize_kernel(device_idx):
+    """Compile the columnwise weight requantize with symbolic extents (cached per device).
+
+    The packed inputs and the codes out are flat u32 views with ``assumed_align=16``
+    (64 B code rows, 512 B scale atoms); the scales out the flat e4m3 run of 512 B atoms.
+    N, the per-expert row-block count, the y-grid and E are runtime Int32 args.
+    """
+    free = cute.sym_int
+    fake_codes = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_sf = make_fake_tensor(cutlass.Uint32, (free(),), stride=(1,), assumed_align=16)
+    fake_amax = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    fake_amax_out = make_fake_tensor(cutlass.Float32, (free(),), stride=(1,))
+    fake_cfp4 = make_fake_tensor(
+        cutlass.Uint32, (free(),), stride=(1,), assumed_align=16
+    )
+    fake_csf = make_fake_tensor(cutlass.Float8E4M3FN, (free(),), stride=(1,))
+    return cute.compile(
+        _Requantize(),
+        fake_codes,
+        fake_sf,
+        fake_amax,
+        fake_amax_out,
+        fake_cfp4,
+        fake_csf,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _cutedsl_group_col_cast_requantize_impl(
+    row_fp4_w: torch.Tensor,
+    row_sf_w: torch.Tensor,
+    global_amax: torch.Tensor,
+    amax_w_qdq_t: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-expert columnwise NVFP4 requantization of ``W_qdq.bf16().t()``.
+
+    Operands as ``_cutedsl_group_col_cast_requant_amax_impl`` plus ``amax_w_qdq_t``, that
+    op's ``(E,)`` output. Returns ``(E, N, M//2)`` uint8 codes (a view of the u32 buffer
+    the kernel writes) and ``(E, N//128, M//64, 32, 16)`` float8_e4m3fn swizzled scales.
+    """
+    E, M, packed_N = row_fp4_w.shape
+    N = packed_N * 2
+    dev = row_fp4_w.device
+
+    col_fp4 = torch.empty((E, N, M // 8), dtype=torch.uint32, device=dev)
+    col_sf = torch.empty(
+        (E, N // 128, M // 64, 32, 16), dtype=torch.float8_e4m3fn, device=dev
+    )
+    # An empty stack (E, M or N = 0) passes validation and has nothing to quantize: a
+    # zero grid dimension is a launch error here where the Triton launcher skips it.
+    if row_fp4_w.numel() == 0:
+        return col_fp4.view(torch.uint8), col_sf
+
+    m_blocks = M // M_TILE
+    NUM_SMS = _get_num_sms(dev.index)
+    GRID_Y = min(m_blocks, -(-REQUANTIZE_CTAS_PER_SM * NUM_SMS // (E * (N // M_TILE))))
+    stream = cuda.CUstream(int(torch.cuda.current_stream(dev).cuda_stream))
+
+    requantize = _compile_requantize_kernel(dev.index)
+    requantize(
+        row_fp4_w.view(torch.uint32).view(-1),
+        row_sf_w.view(torch.uint32).view(-1),
+        global_amax,
+        amax_w_qdq_t,
+        col_fp4.view(-1),
+        col_sf.view(-1),
+        int(N),
+        int(m_blocks),
+        int(GRID_Y),
+        int(E),
+        stream,
+    )
+    # uint32 -> uint8 quadruples the last extent: (E, N, M//8) -> (E, N, M//2).
+    return col_fp4.view(torch.uint8), col_sf
+
+
+@dsl_user_op
+def _cvt_e2m1x8_to_bf16x2x4(word: cutlass.Uint32, *, loc=None, ip=None):
+    """``FAST_PATH`` decode of one packed-FP4 word to four packed bf16x2 words, word k =
+    elements ``2k`` (low half) and ``2k + 1`` (high half): one ``cvt.rn.bf16x2.e2m1x2``
+    per byte (PTX ISA 9.2; the DSL emits 9.4). Every E2M1 value is exact in bf16, so this
+    is ``_cvt_e2m1x8_to_f32`` without its eight f16 -> f32 widenings, for a consumer that
+    reads bf16 halves in place (``_dot16_e_q_bf16``). Multi-output form as that helper.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [word.ir_value(loc=loc, ip=ip)],
+        (
+            "{\n"
+            ".reg .b8 b0, b1, b2, b3;\n"
+            "mov.b32 {b0, b1, b2, b3}, $4;\n"
+            "cvt.rn.bf16x2.e2m1x2 $0, b0;\n"
+            "cvt.rn.bf16x2.e2m1x2 $1, b1;\n"
+            "cvt.rn.bf16x2.e2m1x2 $2, b2;\n"
+            "cvt.rn.bf16x2.e2m1x2 $3, b3;\n"
+            "}"
+        ),
+        "=r,=r,=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple(
+        cutlass.Uint32(llvm.extractvalue(T.i32(), rst, [k], loc=loc, ip=ip))
+        for k in range(4)
+    )
+
+
+@dsl_user_op
+def _dot16_e_q_bf16(
+    e0: cutlass.Float32,
+    e1: cutlass.Float32,
+    e2: cutlass.Float32,
+    e3: cutlass.Float32,
+    e4: cutlass.Float32,
+    e5: cutlass.Float32,
+    e6: cutlass.Float32,
+    e7: cutlass.Float32,
+    e8: cutlass.Float32,
+    e9: cutlass.Float32,
+    e10: cutlass.Float32,
+    e11: cutlass.Float32,
+    e12: cutlass.Float32,
+    e13: cutlass.Float32,
+    e14: cutlass.Float32,
+    e15: cutlass.Float32,
+    q0: cutlass.Uint32,
+    q1: cutlass.Uint32,
+    q2: cutlass.Uint32,
+    q3: cutlass.Uint32,
+    q4: cutlass.Uint32,
+    q5: cutlass.Uint32,
+    q6: cutlass.Uint32,
+    q7: cutlass.Uint32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """``FAST_PATH`` mixed-precision ``<e, q>`` of a 1x16 block: sixteen ``fma.rn.f32.bf16``
+    (one ``FHFMA.BF16`` each) taking ``e_k`` as the bf16 in the HIGH half of its widened f32
+    word (what ``_bf16round_f32x8`` produces; the low half is zero) and ``q_k`` as a half of
+    the packed bf16x2 words of ``_cvt_e2m1x8_to_bf16x2x4``, accumulated in f32 down two
+    chains (even and odd k, 8 deep) that are returned unsummed, as ``_dot16_chain_fast``.
+    Each product is exact (8 x 3 significant bits fit f32), so versus ``<v, q>`` with
+    ``v = RN(e * enc)`` the only differences are the missing per-term rounding and the
+    summation order: ``<e, q> * enc`` moves the corrected scale by float rounding only.
+    The one exception is range: ``<e, q>`` on the unscaled ``e`` overflows to inf where
+    ``<v, q>`` stays finite once a block's sum of |e| x |q| (both chains added) reaches
+    2^128, from |e| ~ 2^128 / 96 (about 3.5e36) for sixteen saturated codes; the fast
+    select (``_ms_eden_corr_fast``) treats the zero ratio ``rcp.approx.ftz`` makes of it
+    as the undefined case.
+    """
+    rst = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [
+            e0.ir_value(loc=loc, ip=ip),
+            e1.ir_value(loc=loc, ip=ip),
+            e2.ir_value(loc=loc, ip=ip),
+            e3.ir_value(loc=loc, ip=ip),
+            e4.ir_value(loc=loc, ip=ip),
+            e5.ir_value(loc=loc, ip=ip),
+            e6.ir_value(loc=loc, ip=ip),
+            e7.ir_value(loc=loc, ip=ip),
+            e8.ir_value(loc=loc, ip=ip),
+            e9.ir_value(loc=loc, ip=ip),
+            e10.ir_value(loc=loc, ip=ip),
+            e11.ir_value(loc=loc, ip=ip),
+            e12.ir_value(loc=loc, ip=ip),
+            e13.ir_value(loc=loc, ip=ip),
+            e14.ir_value(loc=loc, ip=ip),
+            e15.ir_value(loc=loc, ip=ip),
+            q0.ir_value(loc=loc, ip=ip),
+            q1.ir_value(loc=loc, ip=ip),
+            q2.ir_value(loc=loc, ip=ip),
+            q3.ir_value(loc=loc, ip=ip),
+            q4.ir_value(loc=loc, ip=ip),
+            q5.ir_value(loc=loc, ip=ip),
+            q6.ir_value(loc=loc, ip=ip),
+            q7.ir_value(loc=loc, ip=ip),
+        ],
+        (
+            "{\n"
+            ".reg .b16 t, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;\n"
+            ".reg .b16 l0, u0, l1, u1, l2, u2, l3, u3, l4, u4, l5, u5, l6, u6, l7, u7;\n"
+            "mov.b32 {t, h0}, $2;\n"
+            "mov.b32 {t, h1}, $3;\n"
+            "mov.b32 {t, h2}, $4;\n"
+            "mov.b32 {t, h3}, $5;\n"
+            "mov.b32 {t, h4}, $6;\n"
+            "mov.b32 {t, h5}, $7;\n"
+            "mov.b32 {t, h6}, $8;\n"
+            "mov.b32 {t, h7}, $9;\n"
+            "mov.b32 {t, h8}, $10;\n"
+            "mov.b32 {t, h9}, $11;\n"
+            "mov.b32 {t, h10}, $12;\n"
+            "mov.b32 {t, h11}, $13;\n"
+            "mov.b32 {t, h12}, $14;\n"
+            "mov.b32 {t, h13}, $15;\n"
+            "mov.b32 {t, h14}, $16;\n"
+            "mov.b32 {t, h15}, $17;\n"
+            "mov.b32 {l0, u0}, $18;\n"
+            "mov.b32 {l1, u1}, $19;\n"
+            "mov.b32 {l2, u2}, $20;\n"
+            "mov.b32 {l3, u3}, $21;\n"
+            "mov.b32 {l4, u4}, $22;\n"
+            "mov.b32 {l5, u5}, $23;\n"
+            "mov.b32 {l6, u6}, $24;\n"
+            "mov.b32 {l7, u7}, $25;\n"
+            "mov.f32 $0, 0f00000000;\n"
+            "mov.f32 $1, 0f00000000;\n"
+            "fma.rn.f32.bf16 $0, h0, l0, $0;\n"
+            "fma.rn.f32.bf16 $1, h1, u0, $1;\n"
+            "fma.rn.f32.bf16 $0, h2, l1, $0;\n"
+            "fma.rn.f32.bf16 $1, h3, u1, $1;\n"
+            "fma.rn.f32.bf16 $0, h4, l2, $0;\n"
+            "fma.rn.f32.bf16 $1, h5, u2, $1;\n"
+            "fma.rn.f32.bf16 $0, h6, l3, $0;\n"
+            "fma.rn.f32.bf16 $1, h7, u3, $1;\n"
+            "fma.rn.f32.bf16 $0, h8, l4, $0;\n"
+            "fma.rn.f32.bf16 $1, h9, u4, $1;\n"
+            "fma.rn.f32.bf16 $0, h10, l5, $0;\n"
+            "fma.rn.f32.bf16 $1, h11, u5, $1;\n"
+            "fma.rn.f32.bf16 $0, h12, l6, $0;\n"
+            "fma.rn.f32.bf16 $1, h13, u6, $1;\n"
+            "fma.rn.f32.bf16 $0, h14, l7, $0;\n"
+            "fma.rn.f32.bf16 $1, h15, u7, $1;\n"
+            "}"
+        ),
+        "=f,=f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,r,r,r,r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [0], loc=loc, ip=ip)),
+        cutlass.Float32(llvm.extractvalue(T.f32(), rst, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _rcp_approx_f32(b: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """``FAST_PATH`` scheduling twin of ``_div_approx_f32``: its first SASS instruction, the
+    lone ``MUFU.RCP``. ``div.approx.ftz.f32 d, a, b`` is defined as ``a * rcp.approx.ftz(b)``
+    and ptxas emits exactly ``MUFU.RCP`` + ``FMUL.FTZ`` for it, so the pair
+    ``_mul_ftz_f32(a, _rcp_approx_f32(b))`` is the same two instructions on the same operands
+    -- written apart only so the scheduler may place work between them."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [b.ir_value(loc=loc, ip=ip)],
+            "rcp.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _mul_ftz_f32(
+    a: cutlass.Float32, b: cutlass.Float32, *, loc=None, ip=None
+) -> cutlass.Float32:
+    """``FAST_PATH`` scheduling twin of ``_div_approx_f32``: its second SASS instruction, the
+    ``FMUL.FTZ`` that multiplies the numerator by ``_rcp_approx_f32``'s reciprocal."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+            "mul.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )

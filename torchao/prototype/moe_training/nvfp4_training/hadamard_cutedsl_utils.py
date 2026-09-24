@@ -102,6 +102,9 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
     from ._cutedsl_kernels_impl import (
         _compile_amax_tc_kernel,
         _compile_fused_kernel,
+        _compile_requant_amax_kernel,
+        _compile_requantize_kernel,
+        _compile_row_cast_quantize_kernel,
         _get_identity_buffer,
         _get_rht_buffer,
         _get_sr_rng_buffer,
@@ -132,14 +135,41 @@ def cutedsl_prepare_for_cuda_graph(device, *, sign_vectors=None) -> None:
                 _compile_fused_kernel(idx, True, sr, True, False, col_groups, fast_math)
         for grouped in (False, True):
             _compile_fused_kernel(idx, True, False, False, grouped, col_groups, False)
+    # The rowwise 1x16 weight cast has no flags: one compile.
+    _compile_row_cast_quantize_kernel(idx)
+    # Nor does the requant amax of the packed weight it wrote: one compile.
+    _compile_requant_amax_kernel(idx)
+    # Nor the columnwise requantize that consumes that amax: one compile.
+    _compile_requantize_kernel(idx)
 
     # Same for the grouped (per-expert MoE) kernels, which tile at 128 rows already.
     from ._cutedsl_group_kernels_impl import (
         _compile_group_amax_kernel,
+        _compile_group_col_rht_requant_amax_kernel,
+        _compile_group_col_rht_requantize_kernel,
         _compile_group_fused_kernel,
+        _compile_group_row_cast_col_rht_amax_kernel,
+        _compile_group_row_cast_col_rht_quantize_kernel,
+        _compile_group_row_rht_col_rht_amax_kernel,
+        _compile_group_row_rht_col_rht_quantize_ms_eden_kernel,
+        _get_group_amax_reduce_buffers,
     )
+    from .hadamard_utils import _device_key, get_hadamard_matrix
 
     _compile_group_amax_kernel(idx)
     for sr in (False, True):
         for fast_math in (False, True):
             _compile_group_fused_kernel(idx, sr, fast_math)
+    # The V2 gradient amax validates against the cached Hadamard and reduces across CTAs
+    # through persistent per-device buffers; warm both, so neither the compile nor H128
+    # nor the reduction state lands in the graph pool.
+    _compile_group_row_rht_col_rht_amax_kernel(idx)
+    _get_group_amax_reduce_buffers(idx)
+    for fast_path in (False, True):
+        _compile_group_row_rht_col_rht_quantize_ms_eden_kernel(idx, fast_path)
+    _compile_group_col_rht_requant_amax_kernel(idx)
+    _compile_group_col_rht_requantize_kernel(idx)
+    _compile_group_row_cast_col_rht_amax_kernel(idx)
+    for fast_math in (False, True):
+        _compile_group_row_cast_col_rht_quantize_kernel(idx, fast_math)
+    get_hadamard_matrix(128, _device_key(dev), torch.bfloat16)

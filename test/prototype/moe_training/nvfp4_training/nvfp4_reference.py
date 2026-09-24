@@ -100,6 +100,7 @@ __all__ = [
     "reference_row_rht_col_rht_amax",
     "global_encode_scale",
     "nvfp4_reference_quantize",
+    "pack_fp4_stochastic",
     "reference_group_rht_amax",
     "reference_group_rht_quantize_row_col",
     "reference_group_weight_quantize_2d",
@@ -504,6 +505,23 @@ def decode_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
     nibbles = torch.stack((lo, hi), dim=-1).reshape(codes.shape[0], -1).long()
     magnitude = lut[nibbles & 0x7]
     return torch.where(nibbles & 0x8 != 0, -magnitude, magnitude)
+
+
+def pack_fp4_stochastic(
+    scaled: torch.Tensor, generator: torch.Generator
+) -> torch.Tensor:
+    """``pack_fp4`` with per-element stochastic rounding: each element lands on the E2M1
+    neighbour above its (clamped) magnitude with probability equal to its fractional
+    position between the two neighbours, so ``E[decode] == clamp(scaled)`` element by
+    element. The textbook unbiased NVFP4 quantizer, for comparison against MS-EDEN.
+    """
+    grid = torch.tensor(_FP4_MAGNITUDES, dtype=torch.float32, device=scaled.device)
+    magnitude = scaled.abs().clamp(max=FP4_E2M1_MAX)
+    upper = torch.bucketize(magnitude, grid, right=True).clamp(max=7)
+    lo, hi = grid[upper - 1], grid[upper]
+    u = torch.rand(magnitude.shape, generator=generator, device=scaled.device)
+    up = u * (hi - lo) < magnitude - lo
+    return pack_fp4(torch.where(up, hi, lo).copysign(scaled))
 
 
 def reference_dequantize_rowwise(

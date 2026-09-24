@@ -157,6 +157,33 @@ def test_cutedsl_weight_quantize_2d_matches_triton(M, N):
         assert torch.equal(c, t), f"{name} differs between backends"
 
 
+@_skip_no_triton
+@_skip_no_cutedsl
+@pytest.mark.parametrize("M", [128, 256], ids=lambda m: f"M{m}")
+@torch.no_grad()
+def test_cutedsl_weight_quantize_2d_matches_triton_on_nan_blocks(M):
+    """A NaN is dropped from its 16x16 block's amax on both backends (Triton's ``tl.max``
+    is IEEE maxNum), so the finite neighbours keep their scale and only an all-NaN block
+    scales as NaN; the NaN itself encodes as +6 either way. A finite global amax, since
+    the NaN-propagating tensor amax would hide the block."""
+    N = 256
+    torch.manual_seed(3)
+    W = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    nan = float("nan")
+    W[0, 0] = nan
+    W[31, 31] = nan
+    W[64, 100:103] = nan
+    W[16:32, 16:32] = nan  # an all-NaN block
+    W[-1, -1] = float("inf")
+    amax = torch.nan_to_num(W.float(), 0.0, 0.0, 0.0).abs().max()
+    cutedsl = _weight_quantize_2d("cutedsl", W, amax)
+    triton_out = _weight_quantize_2d("triton", W, amax)
+    for name, c, t in zip(("q", "sf", "qt", "sft"), cutedsl, triton_out):
+        assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
+            f"{name} differs between backends"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tests — quantization quality (SQNR) and output contract
 # ---------------------------------------------------------------------------
