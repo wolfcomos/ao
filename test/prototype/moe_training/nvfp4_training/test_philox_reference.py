@@ -6,7 +6,7 @@
 
 import torch
 
-from .nvfp4_reference import philox4x32
+from .nvfp4_v2_reference import philox4x32
 
 
 def test_philox4x32_zero_known_answer():

@@ -12,7 +12,7 @@ assembly separate from the quantization math makes per-expert addressing testabl
 
 import torch
 
-from .nvfp4_reference import (
+from .nvfp4_v2_reference import (
     reference_group_col_cast_requant_amax,
     reference_group_col_cast_requantize,
     reference_group_col_rht_requant_amax,

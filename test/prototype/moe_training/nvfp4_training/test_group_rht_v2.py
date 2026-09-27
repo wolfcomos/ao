@@ -20,7 +20,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 )
 from torchao.prototype.mx_formats.utils import from_blocked
 
-from .nvfp4_reference import (
+from .nvfp4_v2_reference import (
     from_blocked_grouped,
     reference_group_row_cast_col_rht_amax,
     reference_group_row_cast_col_rht_quantize,
@@ -134,7 +134,7 @@ def test_dynamic_fast_math_reconstruction_sqnr(sizes, hidden):
     """
     from torchao.quantization.utils import compute_error
 
-    from .nvfp4_reference import reference_dequantize_rowwise
+    from .nvfp4_v2_reference import reference_dequantize_rowwise
 
     x, offs, signs = _case(sizes, hidden, 0)
     args = (x, [], offs, len(sizes), x.shape[0], hidden, 1)

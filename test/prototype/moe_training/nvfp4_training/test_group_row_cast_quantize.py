@@ -27,7 +27,10 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 from ._assertions import assert_codes_bitwise, assert_scales_bitwise
 from ._v2_marks import maybe_sm100 as _maybe_sm100
 from ._v2_reference_ops import reference_row_cast_op, reference_weight_amax
-from .nvfp4_reference import reference_row_cast_quantize, reference_weight_quantize_2d
+from .nvfp4_v2_reference import (
+    reference_row_cast_quantize,
+    reference_weight_quantize_2d,
+)
 
 _needs_kernel = _maybe_sm100
 

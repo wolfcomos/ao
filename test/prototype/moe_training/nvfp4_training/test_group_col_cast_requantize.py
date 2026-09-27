@@ -33,7 +33,7 @@ from ._v2_reference_ops import (
     reference_row_cast_op,
     reference_weight_amax,
 )
-from .nvfp4_reference import (
+from .nvfp4_v2_reference import (
     reference_col_cast_requant_amax,
     reference_dequantize_rowwise,
     reference_group_col_cast_requant_amax,

@@ -33,7 +33,7 @@ from ._v2_reference_ops import (
     reference_row_cast_op,
     reference_weight_amax,
 )
-from .nvfp4_reference import (
+from .nvfp4_v2_reference import (
     reference_col_rht_requant_amax,
     reference_group_col_rht_requant_amax,
     reference_group_col_rht_requantize,
@@ -144,7 +144,7 @@ def test_amax_is_computed_from_the_quantized_weight(kernel):
     once the rotation is involved, because ``W`` and ``W_qdq`` differ per element even
     though their maxima coincide (see the note in the unrotated twin's test file).
     """
-    from .nvfp4_reference import reference_dynamic_rht
+    from .nvfp4_v2_reference import reference_dynamic_rht
 
     W, codes, scales, amax = _packed_weights(1, 256, 512)
     d = _signs()
@@ -218,7 +218,7 @@ def test_decode_numerator_is_2688_not_1536(kernel):
     with the MS-EDEN numerator must disagree, so the test is sensitive to the mistake
     the design doc calls out as "backward off by roughly 40%".
     """
-    from .nvfp4_reference import EDEN_BLOCK_SCALE_MAX, reference_dequantize_rowwise
+    from .nvfp4_v2_reference import EDEN_BLOCK_SCALE_MAX, reference_dequantize_rowwise
 
     _, codes, scales, amax = _packed_weights(1, 256, 512)
     d = _signs()

@@ -33,7 +33,7 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 from ._assertions import assert_codes_bitwise, assert_scales_adjacent
 from ._v2_marks import CUTEDSL_AVAILABLE, maybe_sm100, requires_cutedsl
 from ._v2_reference_ops import reference_dual_amax_op, reference_ms_eden_op
-from .nvfp4_reference import (
+from .nvfp4_v2_reference import (
     reference_group_row_rht_col_rht_amax,
     reference_row_rht_col_rht_amax,
 )
@@ -415,7 +415,7 @@ def test_ms_eden_is_unbiased(kernel):
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         reference_dequantize_rowwise,
         reference_dynamic_rht,
@@ -470,7 +470,7 @@ def test_codes_are_rtne_from_the_pre_correction_scale(kernel):
     every other test in this file. It also pins the whole deterministic chain at once:
     RHT-128, the 256 ceiling, the block amax, the TE scale chain, RTNE and the packing.
     """
-    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+    from .nvfp4_v2_reference import reference_dynamic_rht, reference_ms_eden
 
     M, N = 256, 512
     dy, offs = _packed([M], N, seed=2)
@@ -551,7 +551,7 @@ def test_multi_group_matches_the_reference(kernel, group_sizes):
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         from_blocked_grouped,
         reference_group_row_rht_col_rht_quantize_ms_eden,
     )
@@ -666,7 +666,7 @@ def test_fast_path_scales_are_neighbours_of_the_default_path(group_sizes):
     held to the same one-step band as in ``test_multi_group_matches_the_reference``."""
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         from_blocked_grouped,
         reference_group_row_rht_col_rht_quantize_ms_eden,
     )
@@ -720,7 +720,7 @@ def test_fast_path_rounds_up_with_the_fractional_position():
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+    from .nvfp4_v2_reference import reference_dynamic_rht, reference_ms_eden
 
     M = N = 4096
     dy, offs = _packed([M], N, seed=7)
@@ -805,7 +805,7 @@ def test_fast_path_is_unbiased():
     the bound)."""
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         reference_dequantize_rowwise,
         reference_dynamic_rht,
@@ -893,7 +893,7 @@ def test_ms_eden_keeps_rn_error_and_sr_unbiasedness(kernel):
     half of itself and would put MS-EDEN above SR). The table and the reference line
     under it are what ``pytest -s`` prints.
     """
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         FP4_E2M1_MAX,
         decode_fp4_codes,
@@ -1041,7 +1041,7 @@ def test_fast_path_sqnr_matches_the_default_path(group_sizes, hidden):
     from torchao.prototype.mx_formats.utils import from_blocked
 
     from ._assertions import assert_zero_quantized
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         from_blocked_grouped,
         reference_dequantize_rowwise,
