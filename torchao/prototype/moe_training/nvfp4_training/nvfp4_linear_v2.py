@@ -40,23 +40,12 @@ from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_cut
     cutedsl_group_col_cast_requant_amax,
     cutedsl_group_col_cast_requantize,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_triton import (
-    triton_group_col_cast_requant_amax,
-    triton_group_col_cast_requantize,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_cutedsl import (
     cutedsl_group_col_rht_requant_amax,
     cutedsl_group_col_rht_requantize,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_triton import (
-    triton_group_col_rht_requant_amax,
-    triton_group_col_rht_requantize,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
     cutedsl_group_rht_amax,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton import (
-    triton_group_rht_amax,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     VARYING_FIRST_DIM,
@@ -64,37 +53,20 @@ from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
 from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
     cutedsl_group_rht_quantize_row_col,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
-    triton_group_rht_quantize_row_col,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
     cutedsl_group_row_cast_quantize,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
-    triton_group_row_cast_quantize,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_cutedsl import (
     cutedsl_group_row_rht_col_rht_amax,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_triton import (
-    triton_group_row_rht_col_rht_amax,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_cutedsl import (
     cutedsl_group_row_rht_col_rht_quantize_ms_eden,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_triton import (
-    triton_group_row_rht_col_rht_quantize_ms_eden,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_weight_amax_triton import (
-    triton_group_weight_amax,
-)
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
-    _resolve_use_cutedsl,
 )
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
     EDEN_NUMERATOR,
     NVFP4_CAST_NUMERATOR,
     _amax_to_scale,
+    _require_cutedsl,
 )
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
@@ -169,12 +141,8 @@ def _quantize_weight_rowwise(weight: torch.Tensor, use_cutedsl: bool):
     churn. Only the GEMM needs a 2D view, and it takes one at the call site.
     """
     weight_3d = weight.unsqueeze(0)
-    amax_w = triton_group_weight_amax(weight_3d, 1)
-    group_row_cast_quantize = (
-        cutedsl_group_row_cast_quantize
-        if use_cutedsl
-        else triton_group_row_cast_quantize
-    )
+    amax_w = weight_3d.float().abs().amax(dim=(-2, -1))
+    group_row_cast_quantize = cutedsl_group_row_cast_quantize
     row_fp4_w, row_sf_w = group_row_cast_quantize(weight_3d, amax_w, 1)
     return row_fp4_w, row_sf_w, amax_w
 
@@ -217,10 +185,12 @@ class _NVFP4LinearV2(torch.autograd.Function):
         wgrad_rht: torch.Tensor,
         dgrad_rht: torch.Tensor,
         sr_seed: torch.Tensor,
-        use_cutedsl: bool = False,
+        use_cutedsl: bool = True,
         use_fast_math: bool = True,
         ms_eden_fast_path: bool = False,
     ):
+        if not use_cutedsl:
+            raise ValueError("NVFP4 V2 and V1_REQUANT require CuTeDSL")
         M = input_hp.shape[-2]
         K = input_hp.shape[-1]
         N = weight_hp.shape[0]
@@ -230,14 +200,8 @@ class _NVFP4LinearV2(torch.autograd.Function):
         input_2d = input_hp.reshape(-1, K).contiguous()
         M = input_2d.shape[0]
         offsets = _degenerate_group_args(M, str(input_2d.device))
-        group_rht_amax = (
-            cutedsl_group_rht_amax if use_cutedsl else triton_group_rht_amax
-        )
-        group_rht_quantize_row_col = (
-            cutedsl_group_rht_quantize_row_col
-            if use_cutedsl
-            else triton_group_rht_quantize_row_col
-        )
+        group_rht_amax = cutedsl_group_rht_amax
+        group_rht_quantize_row_col = cutedsl_group_rht_quantize_row_col
 
         # §11.8 then §11.9: amax first so the columnwise bound is taken post-RHT.
         # Same ops as V1_REQUANT below, driven at RHT-128 with a resampled sign
@@ -332,29 +296,13 @@ class _NVFP4LinearV2(torch.autograd.Function):
         dy_2d = grad_output.reshape(-1, N)
         M = dy_2d.shape[0]
         offsets = _degenerate_group_args(M, str(dy_2d.device))
-        group_row_rht_col_rht_amax = (
-            cutedsl_group_row_rht_col_rht_amax
-            if ctx.use_cutedsl
-            else triton_group_row_rht_col_rht_amax
+        group_row_rht_col_rht_amax = cutedsl_group_row_rht_col_rht_amax
+        group_row_rht_col_rht_quantize_ms_eden = partial(
+            cutedsl_group_row_rht_col_rht_quantize_ms_eden,
+            fast_path=ctx.ms_eden_fast_path,
         )
-        group_row_rht_col_rht_quantize_ms_eden = (
-            partial(
-                cutedsl_group_row_rht_col_rht_quantize_ms_eden,
-                fast_path=ctx.ms_eden_fast_path,
-            )
-            if ctx.use_cutedsl
-            else triton_group_row_rht_col_rht_quantize_ms_eden
-        )
-        group_col_rht_requant_amax = (
-            cutedsl_group_col_rht_requant_amax
-            if ctx.use_cutedsl
-            else triton_group_col_rht_requant_amax
-        )
-        group_col_rht_requantize = (
-            cutedsl_group_col_rht_requantize
-            if ctx.use_cutedsl
-            else triton_group_col_rht_requantize
-        )
+        group_col_rht_requant_amax = cutedsl_group_col_rht_requant_amax
+        group_col_rht_requantize = cutedsl_group_col_rht_requantize
 
         # §11.2 -> §11.3. dgrad_rht rotates the row axis, wgrad_rht the transposed
         # one; swapping them is silent and yields a wrong gradient.
@@ -445,10 +393,12 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         sign_vector: tuple,
         sr_seed: torch.Tensor,
-        use_cutedsl: bool = False,
+        use_cutedsl: bool = True,
         use_fast_math: bool = True,
     ):
         sign_vector = tuple(sign_vector)
+        if not use_cutedsl:
+            raise ValueError("NVFP4 V2 and V1_REQUANT require CuTeDSL")
         M = input_hp.shape[-2]
         K = input_hp.shape[-1]
         N = weight_hp.shape[0]
@@ -459,14 +409,8 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         M = input_2d.shape[0]
         offsets = _degenerate_group_args(M, str(input_2d.device))
         sv = list(sign_vector)
-        group_rht_amax = (
-            cutedsl_group_rht_amax if use_cutedsl else triton_group_rht_amax
-        )
-        group_rht_quantize_row_col = (
-            cutedsl_group_rht_quantize_row_col
-            if use_cutedsl
-            else triton_group_rht_quantize_row_col
-        )
+        group_rht_amax = cutedsl_group_rht_amax
+        group_rht_quantize_row_col = cutedsl_group_rht_quantize_row_col
 
         amax_rht_x_t, amax_x = group_rht_amax(
             input_2d,
@@ -546,24 +490,10 @@ class _NVFP4LinearV1Requant(torch.autograd.Function):
         M = dy_2d.shape[0]
         offsets = _degenerate_group_args(M, str(dy_2d.device))
         sv = list(ctx.sign_vector)
-        group_rht_amax = (
-            cutedsl_group_rht_amax if ctx.use_cutedsl else triton_group_rht_amax
-        )
-        group_rht_quantize_row_col = (
-            cutedsl_group_rht_quantize_row_col
-            if ctx.use_cutedsl
-            else triton_group_rht_quantize_row_col
-        )
-        group_col_cast_requant_amax = (
-            cutedsl_group_col_cast_requant_amax
-            if ctx.use_cutedsl
-            else triton_group_col_cast_requant_amax
-        )
-        group_col_cast_requantize = (
-            cutedsl_group_col_cast_requantize
-            if ctx.use_cutedsl
-            else triton_group_col_cast_requantize
-        )
+        group_rht_amax = cutedsl_group_rht_amax
+        group_rht_quantize_row_col = cutedsl_group_rht_quantize_row_col
+        group_col_cast_requant_amax = cutedsl_group_col_cast_requant_amax
+        group_col_cast_requantize = cutedsl_group_col_cast_requantize
 
         amax_rht_dy_t, amax_dy = group_rht_amax(
             dy_2d,
@@ -653,27 +583,18 @@ def nvfp4_linear_v2(
         wgrad_rht: ``(128,)`` int8 sign buffer, resampled per accumulation microbatch.
         dgrad_rht: ``(128,)`` int8 sign buffer, resampled per optimizer step.
         sr_seed: one-element int64 CUDA tensor, the Philox key for MS-EDEN.
-        kernel_preference: Backend for the quantize and amax ops, AUTO (default),
-            TRITON, or CUTEDSL. AUTO takes CuteDSL when the runtime allows and falls
-            back to Triton otherwise; CUTEDSL is the same choice made loudly, raising
-            rather than falling back. The weight amax is Triton on every path -- it
-            has no CuteDSL twin.
+        kernel_preference: AUTO and CUTEDSL require CuTeDSL. Explicit TRITON
+            is unsupported. Raw weight amax uses a native PyTorch reduction;
+            all quantization and RHT operators use CuTeDSL.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
-        ms_eden_fast_path: round the MS-EDEN scales of the backward in hardware
-            (``cvt.rs``) rather than in software. The FP4 codes are bitwise with the
-            default path and with Triton; each scale byte lands on one of the two E4M3
-            neighbours of the same corrected scale, so the step is not bitwise with
-            Triton. CuteDSL only: raises if the MS-EDEN op resolves to Triton.
+        ms_eden_fast_path: use hardware stochastic rounding for corrected
+            MS-EDEN scales. FP4 codes agree with the software path; scale bytes
+            use a different Philox mapping and need not agree bitwise.
 
     Both sign buffers must be the module-owned tensors that
     ``resample_nvfp4_rht_signs`` updates in place, not fresh allocations.
     """
-    use_cutedsl = _resolve_use_cutedsl(kernel_preference)
-    if ms_eden_fast_path and not use_cutedsl:
-        raise ValueError(
-            "ms_eden_fast_path=True requires the MS-EDEN op on CuteDSL; this call "
-            "resolves it to Triton"
-        )
+    use_cutedsl = _require_cutedsl(kernel_preference)
     return _NVFP4LinearV2.apply(
         input_hp,
         weight_hp,
@@ -706,14 +627,12 @@ def nvfp4_linear_v1_requant(
         sign_vector: static 16-element {-1, +1} tuple. Fixed for the whole run, so it
             resolves through the sign-keyed ``get_rht_matrix`` cache -- one entry.
         sr_seed: one-element int64 CUDA tensor, the Philox key for stochastic rounding.
-        kernel_preference: Backend for the quantize and amax ops, AUTO (default),
-            TRITON, or CUTEDSL. AUTO takes CuteDSL when the runtime allows and falls
-            back to Triton otherwise; CUTEDSL is the same choice made loudly, raising
-            rather than falling back. The weight amax is Triton on every path -- it
-            has no CuteDSL twin.
+        kernel_preference: AUTO and CUTEDSL require CuTeDSL. Explicit TRITON
+            is unsupported. Raw weight amax uses a native PyTorch reduction;
+            all quantization and RHT operators use CuTeDSL.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
     """
-    use_cutedsl = _resolve_use_cutedsl(kernel_preference)
+    use_cutedsl = _require_cutedsl(kernel_preference)
     return _NVFP4LinearV1Requant.apply(
         input_hp,
         weight_hp,

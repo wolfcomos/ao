@@ -116,7 +116,9 @@ class NVFP4TrainingConfig(AOBaseConfig):
                 resampling buys.
 
             V1_REQUANT and V2 are single-GPU only for now: ``process_group`` raises.
-        kernel_preference: Backend for quantization kernels.
+        kernel_preference: Backend for quantization kernels. V2 and V1_REQUANT
+            require AUTO or CUTEDSL and the CuTeDSL runtime; their raw weight
+            amax uses PyTorch. The following backend choices apply to V1.
             AUTO: CuteDSL where its runtime allows, Triton otherwise. Both backends
                 accept the same shapes, on the tensor-parallel path as on the single-GPU
                 one, so the choice is availability alone and there is nothing for AUTO

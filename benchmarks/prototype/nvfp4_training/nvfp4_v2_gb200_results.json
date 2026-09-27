@@ -1,0 +1,64 @@
+{
+  "measured_at": "2026-09-27",
+  "source_commit": "d822c848422a651b30e49293cb6b85f84178f8c5",
+  "device": "NVIDIA GB200",
+  "experts": 4,
+  "torch": "2.14.0a0+b2c75dd062.nvinternal.rubin",
+  "cuda": "13.5",
+  "cutedsl": "4.8.0.dev0+20260825235843.64aba46",
+  "metric": "CUDA kernel self-time per call, excludes copies, memsets and host overhead",
+  "passes": 3,
+  "warmup": 15,
+  "iters": 50,
+  "active_sm_clock_median_mhz": 2062,
+  "records": [
+    {
+      "model": "16B",
+      "projection": "down (w2)",
+      "triton_us": 272.64816000000013,
+      "default_us": 102.43034000000002,
+      "fast_us": 78.12178,
+      "default_vs_triton": 2.661791027931764,
+      "fast_vs_triton": 3.4900402935007384,
+      "fast_vs_default": 1.3111623928691847,
+      "fast_latency_reduction_pct": 23.731796653218183,
+      "triton_baseline_difference_pct": -0.19413298076184082
+    },
+    {
+      "model": "16B",
+      "projection": "gate/up (w1/w3)",
+      "triton_us": 195.82096,
+      "default_us": 73.14633999999998,
+      "fast_us": 56.62433999999995,
+      "default_vs_triton": 2.677112210945894,
+      "fast_vs_triton": 3.458247107162754,
+      "fast_vs_default": 1.2917826503584864,
+      "fast_latency_reduction_pct": 22.58759631719104,
+      "triton_baseline_difference_pct": -0.13234538325215262
+    },
+    {
+      "model": "671B",
+      "projection": "down (w2)",
+      "triton_us": 2353.1143799999995,
+      "default_us": 863.2031999999999,
+      "fast_us": 621.4053400000005,
+      "default_vs_triton": 2.726026015658885,
+      "fast_vs_triton": 3.7867624053568605,
+      "fast_vs_default": 1.389114551220302,
+      "fast_latency_reduction_pct": 28.011696434860234,
+      "triton_baseline_difference_pct": -0.05885646748717832
+    },
+    {
+      "model": "671B",
+      "projection": "gate/up (w1/w3)",
+      "triton_us": 684.9479800000005,
+      "default_us": 253.55117999999996,
+      "fast_us": 184.29717999999997,
+      "default_vs_triton": 2.7014190192291774,
+      "fast_vs_triton": 3.71654075227847,
+      "fast_vs_default": 1.37577351970334,
+      "fast_latency_reduction_pct": 27.313617708267024,
+      "triton_baseline_difference_pct": -0.01224910539929791
+    }
+  ]
+}

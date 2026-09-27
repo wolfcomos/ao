@@ -6,12 +6,7 @@
 
 """CuteDSL grouped rotated columnwise weight requantization (SM100+).
 
-Drop-in backends for ``triton_group_col_rht_requant_amax`` (§11.4) and
-``triton_group_col_rht_requantize`` (§11.5): same signatures, same returns. Both
-kernels rebuild the dequantized weight tile on chip from the rowwise codes and
-scales, rotate its transpose by ``R_n`` through one tcgen05 chain and share that
-producer, as the Triton twins share ``_load_rht_requant_weight_tile``; see
-``_cutedsl_group_kernels_impl``.
+See the public operator docstrings for tensor layouts and rounding contracts.
 """
 
 from typing import Tuple
@@ -54,10 +49,10 @@ def cutedsl_group_col_rht_requant_amax(
 ) -> torch.Tensor:
     """Per-expert amax of the rotated dequantized forward weight transpose (CuteDSL, SM100+).
 
-    Signature and returns match ``triton_group_col_rht_requant_amax``: ``(E,)`` float32
+    Returns ``(E,)`` float32
     ``out[g] = amax(abs(dequantize(row_fp4_w[g]).bf16().t() @ R_n))``, computed from the
     *quantized* weight. An expert whose ``global_amax`` is NaN or inf reconstructs to
-    zero and reports 0.0, as the Triton kernel does.
+    zero and reports 0.0.
 
     Raises:
         NotImplementedError: pre-SM100 or a missing CuteDSL runtime.
@@ -98,7 +93,7 @@ def cutedsl_group_col_rht_requantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-expert rotated columnwise NVFP4 requantization of the weight (CuteDSL, SM100+).
 
-    Signature and returns match ``triton_group_col_rht_requantize``: ``(E, N, M//2)``
+    Returns ``(E, N, M//2)``
     uint8 codes and ``(E, N//128, M//64, 32, 16)`` float8_e4m3fn swizzled scales, to be
     decoded with ``NVFP4_CAST_NUMERATOR`` (2688). ``amax_rht_w_qdq_t`` must come from
     §11.4 with the same ``dgrad_rht``.

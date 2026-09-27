@@ -4,73 +4,22 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Shared skip marks for the V2 / V1_REQUANT kernel tests.
-
-Every one of these test modules needs the same two gates, so they live here rather
-than being copied seven times:
-
-* ``requires_sm100`` -- Triton, SM100, and PyTorch 2.10+, as elsewhere in this
-  directory.
-* ``kernel_gate`` -- the per-file switch that turns a kernel's numerics tests on once
-  its ``@triton.jit`` body lands. The wrapper-layer tests (validation and
-  ``register_fake``) deliberately do **not** go behind this gate: that layer is
-  complete today and should be failing loudly if it regresses.
-"""
+"""Hardware and runtime skip marks for the CuTeDSL V2 kernel tests."""
 
 import pytest
-import torch
-from torch.utils._triton import has_triton
 
-from torchao.utils import is_sm_at_least_100, torch_version_at_least
-
-TRITON_AVAILABLE = (
-    has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0")
+from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+    cutedsl_nvfp4_kernels_available,
 )
+from torchao.utils import torch_version_at_least
 
-requires_sm100 = [
-    pytest.mark.skipif(not has_triton(), reason="unsupported without triton"),
-    pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+"),
-    pytest.mark.skipif(
-        not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
-    ),
-]
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
+CUTEDSL_AVAILABLE = cutedsl_nvfp4_kernels_available()
+requires_cutedsl = pytest.mark.skipif(
+    not CUTEDSL_AVAILABLE or not torch_version_at_least("2.10.0"),
+    reason="requires SM100+, PyTorch 2.10+, and CuTeDSL",
 )
 
 
 def maybe_sm100(fn):
-    """Apply the hardware/version gates. Use for tests that need no kernel body."""
-    for mark in requires_sm100:
-        fn = mark(fn)
-    return fn
-
-
-def kernel_skip(implemented: bool, module: str):
-    """The bare skip mark behind ``kernel_gate``, for per-*parameter* gating.
-
-    Use with ``pytest.param(..., marks=...)`` when one test covers several recipes
-    whose kernels land at different times. Decorating the whole test with the
-    strictest gate hides the recipes that are already ready -- which is how
-    V1_REQUANT's gradient coverage ended up behind the V2 flag.
-    """
-    return pytest.mark.skipif(
-        not implemented, reason=f"Triton kernel body in {module} is still a stub"
-    )
-
-
-def kernel_gate(implemented: bool, module: str):
-    """Return a decorator gating a whole test on ``module``'s kernel body being written.
-
-    Args:
-        implemented: the module-level ``_KERNEL_IMPLEMENTED`` flag.
-        module: the file whose ``@triton.jit`` body is still a stub, for the reason
-            string.
-    """
-    skip = kernel_skip(implemented, module)
-
-    def decorate(fn):
-        return maybe_sm100(skip(fn))
-
-    return decorate
+    """Gate CUDA operator and wrapper tests on the supported runtime."""
+    return requires_cutedsl(fn)

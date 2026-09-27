@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Benchmark the grouped rowwise-cast + columnwise-RHT quantize kernel across backends (triton, cutedsl).
+"""Benchmark the grouped rowwise-cast + columnwise-RHT quantize kernel with CuTeDSL.
 
 One launch over the packed activation x = (E * tokens, dim) bf16 quantizes per group the
 raw rows of x_g and the columns of x_g^T @ R -- a 128-point randomized Hadamard transform
@@ -13,7 +13,7 @@ group's two amaxes: the V2 forward activation operands, the ``dynamic_rht=True``
 ``group_rht_quantize_row_col``. RTNE with ``use_fast_math=True``, the recipe default (the
 baseline table's rows); stochastic rounding is refused on this path by the CuteDSL op.
 Reports device kernel time (see bench_utils.kernel_time_us) for each available backend on
-the DeepSeek-V3 shapes, with the cutedsl-vs-triton speedup.
+the DeepSeek-V3 shapes.
 
     python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_quantize
 """
@@ -23,7 +23,6 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from tabulate import tabulate
-from torch.utils._triton import has_triton
 from tqdm import tqdm
 
 from benchmarks.prototype.nvfp4_training.bench_utils import (
@@ -40,7 +39,7 @@ from torchao.utils import is_sm_at_least_100
 
 device = torch.device("cuda")
 
-BACKENDS = ("triton", "cutedsl")
+BACKENDS = ("cutedsl",)
 
 # The target deployment is high expert parallelism, so the small-E shapes are the
 # representative ones; the ranking inverts at large E and misleads.
@@ -86,13 +85,7 @@ def make_runner(
 ) -> Optional[Callable[[], object]]:
     """No-arg callable running ``backend``'s grouped quantize op, or None if unavailable."""
     psl, hidden = x.shape
-    if backend == "triton":
-        if not has_triton():
-            return None
-        from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
-            triton_group_rht_quantize_row_col as op,
-        )
-    elif backend == "cutedsl":
+    if backend == "cutedsl":
         if not cutedsl_nvfp4_kernels_available():
             return None
         from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
@@ -120,7 +113,11 @@ def make_runner(
     )
 
 
-def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
+def run_experiment(
+    config: ExperimentConfig, *, warmup: int = 15, iters: int = 50
+) -> Optional[ExperimentResult]:
+    if not cutedsl_nvfp4_kernels_available():
+        raise RuntimeError("NVFP4 V2 benchmarks require SM100+ and the CuTeDSL runtime")
     E, tokens, dim = config.experts, config.tokens, config.dim
     x = torch.randn((E * tokens, dim), dtype=torch.bfloat16, device=device)
     wgrad_rht = _signs(seed=0)
@@ -136,7 +133,7 @@ def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
             backend, x, wgrad_rht, offsets, E, row_amax, col_amax, logical_packed_length
         )
         if runner is not None:
-            us[backend] = kernel_time_us(runner)
+            us[backend] = kernel_time_us(runner, warmup=warmup, iters=iters)
     if not us:
         return None
     psl = E * tokens
@@ -154,16 +151,13 @@ def print_results(experiments: List[Experiment]) -> None:
         "tokens",
         "dim",
         "cutedsl_us",
-        "triton_us",
-        "speedup",
         "cutedsl_gbps",
     ]
     rows = []
     for e in experiments:
         us = e.result.us
-        c, t = us.get("cutedsl"), us.get("triton")
-        speedup = f"{t / c:.2f}x" if (c and t) else "n/a"
-        ref = c or t
+        c = us["cutedsl"]
+        ref = c
         gbps = (e.result.total_bytes / 1e9) / (ref / 1e6)
         rows.append(
             [
@@ -173,8 +167,6 @@ def print_results(experiments: List[Experiment]) -> None:
                 e.config.tokens,
                 e.config.dim,
                 round(c, 3) if c else "n/a",
-                round(t, 3) if t else "n/a",
-                speedup,
                 round(gbps, 1),
             ]
         )

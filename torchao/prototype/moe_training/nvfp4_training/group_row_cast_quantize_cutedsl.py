@@ -6,13 +6,7 @@
 
 """CuteDSL grouped rowwise 1x16 NVFP4 E2M1 weight quantization (no RHT), SM100+.
 
-Drop-in for ``triton_group_row_cast_quantize``: same signature, same output contract,
-and byte-for-byte identical output. One launch covers the whole ``(E, M, N)`` stack --
-experts are equal-sized and contiguous, so the expert is a grid coordinate and only the
-per-expert global amax is expert-indexed. Weights never use stochastic rounding: RTNE
-only, so there is no ``rng_state``.
-
-A dense linear is the degenerate ``num_experts = 1`` case -- pass ``w.unsqueeze(0)``.
+See the public operator docstrings for tensor layouts and rounding contracts.
 """
 
 from typing import Tuple
@@ -34,12 +28,12 @@ def cutedsl_group_row_cast_quantize(
         A: Dense ``(E, M, N)`` BF16 weights, contiguous. M and N must be
             divisible by 128.
         global_amax: ``(E,)`` float32 per-expert absolute maxima, as produced by
-            ``triton_group_weight_amax``. Expert ``g`` is quantized with
+            ``W.float().abs().amax(dim=(-2, -1))``. Expert ``g`` is quantized with
             ``global_amax[g]``, never a reduction across experts.
         num_tensors: Number of experts; must equal ``E``.
 
     Returns:
-        A 2-tuple matching ``triton_group_row_cast_quantize``:
+        A tuple of packed FP4 codes and swizzled E4M3 scales:
           - ``(E, M, N//2)`` uint8 rowwise FP4 codes.
           - ``(E, M//128, N//64, 32, 16)`` float8_e4m3fn swizzled scales.
 

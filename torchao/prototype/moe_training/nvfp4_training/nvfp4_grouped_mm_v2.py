@@ -29,23 +29,12 @@ from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_cut
     cutedsl_group_col_cast_requant_amax,
     cutedsl_group_col_cast_requantize,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_triton import (
-    triton_group_col_cast_requant_amax,
-    triton_group_col_cast_requantize,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_cutedsl import (
     cutedsl_group_col_rht_requant_amax,
     cutedsl_group_col_rht_requantize,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_triton import (
-    triton_group_col_rht_requant_amax,
-    triton_group_col_rht_requantize,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_cutedsl import (
     cutedsl_group_rht_amax,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_hadamard_amax_triton import (
-    triton_group_rht_amax,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
     _DEVICE_ASSERTS,
@@ -54,32 +43,14 @@ from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
 from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_cutedsl import (
     cutedsl_group_rht_quantize_row_col,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_rht_quantize_row_col_triton import (
-    triton_group_rht_quantize_row_col,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
     cutedsl_group_row_cast_quantize,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
-    triton_group_row_cast_quantize,
 )
 from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_cutedsl import (
     cutedsl_group_row_rht_col_rht_amax,
 )
-from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_triton import (
-    triton_group_row_rht_col_rht_amax,
-)
 from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_cutedsl import (
     cutedsl_group_row_rht_col_rht_quantize_ms_eden,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_triton import (
-    triton_group_row_rht_col_rht_quantize_ms_eden,
-)
-from torchao.prototype.moe_training.nvfp4_training.group_weight_amax_triton import (
-    triton_group_weight_amax,
-)
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
-    _resolve_backends,
 )
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear_v2 import (
     _backward_rng_state,
@@ -88,6 +59,7 @@ from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
     EDEN_NUMERATOR,
     NVFP4_CAST_NUMERATOR,
     _amax_to_scale,
+    _require_cutedsl_backends,
 )
 from torchao.prototype.moe_training.utils import (
     conditional_nostrict_trace,
@@ -179,12 +151,8 @@ def _quantize_weight_rowwise(
     weight: torch.Tensor, num_experts: int, use_cutedsl_weight: bool
 ):
     """§11.1 over the expert stack. Returns ``(row_fp4_w, row_sf_w, weight_amax)``."""
-    weight_amax = triton_group_weight_amax(weight, num_experts)
-    group_row_cast_quantize = (
-        cutedsl_group_row_cast_quantize
-        if use_cutedsl_weight
-        else triton_group_row_cast_quantize
-    )
+    weight_amax = weight.float().abs().amax(dim=(-2, -1))
+    group_row_cast_quantize = cutedsl_group_row_cast_quantize
     row_fp4_w, row_sf_w = group_row_cast_quantize(weight, weight_amax, num_experts)
     return row_fp4_w, row_sf_w, weight_amax
 
@@ -269,14 +237,9 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         )
         _validate_sign_tensor(wgrad_rht, "wgrad_rht", input_act.device)
         _validate_sign_tensor(dgrad_rht, "dgrad_rht", input_act.device)
-        use_cutedsl_rht, use_cutedsl_weight = _resolve_backends(
+        use_cutedsl_rht, use_cutedsl_weight = _require_cutedsl_backends(
             kernel_preference, num_experts
         )
-        if ms_eden_fast_path and not use_cutedsl_rht:
-            raise ValueError(
-                "ms_eden_fast_path=True requires the MS-EDEN op on CuteDSL; this call "
-                "resolves it to Triton"
-            )
 
         input_act = input_act.to(torch.bfloat16).contiguous()
         weight = weight.to(torch.bfloat16).contiguous()
@@ -293,14 +256,8 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
 
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
-        group_rht_amax = (
-            cutedsl_group_rht_amax if use_cutedsl_rht else triton_group_rht_amax
-        )
-        group_rht_quantize_row_col = (
-            cutedsl_group_rht_quantize_row_col
-            if use_cutedsl_rht
-            else triton_group_rht_quantize_row_col
-        )
+        group_rht_amax = cutedsl_group_rht_amax
+        group_rht_quantize_row_col = cutedsl_group_rht_quantize_row_col
 
         # §11.8 then §11.9, on the same ops V1_REQUANT uses: dynamic_rht switches
         # them from the memoized RHT-16 tuple to the resampled RHT-128 buffer.
@@ -409,29 +366,13 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         num_experts = ctx.num_experts
         packed_sequence_length, N = grad_output.shape
         logical_packed_length = padded_group_end_offsets[-1:]
-        group_row_rht_col_rht_amax = (
-            cutedsl_group_row_rht_col_rht_amax
-            if ctx.use_cutedsl_rht
-            else triton_group_row_rht_col_rht_amax
+        group_row_rht_col_rht_amax = cutedsl_group_row_rht_col_rht_amax
+        group_row_rht_col_rht_quantize_ms_eden = partial(
+            cutedsl_group_row_rht_col_rht_quantize_ms_eden,
+            fast_path=ctx.ms_eden_fast_path,
         )
-        group_row_rht_col_rht_quantize_ms_eden = (
-            partial(
-                cutedsl_group_row_rht_col_rht_quantize_ms_eden,
-                fast_path=ctx.ms_eden_fast_path,
-            )
-            if ctx.use_cutedsl_rht
-            else triton_group_row_rht_col_rht_quantize_ms_eden
-        )
-        group_col_rht_requant_amax = (
-            cutedsl_group_col_rht_requant_amax
-            if ctx.use_cutedsl_weight
-            else triton_group_col_rht_requant_amax
-        )
-        group_col_rht_requantize = (
-            cutedsl_group_col_rht_requantize
-            if ctx.use_cutedsl_weight
-            else triton_group_col_rht_requantize
-        )
+        group_col_rht_requant_amax = cutedsl_group_col_rht_requant_amax
+        group_col_rht_requantize = cutedsl_group_col_rht_requantize
 
         amax_rht_dy, amax_rht_dy_t = group_row_rht_col_rht_amax(
             grad_output,
@@ -528,7 +469,7 @@ class _NVFP4GroupedMMV1Requant(torch.autograd.Function):
             sr_seed,
             pad_token_groups_for_grouped_mm,
         )
-        use_cutedsl_rht, use_cutedsl_weight = _resolve_backends(
+        use_cutedsl_rht, use_cutedsl_weight = _require_cutedsl_backends(
             kernel_preference, num_experts
         )
         sign_vector = tuple(sign_vector)
@@ -549,14 +490,8 @@ class _NVFP4GroupedMMV1Requant(torch.autograd.Function):
 
         packed_sequence_length = input_act.shape[0]
         logical_packed_length = padded_group_end_offsets[-1:]
-        group_rht_amax = (
-            cutedsl_group_rht_amax if use_cutedsl_rht else triton_group_rht_amax
-        )
-        group_rht_quantize_row_col = (
-            cutedsl_group_rht_quantize_row_col
-            if use_cutedsl_rht
-            else triton_group_rht_quantize_row_col
-        )
+        group_rht_amax = cutedsl_group_rht_amax
+        group_rht_quantize_row_col = cutedsl_group_rht_quantize_row_col
 
         amax_rht_x_t, amax_x = group_rht_amax(
             input_act,
@@ -655,24 +590,10 @@ class _NVFP4GroupedMMV1Requant(torch.autograd.Function):
         packed_sequence_length, N = grad_output.shape
         logical_packed_length = padded_group_end_offsets[-1:]
         sv = list(ctx.sign_vector)
-        group_rht_amax = (
-            cutedsl_group_rht_amax if ctx.use_cutedsl_rht else triton_group_rht_amax
-        )
-        group_rht_quantize_row_col = (
-            cutedsl_group_rht_quantize_row_col
-            if ctx.use_cutedsl_rht
-            else triton_group_rht_quantize_row_col
-        )
-        group_col_cast_requant_amax = (
-            cutedsl_group_col_cast_requant_amax
-            if ctx.use_cutedsl_weight
-            else triton_group_col_cast_requant_amax
-        )
-        group_col_cast_requantize = (
-            cutedsl_group_col_cast_requantize
-            if ctx.use_cutedsl_weight
-            else triton_group_col_cast_requantize
-        )
+        group_rht_amax = cutedsl_group_rht_amax
+        group_rht_quantize_row_col = cutedsl_group_rht_quantize_row_col
+        group_col_cast_requant_amax = cutedsl_group_col_cast_requant_amax
+        group_col_cast_requantize = cutedsl_group_col_cast_requantize
 
         amax_rht_dy_t, amax_dy = group_rht_amax(
             grad_output,
@@ -774,16 +695,13 @@ def nvfp4_v2_grouped_mm(
         pad_token_groups_for_grouped_mm: pad each group up to 128 rows internally and
             strip the padding before returning. With padding off, every group size
             must already be 128-aligned.
-        kernel_preference: selects the quantization backend. AUTO (default) runs each
-            op on CuteDSL where it can and falls back to Triton per op; TRITON forces
-            Triton; CUTEDSL demands CuteDSL and raises if it cannot run. The
-            per-expert weight amax is Triton on every path -- it has no CuteDSL twin.
+        kernel_preference: AUTO and CUTEDSL require CuTeDSL. Explicit TRITON
+            is unsupported. Raw weight amax uses a native PyTorch reduction;
+            all quantization and RHT operators use CuTeDSL.
         use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
-        ms_eden_fast_path: round the MS-EDEN scales of the backward in hardware
-            (``cvt.rs``) rather than in software. The FP4 codes are bitwise with the
-            default path and with Triton; each scale byte lands on one of the two E4M3
-            neighbours of the same corrected scale, so the step is not bitwise with
-            Triton. CuteDSL only: raises if the MS-EDEN op resolves to Triton.
+        ms_eden_fast_path: use hardware stochastic rounding for corrected
+            MS-EDEN scales. FP4 codes agree with the software path; scale bytes
+            use a different Philox mapping and need not agree bitwise.
 
     When padding is off, ``offs[-1]`` may be less than ``M``: rows from ``offs[-1]``
     on are the dispatcher's spare capacity, are never read, and carry no contract in

@@ -11,14 +11,11 @@ against the linear reference first, then multi-expert, then group isolation. A k
 that is wrong only at ``E > 1`` has a group-index bug, not a numerics bug, and the
 ordering is what makes that distinction readable from the failure list.
 
-Both backends implement the same op and are selected by the ``kernel`` parametrization
-(see ``_KERNELS``); under RTNE they are bitwise interchangeable
-(``test_cutedsl_group_row_cast_quantize_matches_triton``).
+CuTeDSL packed codes and swizzled scale bytes are checked against PyTorch.
 """
 
 import pytest
 import torch
-from torch.utils._triton import has_triton
 
 from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
     cutedsl_group_row_cast_quantize,
@@ -26,37 +23,13 @@ from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cuted
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
 )
-from torchao.utils import is_sm_at_least_100, torch_version_at_least
 
 from ._assertions import assert_codes_bitwise, assert_scales_bitwise
+from ._v2_marks import maybe_sm100 as _maybe_sm100
+from ._v2_reference_ops import reference_row_cast_op, reference_weight_amax
 from .nvfp4_reference import reference_row_cast_quantize, reference_weight_quantize_2d
 
-# Flip to True once the @triton.jit body in group_row_cast_quantize_triton.py lands.
-# Tests that exercise only the host wrapper -- validation and register_fake -- run
-# regardless, because that layer is complete today.
-_KERNEL_IMPLEMENTED = True
-
-requires_sm100 = [
-    pytest.mark.skipif(not has_triton(), reason="unsupported without triton"),
-    pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+"),
-    pytest.mark.skipif(
-        not torch_version_at_least("2.10.0"), reason="requires PyTorch 2.10+"
-    ),
-]
-_requires_kernel = pytest.mark.skipif(
-    not _KERNEL_IMPLEMENTED,
-    reason="Triton kernel body in group_row_cast_quantize_triton.py is still a stub",
-)
-
-
-def _maybe_sm100(fn):
-    for mark in requires_sm100:
-        fn = mark(fn)
-    return fn
-
-
-def _needs_kernel(fn):
-    return _maybe_sm100(_requires_kernel(fn))
+_needs_kernel = _maybe_sm100
 
 
 _skip_no_cutedsl = pytest.mark.skipif(
@@ -64,21 +37,10 @@ _skip_no_cutedsl = pytest.mark.skipif(
     reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
 )
 
-# Both backends share one signature. Every test also needs the Triton amax producer, so
-# the triton param rides on the test's own SM100 gate and only cutedsl carries a mark.
+# Only the production CuTeDSL operator is parametrized; expected values use PyTorch.
 _KERNELS = [
-    pytest.param("triton", id="triton"),
     pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
 ]
-
-
-if has_triton() and is_sm_at_least_100() and torch_version_at_least("2.10.0"):
-    from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
-        triton_group_row_cast_quantize,
-    )
-    from torchao.prototype.moe_training.nvfp4_training.group_weight_amax_triton import (
-        triton_group_weight_amax,
-    )
 
 
 def _weights(E, M, N, *, seed=0, scale=0.05):
@@ -88,8 +50,8 @@ def _weights(E, M, N, *, seed=0, scale=0.05):
 
 def _row_cast_quantize(kernel, W, amax, E):
     op = (
-        triton_group_row_cast_quantize
-        if kernel == "triton"
+        reference_row_cast_op
+        if kernel == "reference"
         else cutedsl_group_row_cast_quantize
     )
     return op(W, amax, E)
@@ -110,7 +72,7 @@ def test_single_expert_matches_the_linear_reference(kernel):
     first thing that has to hold.
     """
     W = _weights(1, 256, 512)
-    amax = triton_group_weight_amax(W, 1)
+    amax = reference_weight_amax(W, 1)
     codes, scales = _row_cast_quantize(kernel, W, amax, 1)
     ref = reference_row_cast_quantize(W[0], amax[0])
     assert_codes_bitwise(codes[0], ref.codes, "codes")
@@ -123,7 +85,7 @@ def test_single_expert_matches_the_linear_reference(kernel):
 @torch.no_grad()
 def test_multi_expert_matches_the_reference_per_expert(kernel, E):
     W = _weights(E, 256, 512)
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     codes, scales = _row_cast_quantize(kernel, W, amax, E)
     for e in range(E):
         ref = reference_row_cast_quantize(W[e], amax[e])
@@ -142,12 +104,12 @@ def test_per_expert_amax_is_not_a_global_reduction(kernel):
     """
     E = 4
     W = _weights(E, 256, 512)
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     baseline = _row_cast_quantize(kernel, W, amax, E)
 
     W_hot = W.clone()
     W_hot[1] *= 1000.0
-    amax_hot = triton_group_weight_amax(W_hot, E)
+    amax_hot = reference_weight_amax(W_hot, E)
     hot = _row_cast_quantize(kernel, W_hot, amax_hot, E)
 
     for e in range(E):
@@ -164,7 +126,7 @@ def test_one_zero_expert_leaves_its_neighbours_alone(kernel):
     E = 4
     W = _weights(E, 256, 512)
     W[2] = 0.0
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     codes, scales = _row_cast_quantize(kernel, W, amax, E)
     assert (codes[2] == 0).all(), "zero expert must produce zero codes"
     assert (scales[2].view(torch.uint8) == 0).all(), (
@@ -191,7 +153,7 @@ def test_scale_count_is_1x16_not_16x16(kernel):
     """
     E, M, N = 1, 256, 512
     W = _weights(E, M, N)
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     _, scales = _row_cast_quantize(kernel, W, amax, E)
     assert scales[0].numel() == M * N // 16
 
@@ -210,7 +172,7 @@ def test_rows_in_one_16x16_tile_get_independent_scales(kernel):
     W = _weights(E, M, N)
     W[0, 0, :] = 1e-4
     W[0, 1, :] = 1.0
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     _, scales = _row_cast_quantize(kernel, W, amax, E)
     ref = reference_row_cast_quantize(W[0], amax[0])
     assert_scales_bitwise(scales[0], ref.scales, "scales")
@@ -236,7 +198,7 @@ def test_rowwise_error_is_no_worse_than_the_2d_scheme(kernel):
 
     E, M, N = 1, 256, 512
     W = _weights(E, M, N)
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     codes, scales = _row_cast_quantize(kernel, W, amax, E)
     err_1d = (dequantize(codes[0], scales[0], amax[0]) - W[0].float()).abs()
 
@@ -261,26 +223,23 @@ _BITWISE_SHAPES = [
 @_skip_no_cutedsl
 @pytest.mark.parametrize("shape", _BITWISE_SHAPES)
 @torch.no_grad()
-def test_cutedsl_group_row_cast_quantize_matches_triton(shape):
-    """The two backends are byte-for-byte interchangeable, codes as well as scales."""
+def test_cutedsl_group_row_cast_quantize_matches_pytorch(shape):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     E, M, N = shape
     W = _weights(E, M, N, seed=3)
-    amax = triton_group_weight_amax(W, E)
+    amax = reference_weight_amax(W, E)
     cutedsl = _row_cast_quantize("cutedsl", W, amax, E)
-    triton_out = _row_cast_quantize("triton", W, amax, E)
-    for name, c, t in zip(("codes", "scales"), cutedsl, triton_out):
-        assert torch.equal(c, t), f"{name} differs between backends"
+    reference_out = _row_cast_quantize("reference", W, amax, E)
+    for name, c, t in zip(("codes", "scales"), cutedsl, reference_out):
+        assert torch.equal(c, t), f"{name} differs against the PyTorch reference"
 
 
 @_needs_kernel
 @_skip_no_cutedsl
 @pytest.mark.parametrize("shape", _BITWISE_SHAPES)
 @torch.no_grad()
-def test_cutedsl_group_row_cast_quantize_matches_triton_on_nan_blocks(shape):
-    """A NaN element is dropped from its block's amax on both backends (Triton's
-    ``tl.max`` is IEEE maxNum), so the 15 finite neighbours keep their own scale and only
-    an all-NaN block scales as NaN; the NaN itself encodes as +6 either way. Finite global
-    amaxes, since the recipe's NaN-propagating expert amax would hide the block."""
+def test_cutedsl_group_row_cast_quantize_matches_pytorch_on_nan_blocks(shape):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     E, M, N = shape
     W = _weights(E, M, N, seed=3)
     nan = float("nan")
@@ -293,10 +252,10 @@ def test_cutedsl_group_row_cast_quantize_matches_triton_on_nan_blocks(shape):
     W[-1, -1, -1] = nan  # last lane of the last expert
     amax = torch.nan_to_num(W.float(), 0.0, 0.0, 0.0).abs().amax(dim=(1, 2))
     cutedsl = _row_cast_quantize("cutedsl", W, amax, E)
-    triton_out = _row_cast_quantize("triton", W, amax, E)
-    for name, c, t in zip(("codes", "scales"), cutedsl, triton_out):
+    reference_out = _row_cast_quantize("reference", W, amax, E)
+    for name, c, t in zip(("codes", "scales"), cutedsl, reference_out):
         assert torch.equal(c.view(torch.uint8), t.view(torch.uint8)), (
-            f"{name} differs between backends"
+            f"{name} differs against the PyTorch reference"
         )
 
 

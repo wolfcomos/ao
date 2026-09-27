@@ -1,5 +1,10 @@
 # NVFP4 V2 grouped kernels: CuteDSL vs Triton
 
+Historical measurements from the Triton-capable branch. The V2 Triton kernels have
+been removed here; reproduce these comparisons at commit
+`d822c848422a651b30e49293cb6b85f84178f8c5`. For the current CuTeDSL-only drivers and
+a more recent GB200 measurement, see the V2 section of [README.md](README.md).
+
 CuteDSL ports of the nine grouped Triton kernels behind `nvfp4_grouped_mm_v2` (the V2
 recipe and the V1_REQUANT weight path), each measured against its Triton twin with the
 benches in this directory. Compare numbers within this file only; the tables in

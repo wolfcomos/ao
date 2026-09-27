@@ -12,15 +12,11 @@ that claim rather than to check numerics: that no non-grouped kernel is reachabl
 and that the linear path and the grouped path agree at ``E = 1``.
 """
 
-
 import pytest
 import torch
 import torch.nn as nn
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from torchao.prototype.moe_training.nvfp4_training import (
-    nvfp4_linear as nvfp4_linear_mod,
-)
 from torchao.prototype.moe_training.nvfp4_training import nvfp4_linear_v2 as v2_mod
 from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
     cutedsl_nvfp4_kernels_available,
@@ -38,38 +34,26 @@ from torchao.quantization import quantize_
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.quantization.utils import compute_error
 
-from ._v2_marks import kernel_gate, kernel_skip, maybe_sm100
+from ._v2_marks import maybe_sm100, requires_cutedsl
 
-# Every grouped kernel these recipes call must be implemented before the numerics
-# tests mean anything. V1_REQUANT needs only the three no-RHT ops; V2 needs all of them.
-_V1_REQUANT_KERNELS_IMPLEMENTED = True
-_V2_KERNELS_IMPLEMENTED = True
-_needs_v1_requant = kernel_gate(
-    _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"
-)
-_needs_v2 = kernel_gate(_V2_KERNELS_IMPLEMENTED, "the §11.1-§11.9 kernels")
+_needs_v1_requant = requires_cutedsl
+_needs_v2 = requires_cutedsl
 
-# For tests that cover both recipes. Gating the whole test on V2 would keep the
-# V1_REQUANT half unreachable through all of Phase A, which is exactly the half that
-# has to hold before a V1_REQUANT convergence run.
 _BOTH_RECIPES = [
     pytest.param(
         NVFP4Recipe.V1_REQUANT,
-        marks=kernel_skip(
-            _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"
-        ),
+        marks=requires_cutedsl,
         id="v1_requant",
     ),
     pytest.param(
         NVFP4Recipe.V2,
-        marks=kernel_skip(_V2_KERNELS_IMPLEMENTED, "the §11.1-§11.9 kernels"),
+        marks=requires_cutedsl,
         id="v2",
     ),
 ]
 
 _KERNEL_PREFERENCES = [
     pytest.param(KernelPreference.AUTO, id="auto"),
-    pytest.param(KernelPreference.TRITON, id="triton"),
     pytest.param(
         KernelPreference.CUTEDSL,
         marks=pytest.mark.skipif(
@@ -80,7 +64,7 @@ _KERNEL_PREFERENCES = [
     ),
 ]
 
-# For tests that run BOTH backends in one body.
+# For tests that require the CuTeDSL runtime.
 _requires_cutedsl = pytest.mark.skipif(
     not cutedsl_nvfp4_kernels_available(), reason="requires the CuteDSL runtime"
 )
@@ -109,7 +93,6 @@ _KERNELS = {
         "group_row_rht_col_rht_quantize_ms_eden",
         "group_col_rht_requant_amax",
         "group_col_rht_requantize",
-        "group_weight_amax",
     },
     NVFP4Recipe.V1_REQUANT: {
         "group_rht_amax",
@@ -117,27 +100,12 @@ _KERNELS = {
         "group_row_cast_quantize",
         "group_col_cast_requant_amax",
         "group_col_cast_requantize",
-        "group_weight_amax",
     },
 }
 
 
 def _expected_ops(recipe, kernel_preference):
-    """The exact ``torchao::`` op set a recipe dispatches on the resolved backend.
-
-    The weight amax has no CuteDSL twin and is Triton on every path.
-    """
-    if kernel_preference is KernelPreference.AUTO:
-        kernel_preference = (
-            KernelPreference.CUTEDSL
-            if cutedsl_nvfp4_kernels_available()
-            else KernelPreference.TRITON
-        )
-    if kernel_preference is KernelPreference.TRITON:
-        return {"torchao::triton_" + k for k in _KERNELS[recipe]}
-    return {"torchao::triton_group_weight_amax"} | {
-        "torchao::cutedsl_" + k for k in _KERNELS[recipe] - {"group_weight_amax"}
-    }
+    return {"torchao::cutedsl_" + k for k in _KERNELS[recipe] - {"group_weight_amax"}}
 
 
 class _RecordOps(TorchDispatchMode):
@@ -467,14 +435,13 @@ def test_v2_backward_is_reproducible_for_a_fixed_rng_state(monkeypatch):
 @_needs_v2
 @_requires_cutedsl
 @pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
-def test_v2_backends_are_bitwise_for_a_fixed_rng_state(bias, monkeypatch):
-    """A V2 step on CuteDSL reproduces the Triton step bitwise: every V2 op has a
-    bitwise twin, MS-EDEN included, once the Philox state it receives is pinned."""
+def test_v2_auto_matches_explicit_cutedsl_for_a_fixed_rng_state(bias, monkeypatch):
+    """AUTO and explicit CuTeDSL select the same V2 operators and RNG mapping."""
     fixed = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     monkeypatch.setattr(v2_mod, "_backward_rng_state", lambda sr_seed: fixed)
 
     results = []
-    for kernel_preference in (KernelPreference.TRITON, KernelPreference.CUTEDSL):
+    for kernel_preference in (KernelPreference.AUTO, KernelPreference.CUTEDSL):
         layer = _layer(NVFP4Recipe.V2, bias=bias, kernel_preference=kernel_preference)
         x = _inputs()
         out = layer(x)
@@ -533,10 +500,9 @@ def test_v2_ms_eden_fast_path_moves_only_the_scale_bytes(monkeypatch):
 @maybe_sm100
 @torch.no_grad()
 def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
-    """The fast path is a variant of the CuteDSL kernel, so a call whose MS-EDEN op
-    resolves to Triton refuses it before any kernel runs."""
+    """Explicit TRITON is rejected for V2, including the MS-EDEN fast path."""
     layer = _layer(NVFP4Recipe.V2)
-    with pytest.raises(ValueError, match="requires the MS-EDEN op on CuteDSL"):
+    with pytest.raises(ValueError, match="AUTO or CUTEDSL"):
         v2_mod.nvfp4_linear_v2(
             _inputs(),
             layer.weight,
@@ -552,13 +518,10 @@ def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
 @_needs_v1_requant
 @_requires_cutedsl
 @torch.no_grad()
-def test_v1_requant_forward_is_bitwise_across_backends():
-    """The RHT-16 amax, the RTNE row/col quantize and the rowwise weight cast are
-    bitwise twins, so the forward agrees exactly. The backward is the one site that
-    does not: its stochastic-rounding cast of ``dy`` draws a different Philox stream
-    on CuteDSL (see the NVFP4TrainingConfig reproducibility note)."""
+def test_v1_requant_auto_matches_explicit_cutedsl():
+    """AUTO and explicit CuTeDSL agree on the lazy weight recipe forward."""
     x = _inputs()
-    out_t = _layer(NVFP4Recipe.V1_REQUANT, kernel_preference=KernelPreference.TRITON)(x)
+    out_t = _layer(NVFP4Recipe.V1_REQUANT, kernel_preference=KernelPreference.AUTO)(x)
     out_c = _layer(NVFP4Recipe.V1_REQUANT, kernel_preference=KernelPreference.CUTEDSL)(
         x
     )
@@ -569,46 +532,13 @@ def test_v1_requant_forward_is_bitwise_across_backends():
 @pytest.mark.parametrize("kernel_preference", _KERNEL_PREFERENCES)
 @pytest.mark.parametrize("recipe", _BOTH_RECIPES)
 def test_recipe_dispatches_only_the_resolved_backend(recipe, kernel_preference):
-    """``NVFP4Linear`` hands its ``kernel_preference`` to the recipe, and the recipe
-    runs every quantize and amax op on the backend it resolves to -- except the weight
-    amax, which has no CuteDSL twin and stays Triton."""
+    """Every quantization/RHT custom operator belongs to CuTeDSL; raw weight amax uses ATen."""
     layer = _layer(recipe, kernel_preference=kernel_preference)
     x = _inputs()
     with _RecordOps() as recorder:
         layer(x).sum().backward()
     quantizers = {name for name in recorder.names if "_group_" in name}
     assert quantizers == _expected_ops(recipe, kernel_preference)
-
-
-@maybe_sm100
-@pytest.mark.parametrize("recipe", _BOTH_RECIPES)
-@torch.no_grad()
-def test_auto_falls_back_to_triton_without_cutedsl(recipe, monkeypatch):
-    """AUTO degrades to Triton where CuteDSL cannot run, matching an explicit TRITON
-    call bitwise (RTNE forward only; the V1_REQUANT backward stream differs)."""
-    x = _inputs()
-    expected = _layer(recipe, kernel_preference=KernelPreference.TRITON)(x)
-    monkeypatch.setattr(
-        nvfp4_linear_mod, "cutedsl_nvfp4_kernels_available", lambda: False
-    )
-    with _RecordOps() as recorder:
-        got = _layer(recipe, kernel_preference=KernelPreference.AUTO)(x)
-    assert recorder.names, "no torchao op was recorded; the probe is not working"
-    leaked = {n for n in recorder.names if n.startswith("torchao::cutedsl_")}
-    assert not leaked, f"AUTO reached CuteDSL without the runtime: {sorted(leaked)}"
-    assert torch.equal(got, expected)
-
-
-@maybe_sm100
-@pytest.mark.parametrize("recipe", _BOTH_RECIPES)
-@torch.no_grad()
-def test_cutedsl_raises_without_the_runtime(recipe, monkeypatch):
-    monkeypatch.setattr(
-        nvfp4_linear_mod, "cutedsl_nvfp4_kernels_available", lambda: False
-    )
-    layer = _layer(recipe, kernel_preference=KernelPreference.CUTEDSL)
-    with pytest.raises(RuntimeError, match="CUTEDSL requires"):
-        layer(_inputs())
 
 
 @_needs_v2
@@ -702,3 +632,39 @@ def test_cutedsl_prepare_for_cuda_graph_warms_every_v2_kernel():
         f"cutedsl_prepare_for_cuda_graph ({new}); they would compile inside a "
         "CUDA-graph capture"
     )
+
+
+@pytest.mark.parametrize(
+    "preference", [KernelPreference.TRITON, KernelPreference.TORCH]
+)
+def test_lazy_recipes_reject_unsupported_backends(preference):
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
+        _require_cutedsl,
+    )
+
+    with pytest.raises(ValueError, match="AUTO or CUTEDSL"):
+        _require_cutedsl(preference)
+
+
+@_needs_v2
+def test_raw_weight_amax_propagates_nan_per_expert():
+    weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    weight[0, 0] = torch.nan
+    _, _, amax = v2_mod._quantize_weight_rowwise(weight, True)
+    assert torch.isnan(amax).all()
+
+
+def test_auto_requires_cutedsl_runtime(monkeypatch):
+    from torchao.prototype.moe_training.nvfp4_training import hadamard_cutedsl_utils
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
+        _require_cutedsl,
+    )
+
+    def unavailable(name):
+        raise NotImplementedError("CuTeDSL unavailable")
+
+    monkeypatch.setattr(
+        hadamard_cutedsl_utils, "raise_if_cutedsl_nvfp4_unavailable", unavailable
+    )
+    with pytest.raises(NotImplementedError, match="CuTeDSL unavailable"):
+        _require_cutedsl(KernelPreference.AUTO)

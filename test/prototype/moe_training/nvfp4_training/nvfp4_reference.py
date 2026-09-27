@@ -139,6 +139,8 @@ def to_blocked_grouped(plain: torch.Tensor, group_sizes) -> torch.Tensor:
     parts, col = [], 0
     for size in group_sizes:
         width = size // 16
+        if width == 0:
+            continue
         parts.append(to_blocked(plain[:, col : col + width]).flatten())
         col += width
     return torch.cat(parts)
@@ -157,6 +159,8 @@ def from_blocked_grouped(blocked: torch.Tensor, rows: int, group_sizes) -> torch
     for size in group_sizes:
         width = size // 16
         count = rows * width
+        if width == 0:
+            continue
         parts.append(
             from_blocked(flat[pos : pos + count].reshape(rows, width), rows, width)
         )
@@ -175,7 +179,7 @@ def global_encode_scale(
     """
     amax = global_amax.to(torch.float32)
     candidate = torch.full_like(amax, fp8_max * FP4_E2M1_MAX) / amax
-    candidate = candidate.clamp(max=_FP32_MAX)
+    candidate = torch.fmin(candidate, torch.full_like(candidate, _FP32_MAX))
     # amax == 0 gives inf; an enormous amax underflows the scale to zero. Both -> identity.
     return torch.where(
         (amax == 0.0) | (candidate == 0.0), torch.ones_like(candidate), candidate
@@ -187,18 +191,21 @@ def _block_scale(
 ) -> torch.Tensor:
     """``compute_decoding_scaling_factor``: one rounding, upper clamp only."""
     scale = block_amax * (s_enc * (1.0 / FP4_E2M1_MAX))
-    return scale.clamp(max=fp8_max).to(torch.float8_e4m3fn)
+    return torch.fmin(scale, torch.full_like(scale, fp8_max)).to(torch.float8_e4m3fn)
 
 
 def _encode_scale(block_scale_fp8: torch.Tensor, s_enc: torch.Tensor) -> torch.Tensor:
     """Correctly rounded reciprocal of the effective decode scale."""
     denom = block_scale_fp8.to(torch.float32) * (1.0 / s_enc)
-    return (1.0 / denom).clamp(max=_FP32_MAX)
+    value = 1.0 / denom
+    return torch.fmin(value, torch.full_like(value, _FP32_MAX))
 
 
 def pack_fp4(scaled: torch.Tensor) -> torch.Tensor:
     """(R, C) f32 -> (R, C//2) uint8, low nibble = even element."""
-    clamped = scaled.clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX)
+    clamped = torch.nan_to_num(scaled, nan=FP4_E2M1_MAX).clamp(
+        -FP4_E2M1_MAX, FP4_E2M1_MAX
+    )
     return pack_uint4(f32_to_f4_unpacked(clamped.contiguous()))
 
 
@@ -227,7 +234,9 @@ def _block_amax(x: torch.Tensor, block_rows: int) -> torch.Tensor:
     """Per-tile amax over ``(block_rows, 16)`` tiles -> (R//block_rows, C//16) f32."""
     rows, cols = x.shape
     tiles = x.abs().reshape(rows // block_rows, block_rows, cols // 16, 16)
-    return tiles.amax(dim=(1, 3))
+    finite = torch.where(torch.isnan(tiles), -torch.inf, tiles)
+    result = finite.amax(dim=(1, 3))
+    return torch.where(torch.isnan(tiles).all(dim=(1, 3)), torch.nan, result)
 
 
 def nvfp4_reference_quantize(
@@ -437,9 +446,9 @@ def reference_group_rht_quantize_row_col(
         start += size
 
     row_sf = to_blocked(row_sf_plain).view(psl, hidden // 16)
-    col_sf = to_blocked_grouped(torch.cat(col_sf_blocks, dim=1), sizes).view(
-        hidden, psl // 16
-    )
+    col_sf = A.new_zeros((hidden, psl // 16), dtype=torch.float8_e4m3fn)
+    valid_scales = to_blocked_grouped(torch.cat(col_sf_blocks, dim=1), sizes)
+    col_sf.flatten()[: valid_scales.numel()] = valid_scales.flatten()
     return row_codes, row_sf, col_codes, col_sf
 
 
@@ -502,7 +511,9 @@ def decode_fp4_codes(codes: torch.Tensor) -> torch.Tensor:
     lut = torch.tensor(_FP4_MAGNITUDES, dtype=torch.float32, device=codes.device)
     lo = codes & 0xF
     hi = codes >> 4
-    nibbles = torch.stack((lo, hi), dim=-1).reshape(codes.shape[0], -1).long()
+    nibbles = (
+        torch.stack((lo, hi), dim=-1).reshape(codes.shape[0], codes.shape[1] * 2).long()
+    )
     magnitude = lut[nibbles & 0x7]
     return torch.where(nibbles & 0x8 != 0, -magnitude, magnitude)
 
@@ -544,8 +555,7 @@ def reference_dequantize_rowwise(
     values = decode_fp4_codes(codes)
     plain = (from_blocked(scales, rows, cols // 16) if is_swizzled else scales).float()
     s_enc = global_encode_scale(global_amax, fp8_max)
-    decode = plain * (1.0 / s_enc)
-    return values * decode.repeat_interleave(16, dim=1)
+    return (values * plain.repeat_interleave(16, dim=1)) * (1.0 / s_enc)
 
 
 @dataclass(frozen=True)
@@ -580,6 +590,11 @@ def reference_ms_eden(
     the per-tensor numerator 1536. The per-block correction falls back to 1.0 where
     the ratio is undefined -- a block that packs to all-zero codes has
     ``<v, q> == 0`` -- matching the kernel's guard.
+
+    The PyTorch ratio is correctly rounded; the software kernel retains PTX
+    ``div.full`` (up to two ULP error). Byte equality is tested on the covered
+    inputs, not asserted as a universal property of approximate division. The
+    hardware-SR fast path is validated separately by its code and scale properties.
     """
     base = nvfp4_reference_quantize(
         x, global_amax, block="1x16", layout="plain", fp8_max=EDEN_BLOCK_SCALE_MAX
@@ -588,7 +603,7 @@ def reference_ms_eden(
     scaled = base.scaled.reshape(rows, cols // 16, 16)
     values = decode_fp4_codes(base.codes).reshape(rows, cols // 16, 16)
 
-    ratio = (scaled * scaled).sum(dim=-1) / (scaled * values).sum(dim=-1)
+    ratio = _sum16_rn(scaled * scaled) / _sum16_rn(scaled * values)
     correction = torch.where(torch.isfinite(ratio), ratio, torch.ones_like(ratio))
 
     block_scale = base.block_scale.float()
@@ -686,6 +701,7 @@ def reference_col_cast_requant_amax(
     weight rather than the quantized-dequantized one.
     """
     w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    w_qdq = torch.where(torch.isfinite(global_amax), w_qdq, torch.zeros_like(w_qdq))
     return w_qdq.to(torch.bfloat16).float().abs().max()
 
 
@@ -699,6 +715,7 @@ def reference_col_cast_requantize(
 ) -> NVFP4ReferenceOutput:
     """§11.7: rowwise 1x16 NVFP4 of ``W_qdq.bf16().t()``."""
     w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    w_qdq = torch.where(torch.isfinite(global_amax), w_qdq, torch.zeros_like(w_qdq))
     return nvfp4_reference_quantize(
         w_qdq.to(torch.bfloat16).t().contiguous(),
         amax_w_qdq_t,
@@ -715,6 +732,7 @@ def reference_col_rht_requant_amax(
 ) -> torch.Tensor:
     """§11.4: ``amax(abs(W_qdq.bf16().t() @ R_n))``, scalar f32."""
     w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    w_qdq = torch.where(torch.isfinite(global_amax), w_qdq, torch.zeros_like(w_qdq))
     rotated = reference_dynamic_rht(w_qdq.to(torch.bfloat16), dgrad_rht, transpose=True)
     return rotated.float().abs().max()
 
@@ -730,6 +748,7 @@ def reference_col_rht_requantize(
 ) -> NVFP4ReferenceOutput:
     """§11.5: rowwise 1x16 NVFP4 of ``W_qdq.bf16().t() @ R_n``."""
     w_qdq = reference_dequantize_rowwise(row_fp4_w, row_sf_w, global_amax)
+    w_qdq = torch.where(torch.isfinite(global_amax), w_qdq, torch.zeros_like(w_qdq))
     rotated = reference_dynamic_rht(w_qdq.to(torch.bfloat16), dgrad_rht, transpose=True)
     return nvfp4_reference_quantize(
         rotated, amax_rht_w_qdq_t, block="1x16", layout=layout
@@ -835,6 +854,10 @@ def reference_group_row_cast_col_rht_amax(
     col, row, start = [], [], 0
     for size in _group_sizes(offsets, num_tensors):
         group = A[start : start + size]
+        if size == 0:
+            col.append(A.new_zeros((), dtype=torch.float32))
+            row.append(A.new_zeros((), dtype=torch.float32))
+            continue
         c, r = reference_row_cast_col_rht_amax(group, sign_vector)
         col.append(c)
         row.append(r)
@@ -853,6 +876,10 @@ def reference_group_row_rht_col_rht_amax(
     rows, cols, start = [], [], 0
     for size in _group_sizes(offsets, num_tensors):
         group = dy[start : start + size]
+        if size == 0:
+            rows.append(dy.new_zeros((), dtype=torch.float32))
+            cols.append(dy.new_zeros((), dtype=torch.float32))
+            continue
         r, c = reference_row_rht_col_rht_amax(group, dgrad_rht, wgrad_rht)
         rows.append(r)
         cols.append(c)
@@ -888,6 +915,8 @@ def reference_group_row_cast_col_rht_quantize(
     start = 0
     for g, size in enumerate(sizes):
         end = start + size
+        if size == 0:
+            continue
         row, col = reference_row_cast_col_rht_quantize(
             A[start:end],
             row_global_amax[g],
@@ -902,9 +931,9 @@ def reference_group_row_cast_col_rht_quantize(
         start += size
 
     row_sf = to_blocked(row_sf_plain).view(psl, hidden // 16)
-    col_sf = to_blocked_grouped(torch.cat(col_sf_blocks, dim=1), sizes).view(
-        hidden, psl // 16
-    )
+    col_sf = A.new_zeros((hidden, psl // 16), dtype=torch.float8_e4m3fn)
+    valid_scales = to_blocked_grouped(torch.cat(col_sf_blocks, dim=1), sizes)
+    col_sf.flatten()[: valid_scales.numel()] = valid_scales.flatten()
     return row_codes, row_sf, col_codes, col_sf
 
 
@@ -937,6 +966,8 @@ def reference_group_row_rht_col_rht_quantize_ms_eden(
     start = 0
     for g, size in enumerate(sizes):
         end = start + size
+        if size == 0:
+            continue
         group = dy[start:end]
         row = reference_ms_eden(
             reference_dynamic_rht(group, dgrad_rht, transpose=False), amax_rht_dy[g]
@@ -951,3 +982,54 @@ def reference_group_row_rht_col_rht_quantize_ms_eden(
         start += size
 
     return row_codes, row_scale, col_codes, col_scale
+
+
+def _sum16_rn(values: torch.Tensor) -> torch.Tensor:
+    """Separate FP32 operations in the software MS-EDEN reduction order."""
+    p = values.unbind(-1)
+    even = ((p[0] + p[2]) + (p[4] + p[6])) + ((p[8] + p[10]) + (p[12] + p[14]))
+    odd = ((p[1] + p[3]) + (p[5] + p[7])) + ((p[9] + p[11]) + (p[13] + p[15]))
+    return even + odd
+
+
+def philox4x32(
+    seed: torch.Tensor, offset: torch.Tensor, index: torch.Tensor
+) -> torch.Tensor:
+    """Independent PyTorch Philox4x32-10, counter=(offset, index, 0, 0).
+
+    The key/counter contract follows AO PR #4798's CuTeDSL Philox implementation.
+    This oracle uses only integer tensor arithmetic, no kernel implementation or
+    torch RNG state. int64 products retain the low 64 bits; masking the arithmetic
+    right shift recovers the unsigned high word even when the product wraps.
+    """
+    mask = 0xFFFFFFFF
+    c0 = torch.full_like(index, int(offset) & mask)
+    c1 = index.to(torch.int64) & mask
+    c2, c3 = torch.zeros_like(c1), torch.zeros_like(c1)
+    key = int(seed)
+    k0, k1 = key & mask, (key >> 32) & mask
+    for _ in range(10):
+        a, b = c0 * 0xD2511F53, c2 * 0xCD9E8D57
+        c0, c1, c2, c3 = (
+            ((b >> 32) & mask) ^ c1 ^ k0,
+            b & mask,
+            ((a >> 32) & mask) ^ c3 ^ k1,
+            a & mask,
+        )
+        k0, k1 = (k0 + 0x9E3779B9) & mask, (k1 + 0xBB67AE85) & mask
+    return torch.stack((c0, c1, c2, c3), dim=-1)
+
+
+def reference_software_e4m3_sr(corrected, seed, offset):
+    """Round corrected scales using one Philox word per scale in plain layout."""
+    index = torch.arange(
+        corrected.numel(), device=corrected.device, dtype=torch.int64
+    ).reshape(corrected.shape)
+    words = philox4x32(seed, offset, index)[..., 0]
+    saturated = torch.fmin(corrected, torch.full_like(corrected, 448.0))
+    bits = (saturated * 2.0**-120).contiguous().view(torch.int32).to(
+        torch.int64
+    ) & 0xFFFFFFFF
+    rounded = (bits + (words & 0xFFFFF)) >> 20
+    byte = ((rounded & 0x7F) | ((rounded >> 4) & 0x80)).to(torch.uint8)
+    return byte.view(torch.float8_e4m3fn)

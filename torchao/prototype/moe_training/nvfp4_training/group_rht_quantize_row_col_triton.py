@@ -240,9 +240,9 @@ if torch_version_at_least("2.10.0") and has_triton():
         selects the cached RHT matrix used by the Triton kernel. Zero-valued
         per-group padding before the final offset is processed normally.
 
-        Set ``dynamic_rht`` with a ``(rht_size,)`` device ``sign_tensor`` for recipes
-        that resample their signs: the RHT matrix is then formed per launch instead of
-        memoized by sign value, and ``sign_vector`` is ignored (pass ``[]``).
+        Only the static V1 RHT-16 is supported. ``sign_tensor`` must be None and
+        ``dynamic_rht`` False; these arguments remain for call-schema compatibility.
+        V2 dynamic RHT-128 requires CuTeDSL.
 
         Returns ``(qa_base, sfa, qd, sfd)``. Both scale tensors carry swizzled bytes
         reinterpreted to their logical 2D shapes.
@@ -251,7 +251,9 @@ if torch_version_at_least("2.10.0") and has_triton():
         ``[col_seed, col_offset, row_seed, row_offset]`` whose advancement the caller owns;
         the op only forwards single-element views, performing no host RNG.
         """
-        B = _rht_matrix(sign_vector, sign_tensor, dynamic_rht, A.device)
+        if dynamic_rht:
+            raise ValueError("dynamic RHT-128 requires the CuTeDSL backend")
+        B = _rht_matrix(sign_vector, sign_tensor, False, A.device)
         _validate_grouped_hadamard_inputs(
             A,
             B,

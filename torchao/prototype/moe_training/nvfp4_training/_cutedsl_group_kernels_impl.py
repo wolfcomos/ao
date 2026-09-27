@@ -39,9 +39,8 @@ A fourth kernel, ``_Tcgen05GroupRowRhtColRhtQuantizeMsEden``, is the MS-EDEN qua
 that consumes that amax kernel's two outputs: the same standalone two-chain mainloop,
 each accumulator quantized from TMEM to RTNE FP4 codes plus a corrected,
 stochastically rounded E4M3 block scale drawn from Triton's Philox stream. Its 256
-ceiling is ``EDEN_BLOCK_SCALE_MAX``, imported from the MS-EDEN Triton module (a
-module-level constant defined ahead of that module's Triton guard, so the import is
-Triton-free). Its ``FAST_PATH`` variant (``fast_path=True`` on the op) draws one Philox
+ceiling is ``EDEN_BLOCK_SCALE_MAX``, imported from the recipe module. Its
+``FAST_PATH`` variant (``fast_path=True`` on the op) draws one Philox
 counter per 16 scales of a row and rounds the four corrected scales a warp holds with
 one hardware ``cvt.rs.satfinite.e4m3x4.f32``: a different stochastic stream (16 random
 bits per scale, one draw per 16 scales), not the Triton stream.
@@ -123,7 +122,7 @@ from ._cutedsl_kernels_impl import (
     philox_prep,
     philox_word0,
 )
-from .group_row_rht_col_rht_quantize_ms_eden_triton import EDEN_BLOCK_SCALE_MAX
+from .nvfp4_recipe import EDEN_BLOCK_SCALE_MAX
 
 # --- tile shapes (TE :262-271). M = hidden, N = tokens, K = 16 (the RHT block) ---
 M_TILE = 128  # hidden rows per tile
@@ -1861,7 +1860,9 @@ def _rht128_tile_amax(acc, tidx):
         # exact, so the grouping does not change the result.
         m = [_max3_abs_f32(vals[i], vals[i + 1], vals[i + 2]) for i in range(0, 15, 3)]
         tile_max = _max3_abs_f32(
-            _max3_abs_f32(m[0], m[1], m[2]), _max3_abs_f32(m[3], m[4], vals[15]), tile_max
+            _max3_abs_f32(m[0], m[1], m[2]),
+            _max3_abs_f32(m[3], m[4], vals[15]),
+            tile_max,
         )
     return tile_max
 
