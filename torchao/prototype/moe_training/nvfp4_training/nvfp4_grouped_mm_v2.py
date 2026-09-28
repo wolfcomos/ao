@@ -226,7 +226,6 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         pad_token_groups_for_grouped_mm: bool,
         kernel_preference: KernelPreference,
         use_fast_math: bool,
-        ms_eden_fast_path: bool,
     ) -> torch.Tensor:
         num_tokens, K, num_experts, N = _validate_grouped_inputs(
             input_act,
@@ -338,7 +337,7 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         ctx.num_experts = num_experts
         ctx.use_cutedsl_rht = use_cutedsl_rht
         ctx.use_cutedsl_weight = use_cutedsl_weight
-        ctx.ms_eden_fast_path = ms_eden_fast_path
+        ctx.use_fast_math = use_fast_math
         return output
 
     @staticmethod
@@ -369,7 +368,7 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
         group_row_rht_col_rht_amax = cutedsl_group_row_rht_col_rht_amax
         group_row_rht_col_rht_quantize_ms_eden = partial(
             cutedsl_group_row_rht_col_rht_quantize_ms_eden,
-            fast_path=ctx.ms_eden_fast_path,
+            use_fast_math=ctx.use_fast_math,
         )
         group_col_rht_requant_amax = cutedsl_group_col_rht_requant_amax
         group_col_rht_requantize = cutedsl_group_col_rht_requantize
@@ -439,8 +438,8 @@ class _NVFP4GroupedMMV2(torch.autograd.Function):
                 alignment_size=_ALIGNMENT,
             )
         # input_act, weight, wgrad_rht, dgrad_rht, sr_seed, offs, pad,
-        # kernel_preference, use_fast_math, ms_eden_fast_path
-        return grad_input, grad_weight, None, None, None, None, None, None, None, None
+        # kernel_preference, use_fast_math
+        return grad_input, grad_weight, None, None, None, None, None, None, None
 
 
 class _NVFP4GroupedMMV1Requant(torch.autograd.Function):
@@ -677,7 +676,6 @@ def nvfp4_v2_grouped_mm(
     pad_token_groups_for_grouped_mm: bool = False,
     kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
-    ms_eden_fast_path: bool = False,
 ) -> torch.Tensor:
     """Grouped ``A @ B[g].t()`` under the V2 recipe.
 
@@ -698,10 +696,15 @@ def nvfp4_v2_grouped_mm(
         kernel_preference: AUTO and CUTEDSL require CuTeDSL. Explicit TRITON
             is unsupported. Raw weight amax uses a native PyTorch reduction;
             all quantization and RHT operators use CuTeDSL.
-        use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
-        ms_eden_fast_path: use hardware stochastic rounding for corrected
-            MS-EDEN scales. FP4 codes agree with the software path; scale bytes
-            use a different Philox mapping and need not agree bitwise.
+        use_fast_math: enable fast arithmetic for both activation quantization and
+            MS-EDEN gradient quantization. True (default) selects optimized MS-EDEN
+            correction and hardware stochastic rounding of corrected E4M3 scales;
+            False selects exact activation arithmetic and software MS-EDEN scale
+            rounding. For fixed gradient inputs, MS-EDEN FP4 codes are unchanged,
+            but the scale RNG mapping
+            differs between modes, so gradients need not agree bitwise. Earlier
+            V2 defaults used software MS-EDEN rounding even with activation fast
+            math enabled; the default now uses hardware scale rounding.
 
     When padding is off, ``offs[-1]`` may be less than ``M``: rows from ``offs[-1]``
     on are the dispatcher's spare capacity, are never read, and carry no contract in
@@ -717,7 +720,6 @@ def nvfp4_v2_grouped_mm(
         pad_token_groups_for_grouped_mm,
         kernel_preference,
         use_fast_math,
-        ms_eden_fast_path,
     )
     if bias is not None:
         output = output + bias.to(output.dtype)

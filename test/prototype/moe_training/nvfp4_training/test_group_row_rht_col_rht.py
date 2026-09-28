@@ -99,6 +99,7 @@ def _ms_eden(kernel, dy, ar, ac, d, w, offs, E, rng):
         VARYING_FIRST_DIM,
         rng,
         offs[-1:],
+        **({"use_fast_math": False} if kernel != "reference" else {}),
     )
 
 
@@ -119,7 +120,7 @@ def _ms_eden_fast(dy, ar, ac, d, w, offs, E, rng):
         VARYING_FIRST_DIM,
         rng,
         offs[-1:],
-        fast_path=True,
+        use_fast_math=True,
     )
 
 
@@ -1296,3 +1297,79 @@ def test_ms_eden_always_requires_an_rng_state(kernel):
     )
     with pytest.raises(TypeError, match="rng_state must be a torch.Tensor"):
         op(dy, amax, amax, sv, sv, offs, E, M, N, VARYING_FIRST_DIM, None, offs[-1:])
+
+
+@pytest.mark.parametrize(
+    "use_fast_math", [None, True, False], ids=["default", "fast", "exact"]
+)
+def test_ms_eden_fake_accepts_unified_fast_math(use_fast_math):
+    """Both variants and the raw-op default expose the same compile-time contract."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
+        VARYING_FIRST_DIM,
+    )
+
+    kwargs = {} if use_fast_math is None else {"use_fast_math": use_fast_math}
+    M, N, E = 512, 256, 2
+    with FakeTensorMode():
+        dy = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        signs = torch.empty(128, dtype=torch.int8, device="cuda")
+        offs = torch.empty(E, dtype=torch.int32, device="cuda")
+        amax = torch.empty(E, dtype=torch.float32, device="cuda")
+        rng = torch.empty(4, dtype=torch.int64, device="cuda")
+        outputs = cutedsl_group_row_rht_col_rht_quantize_ms_eden(
+            dy,
+            amax,
+            amax,
+            signs,
+            signs,
+            offs,
+            E,
+            M,
+            N,
+            VARYING_FIRST_DIM,
+            rng,
+            **kwargs,
+        )
+    assert [(tuple(t.shape), t.dtype) for t in outputs] == [
+        ((M, N // 2), torch.uint8),
+        ((M, N // 16), torch.float8_e4m3fn),
+        ((N, M // 2), torch.uint8),
+        ((N, M // 16), torch.float8_e4m3fn),
+    ]
+
+
+@requires_cutedsl
+@torch.no_grad()
+def test_ms_eden_raw_default_matches_software_reference():
+    """The raw op keeps its software-SR default; recipe APIs default to fast math."""
+    from ._assertions import assert_scales_bitwise
+
+    dy, offs = _packed([128, 256], 256, seed=225)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 2)
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    args = (
+        dy,
+        ar,
+        ac,
+        d,
+        w,
+        offs,
+        2,
+        dy.shape[0],
+        dy.shape[1],
+        VARYING_FIRST_DIM,
+        rng,
+        offs[-1:],
+    )
+    default = cutedsl_group_row_rht_col_rht_quantize_ms_eden(*args)
+    software = cutedsl_group_row_rht_col_rht_quantize_ms_eden(
+        *args, use_fast_math=False
+    )
+    reference = reference_ms_eden_op(*args)
+    for i, label in enumerate(("row codes", "row scales", "col codes", "col scales")):
+        check = assert_scales_bitwise if i % 2 else assert_codes_bitwise
+        check(default[i], software[i], f"default vs explicit software {label}")
+        check(default[i], reference[i], f"default vs PyTorch {label}")

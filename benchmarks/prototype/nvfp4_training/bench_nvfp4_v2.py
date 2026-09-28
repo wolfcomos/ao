@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Run the nine CuTeDSL V2 kernel benchmarks and compare MS-EDEN variants.
+"""Run the nine CuTeDSL V2 kernel benchmarks and compare fast-math variants.
 
 Each measurement is CUDA kernel self-time, excluding host overhead and copies.
-Inputs are regenerated from the same seed for each variant; default/fast order
+Inputs are regenerated from the same seed for each variant; non-fast/fast order
 alternates between passes. Results are medians of independent profiler passes.
 """
 
@@ -80,15 +80,16 @@ def main():
             config = module.ExperimentConfig(**kwargs)
             variants = (
                 (False, True)
-                if any(f.name == "fast_path" for f in fields(config))
-                else (False,)
+                if any(f.name == "use_fast_math" for f in fields(config))
+                else (None,)
             )
             samples = {fast: [] for fast in variants}
             for trial in range(args.passes):
                 for fast in variants[:: (-1 if trial % 2 else 1)]:
                     torch.manual_seed(123)
                     config = module.ExperimentConfig(
-                        **kwargs, **({"fast_path": fast} if len(variants) == 2 else {})
+                        **kwargs,
+                        **({"use_fast_math": fast} if len(variants) == 2 else {}),
                     )
                     result = module.run_experiment(
                         config, warmup=args.warmup, iters=args.iters
@@ -96,17 +97,17 @@ def main():
                     if result is None:
                         raise RuntimeError(f"No CuTeDSL result for {kernel}")
                     samples[fast].append(result.us["cutedsl"])
-            default = statistics.median(samples[False])
+            baseline = statistics.median(samples[variants[0]])
             for fast, values in samples.items():
                 median = statistics.median(values)
                 record = {
                     "kernel": kernel,
                     **kwargs,
-                    "fast_path": fast,
+                    "use_fast_math": fast,
                     "samples_us": values,
                     "median_us": median,
                     "spread_pct": 100 * (max(values) - min(values)) / median,
-                    "default_over_variant": default / median,
+                    "baseline_over_variant": baseline / median,
                 }
                 records.append(record)
                 print(json.dumps(record), flush=True)
@@ -131,10 +132,12 @@ def main():
                     r["kernel"],
                     r["model"],
                     r["projection"],
-                    "fast" if r["fast_path"] else "default",
+                    "default"
+                    if r["use_fast_math"] is None
+                    else ("fast" if r["use_fast_math"] else "non-fast"),
                     f"{r['median_us']:.3f}",
                     f"{r['spread_pct']:.2f}",
-                    f"{r['default_over_variant']:.2f}x",
+                    f"{r['baseline_over_variant']:.2f}x",
                 ]
                 for r in records
             ],
@@ -145,7 +148,7 @@ def main():
                 "variant",
                 "us",
                 "spread %",
-                "default/variant",
+                "baseline/variant",
             ],
         )
     )

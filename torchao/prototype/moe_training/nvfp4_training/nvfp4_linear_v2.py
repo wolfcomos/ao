@@ -187,7 +187,6 @@ class _NVFP4LinearV2(torch.autograd.Function):
         sr_seed: torch.Tensor,
         use_cutedsl: bool = True,
         use_fast_math: bool = True,
-        ms_eden_fast_path: bool = False,
     ):
         if not use_cutedsl:
             raise ValueError("NVFP4 V2 and V1_REQUANT require CuTeDSL")
@@ -275,7 +274,6 @@ class _NVFP4LinearV2(torch.autograd.Function):
         ctx.has_bias = bias is not None
         ctx.use_cutedsl = use_cutedsl
         ctx.use_fast_math = use_fast_math
-        ctx.ms_eden_fast_path = ms_eden_fast_path
         return output
 
     @staticmethod
@@ -299,7 +297,7 @@ class _NVFP4LinearV2(torch.autograd.Function):
         group_row_rht_col_rht_amax = cutedsl_group_row_rht_col_rht_amax
         group_row_rht_col_rht_quantize_ms_eden = partial(
             cutedsl_group_row_rht_col_rht_quantize_ms_eden,
-            fast_path=ctx.ms_eden_fast_path,
+            use_fast_math=ctx.use_fast_math,
         )
         group_col_rht_requant_amax = cutedsl_group_col_rht_requant_amax
         group_col_rht_requantize = cutedsl_group_col_rht_requantize
@@ -366,8 +364,8 @@ class _NVFP4LinearV2(torch.autograd.Function):
             else None
         )
         # input_hp, weight_hp, bias, wgrad_rht, dgrad_rht, sr_seed, use_cutedsl,
-        # use_fast_math, ms_eden_fast_path
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        # use_fast_math
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
 @torch._dynamo.allow_in_graph
@@ -572,7 +570,6 @@ def nvfp4_linear_v2(
     sr_seed: torch.Tensor,
     kernel_preference: KernelPreference = KernelPreference.AUTO,
     use_fast_math: bool = True,
-    ms_eden_fast_path: bool = False,
 ) -> torch.Tensor:
     """``input @ weight.t() + bias`` under the V2 recipe.
 
@@ -586,10 +583,15 @@ def nvfp4_linear_v2(
         kernel_preference: AUTO and CUTEDSL require CuTeDSL. Explicit TRITON
             is unsupported. Raw weight amax uses a native PyTorch reduction;
             all quantization and RHT operators use CuTeDSL.
-        use_fast_math: match TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
-        ms_eden_fast_path: use hardware stochastic rounding for corrected
-            MS-EDEN scales. FP4 codes agree with the software path; scale bytes
-            use a different Philox mapping and need not agree bitwise.
+        use_fast_math: enable fast arithmetic for both activation quantization and
+            MS-EDEN gradient quantization. True (default) selects optimized MS-EDEN
+            correction and hardware stochastic rounding of corrected E4M3 scales;
+            False selects exact activation arithmetic and software MS-EDEN scale
+            rounding. For fixed gradient inputs, MS-EDEN FP4 codes are unchanged,
+            but the scale RNG mapping
+            differs between modes, so gradients need not agree bitwise. Earlier
+            V2 defaults used software MS-EDEN rounding even with activation fast
+            math enabled; the default now uses hardware scale rounding.
 
     Both sign buffers must be the module-owned tensors that
     ``resample_nvfp4_rht_signs`` updates in place, not fresh allocations.
@@ -604,7 +606,6 @@ def nvfp4_linear_v2(
         sr_seed,
         use_cutedsl,
         use_fast_math,
-        ms_eden_fast_path,
     )
 
 

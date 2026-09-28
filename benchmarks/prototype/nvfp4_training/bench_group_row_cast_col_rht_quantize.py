@@ -10,14 +10,15 @@ One launch over the packed activation x = (E * tokens, dim) bf16 quantizes per g
 raw rows of x_g and the columns of x_g^T @ R -- a 128-point randomized Hadamard transform
 along the tokens (wgrad signs) -- to NVFP4 codes and swizzled E4M3 block scales against the
 group's two amaxes: the V2 forward activation operands, the ``dynamic_rht=True`` path of
-``group_rht_quantize_row_col``. RTNE with ``use_fast_math=True``, the recipe default (the
-baseline table's rows); stochastic rounding is refused on this path by the CuteDSL op.
+``group_rht_quantize_row_col``. RTNE with ``use_fast_math=True`` by default (the recipe default and the
+baseline table's rows); ``--no-use-fast-math`` selects the non-fast arithmetic; stochastic rounding is refused on this path by the CuteDSL op.
 Reports device kernel time (see bench_utils.kernel_time_us) for each available backend on
 the DeepSeek-V3 shapes.
 
     python -m benchmarks.prototype.nvfp4_training.bench_group_row_cast_col_rht_quantize
 """
 
+import argparse
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
@@ -53,6 +54,7 @@ class ExperimentConfig:
     dim: int
     model: str = ""
     projection: str = ""
+    use_fast_math: bool = True
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ def make_runner(
     row_amax: torch.Tensor,
     col_amax: torch.Tensor,
     logical_packed_length: torch.Tensor,
+    use_fast_math: bool = True,
 ) -> Optional[Callable[[], object]]:
     """No-arg callable running ``backend``'s grouped quantize op, or None if unavailable."""
     psl, hidden = x.shape
@@ -107,7 +110,7 @@ def make_runner(
         None,
         False,
         logical_packed_length,
-        True,  # use_fast_math: the recipe default, the baseline table's rows
+        use_fast_math,
         sign_tensor=wgrad_rht,
         dynamic_rht=True,
     )
@@ -130,7 +133,15 @@ def run_experiment(
     us: Dict[str, float] = {}
     for backend in BACKENDS:
         runner = make_runner(
-            backend, x, wgrad_rht, offsets, E, row_amax, col_amax, logical_packed_length
+            backend,
+            x,
+            wgrad_rht,
+            offsets,
+            E,
+            row_amax,
+            col_amax,
+            logical_packed_length,
+            config.use_fast_math,
         )
         if runner is not None:
             us[backend] = kernel_time_us(runner, warmup=warmup, iters=iters)
@@ -177,6 +188,15 @@ def main() -> None:
     if not torch.cuda.is_available() or not is_sm_at_least_100():
         raise RuntimeError("Grouped NVFP4 quantization requires SM100+")
 
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--use-fast-math",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use approximate encode reciprocals and consume FP32 RHT accumulators directly.",
+    )
+    args = parser.parse_args()
+
     torch.random.manual_seed(123)
     configs = [
         ExperimentConfig(
@@ -185,6 +205,7 @@ def main() -> None:
             shape.dim,
             model=shape.model,
             projection=shape.projection,
+            use_fast_math=args.use_fast_math,
         )
         for shape in get_deepseek_v3_activation_shapes(
             "x", factorized_experts=LOCAL_EXPERTS

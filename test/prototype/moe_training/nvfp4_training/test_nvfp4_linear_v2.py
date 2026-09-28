@@ -35,6 +35,7 @@ from torchao.quantization.quantize_.common.kernel_preference import KernelPrefer
 from torchao.quantization.utils import compute_error
 
 from ._v2_marks import maybe_sm100, requires_cutedsl
+from ._v2_test_utils import assert_ms_eden_modes
 
 _needs_v1_requant = requires_cutedsl
 _needs_v2 = requires_cutedsl
@@ -113,19 +114,38 @@ class _RecordOps(TorchDispatchMode):
 
     def __init__(self):
         self.names = set()
-        self.ms_eden_fast_path = None
+        self.quantize_fast_math = {}
+        self.ms_eden_inputs = None
+        self.ms_eden_outputs = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         name = func.name() if hasattr(func, "name") else str(func)
         if name.startswith("torchao::"):
             name = name.split(".")[0]
             self.names.add(name)
-            if name.endswith("_group_row_rht_col_rht_quantize_ms_eden"):
-                # The dispatcher drops a trailing argument left at its default.
-                bound = dict(zip((a.name for a in func._schema.arguments), args))
+            if name.endswith(
+                (
+                    "_group_rht_quantize_row_col",
+                    "_group_row_rht_col_rht_quantize_ms_eden",
+                )
+            ):
+                # Dispatcher schemas supply defaults when trailing args are omitted.
+                bound = {a.name: a.default_value for a in func._schema.arguments}
+                bound.update(zip((a.name for a in func._schema.arguments), args))
                 bound.update(kwargs or {})
-                self.ms_eden_fast_path = bound.get("fast_path", False)
-        return func(*args, **(kwargs or {}))
+                is_ms_eden = name.endswith("_group_row_rht_col_rht_quantize_ms_eden")
+                stage = "ms_eden" if is_ms_eden else "activation"
+                self.quantize_fast_math[stage] = bound["use_fast_math"]
+                if is_ms_eden:
+                    self.ms_eden_inputs = tuple(
+                        bound[a.name]
+                        for a in func._schema.arguments
+                        if a.name != "use_fast_math"
+                    )
+        result = func(*args, **(kwargs or {}))
+        if name.endswith("_group_row_rht_col_rht_quantize_ms_eden"):
+            self.ms_eden_outputs = result
+        return result
 
 
 def _layer(recipe, *, seed=0, bias=False, kernel_preference=KernelPreference.AUTO):
@@ -241,6 +261,33 @@ def test_v1_default_is_unchanged():
     assert model[0].recipe is NVFP4Recipe.V1
     assert model[0]._rht_sign_vector.numel() == 16
     assert not hasattr(model[0], "_dgrad_rht_sign_vector")
+
+
+@pytest.mark.parametrize(
+    "use_fast_math", [None, True, False], ids=["default", "fast", "exact"]
+)
+def test_v2_training_config_forwards_use_fast_math(monkeypatch, use_fast_math):
+    """The CPU config/Module plumbing preserves the unified flag up to the V2 API."""
+    from torchao.prototype.moe_training.nvfp4_training import (
+        nvfp4_training as training_mod,
+    )
+
+    kwargs = {} if use_fast_math is None else {"use_fast_math": use_fast_math}
+    config = NVFP4TrainingConfig(recipe=NVFP4Recipe.V2, **kwargs)
+    expected = True if use_fast_math is None else use_fast_math
+    model = nn.Sequential(nn.Linear(_K, _N, bias=False, dtype=torch.bfloat16))
+    quantize_(model, config)
+    assert isinstance(model[0], NVFP4Linear)
+    assert config.use_fast_math is expected and model[0].use_fast_math is expected
+    seen = []
+
+    def record_forward(x, weight, bias, **call_kwargs):
+        seen.append(call_kwargs["use_fast_math"])
+        return x @ weight.t()
+
+    monkeypatch.setattr(training_mod, "nvfp4_linear_v2", record_forward)
+    model(torch.zeros(1, _K, dtype=torch.bfloat16))
+    assert seen == [expected]
 
 
 @maybe_sm100
@@ -458,14 +505,13 @@ def test_v2_auto_matches_explicit_cutedsl_for_a_fixed_rng_state(bias, monkeypatc
 
 @_needs_v2
 @_requires_cutedsl
-def test_v2_ms_eden_fast_path_moves_only_the_scale_bytes(monkeypatch):
-    """``ms_eden_fast_path`` reaches the CuteDSL MS-EDEN op as ``fast_path=True`` and
-    touches nothing else: the forward is the default path's bitwise, and the gradients
-    stay close to it because only the scale bytes move, each by at most one E4M3 step.
-    Leaving the knob out is the same call as passing ``False``."""
+def test_v2_use_fast_math_controls_activation_and_ms_eden(monkeypatch):
+    """One flag selects both stages; compare MS-EDEN modes with the same dy."""
     fixed = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     monkeypatch.setattr(v2_mod, "_backward_rng_state", lambda sr_seed: fixed)
     layer = _layer(NVFP4Recipe.V2)
+    torch.manual_seed(19)
+    dy = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
 
     def step(**kwargs):
         x = _inputs()
@@ -481,25 +527,33 @@ def test_v2_ms_eden_fast_path_moves_only_the_scale_bytes(monkeypatch):
                 kernel_preference=KernelPreference.CUTEDSL,
                 **kwargs,
             )
-            out.float().square().mean().backward()
+            out.backward(dy)
         return recorder, out, x.grad, weight.grad
 
     default = step()
-    off = step(ms_eden_fast_path=False)
-    fast = step(ms_eden_fast_path=True)
-    assert default[0].ms_eden_fast_path is False and off[0].ms_eden_fast_path is False
-    assert fast[0].ms_eden_fast_path is True
-    for name, want, got in zip(("out", "x.grad", "weight.grad"), default[1:], off[1:]):
-        assert torch.equal(want, got), f"{name} differs between omitted and False"
-    assert torch.equal(default[1], fast[1]), "the fast path is a backward-only change"
-    for name, want, got in zip(("x.grad", "weight.grad"), default[2:], fast[2:]):
-        assert torch.isfinite(got).all(), f"{name} has non-finite values"
+    fast = step(use_fast_math=True)
+    exact = step(use_fast_math=False)
+    for result, expected in ((default, True), (fast, True), (exact, False)):
+        assert result[0].quantize_fast_math == {
+            "activation": expected,
+            "ms_eden": expected,
+        }
+        assert all(torch.isfinite(t).all() for t in result[1:])
+    for name, want, got in zip(("out", "x.grad", "weight.grad"), default[1:], fast[1:]):
+        assert torch.equal(want, got), f"{name} differs between omitted and True"
+    assert_ms_eden_modes(
+        exact[0].ms_eden_inputs,
+        exact[0].ms_eden_outputs,
+        fast[0].ms_eden_outputs,
+    )
+    # Activation quantization also changes, so dW is not a scale-only comparison.
+    for name, want, got in zip(("out", "x.grad", "weight.grad"), exact[1:], fast[1:]):
         assert compute_error(want.float(), got.float()) > 20.0, name
 
 
 @maybe_sm100
 @torch.no_grad()
-def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
+def test_v2_use_fast_math_refuses_triton():
     """Explicit TRITON is rejected for V2, including the MS-EDEN fast path."""
     layer = _layer(NVFP4Recipe.V2)
     with pytest.raises(ValueError, match="AUTO or CUTEDSL"):
@@ -511,7 +565,7 @@ def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
             dgrad_rht=layer._dgrad_rht_sign_vector,
             sr_seed=layer._sr_seed,
             kernel_preference=KernelPreference.TRITON,
-            ms_eden_fast_path=True,
+            use_fast_math=True,
         )
 
 
@@ -585,7 +639,7 @@ def test_cutedsl_prepare_for_cuda_graph_warms_every_v2_kernel():
         num_experts, _N, _K, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     # Both arithmetic modes, forward and backward, dense and grouped: the fused RHT
-    # quantize is keyed on (sr, fast_math), the others on the device alone.
+    # quantize is keyed on (sr, fast_math), and V2 MS-EDEN also has two variants.
     for use_fast_math in (True, False):
         v2_mod.nvfp4_linear_v2(
             _inputs(),
