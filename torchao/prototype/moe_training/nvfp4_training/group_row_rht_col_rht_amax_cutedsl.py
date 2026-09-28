@@ -6,10 +6,7 @@
 
 """CuteDSL grouped rowwise-RHT + columnwise-RHT amax (SM100+).
 
-Drop-in backend for ``triton_group_row_rht_col_rht_amax``: same signature, same
-returns. One tcgen05 kernel applies both RHT-128 transforms to every 128x128 tile
-from a single shared-memory copy of it and reduces both amaxes per group; see
-``_cutedsl_group_kernels_impl``.
+See the public operator docstrings for tensor layouts and rounding contracts.
 """
 
 from typing import Optional, Tuple
@@ -37,7 +34,7 @@ def cutedsl_group_row_rht_col_rht_amax(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-group global amaxes for the V2 backward MS-EDEN operands (CuteDSL, SM100+).
 
-    Signature and returns match ``triton_group_row_rht_col_rht_amax``. ``dy`` is the
+    ``dy`` is the
     packed ``(packed_sequence_length, hidden_size)`` bfloat16 capacity buffer; rows at or
     after ``logical_packed_length == offsets[-1]`` are untouched allocation capacity and
     are never read. ``shape_rep`` is validated but does not reach the kernel: group

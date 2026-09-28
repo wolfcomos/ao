@@ -918,3 +918,60 @@ python -m benchmarks.prototype.nvfp4_training.bench_group_weight_amax
 
 `nvfp4_linear` uses this same op at `E = 1` on `W.unsqueeze(0)` — nothing in the kernel
 is expert-specific beyond the `program_id(1)` base.
+
+
+## NVFP4 V2 grouped kernels
+
+V2 uses dynamic RHT-128, lazy weight requantization and MS-EDEN gradient
+quantization. Its nine benchmark drivers live in this directory. V2 supports
+CuTeDSL only; the V1 benchmarks above retain their Triton comparisons.
+
+GB200 measurement on 2026-09-27, `E=4`: median of three passes, 15 warmups and
+50 timed calls per pass, CUDA kernel self-time excluding host overhead and
+memcpy/memset. PyTorch 2.14.0a0, CUDA 13.5, CuTeDSL 4.8.0.dev0; median active SM
+clock 2062 MHz. The inputs and timings below are MS-EDEN gradient quantization
+only, with precomputed amaxes. They do not measure a full training step.
+
+| model | projection | tokens/expert | hidden | software SR (us) | hardware SR (us) | software/hardware |
+|---|---|---:|---:|---:|---:|---:|
+| 16B | gate/up (w1/w3) | 12288 | 1408 | 73.15 | 56.62 | 1.29x |
+| 16B | down (w2) | 12288 | 2048 | 102.43 | 78.12 | 1.31x |
+| 671B | gate/up (w1/w3) | 32768 | 2048 | 253.55 | 184.30 | 1.38x |
+| 671B | down (w2) | 32768 | 7168 | 863.20 | 621.41 | 1.39x |
+
+V2 uses one `use_fast_math` flag for activation quantization and MS-EDEN gradient
+quantization. The Linear/grouped-MM APIs and `NVFP4TrainingConfig` default to
+`True`, enabling both fast paths. Set it to `False` for the non-fast activation
+arithmetic and software MS-EDEN rounding. The separate `ms_eden_fast_path`
+argument has been removed; callers should pass only `use_fast_math`.
+
+The raw MS-EDEN op also calls its flag `use_fast_math` and retains a `False`
+default, consistent with the other raw quantization ops. Enabling it uses
+hardware stochastic rounding for corrected E4M3 scales.
+Its RNG stream differs from the software path; deterministic FP4 codes
+are tested bitwise, while scale rounding also has reproducibility, adjacent-scale,
+SQNR and unbiasedness tests. A speedup does not imply bitwise equivalence between
+these two scale streams.
+
+These measurements were collected at
+`d822c848422a651b30e49293cb6b85f84178f8c5`; [the result data](nvfp4_v2_gb200_results.json)
+records the toolchain and historical Triton timings. Its software/hardware
+measurements predate the flag consolidation; they are not a new benchmark run.
+The dedicated quantization kernels are unchanged by the CuTeDSL-only cleanup. V2's shared Triton weight-amax
+call is now native PyTorch; that untimed preparation change is not included in
+these kernel speedups. The older [nine-kernel tables](nvfp4_v2_cutedsl_vs_triton.md)
+remain a historical record from their separately documented environment.
+
+Run all nine current V2 kernels, including both activation and MS-EDEN fast-math variants:
+
+```bash
+python -m benchmarks.prototype.nvfp4_training.bench_nvfp4_v2 \
+  --model 671B --experts 4 --passes 3 --warmup 15 --iters 50 --output v2.json
+# Small launch/import smoke for every driver:
+python -m benchmarks.prototype.nvfp4_training.bench_nvfp4_v2 \
+  --model debugmodel --passes 1 --warmup 1 --iters 2
+```
+
+Use `--kernel group_row_rht_col_rht_quantize_ms_eden` for the default/fast
+comparison alone. The JSON output preserves each sample, median and spread;
+variant order alternates between passes.

@@ -34,7 +34,8 @@ NVFP4_CAST_NUMERATOR = 448.0 * 6.0  # 2688.0
 # Per-tensor decode numerator for MS-EDEN operands. MS-EDEN caps the block scale at
 # 256 rather than 448 so the stochastically-rounded scale correction has headroom,
 # which makes the decode numerator smaller by the same factor.
-EDEN_NUMERATOR = 256.0 * 6.0  # 1536.0
+EDEN_BLOCK_SCALE_MAX = 256.0
+EDEN_NUMERATOR = EDEN_BLOCK_SCALE_MAX * 6.0  # 1536.0
 
 
 class NVFP4Recipe(str, Enum):
@@ -103,3 +104,28 @@ def _amax_to_scale(amax: torch.Tensor, numerator: float) -> torch.Tensor:
     spelled out here so the numerator is visible at the call site.
     """
     return amax.to(torch.float32) / numerator
+
+
+def _require_cutedsl(kernel_preference) -> bool:
+    """V2 and lazy weight requantization have a single, explicit kernel backend."""
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    from .hadamard_cutedsl_utils import raise_if_cutedsl_nvfp4_unavailable
+
+    if kernel_preference not in (KernelPreference.AUTO, KernelPreference.CUTEDSL):
+        raise ValueError(
+            "NVFP4 V2 and V1_REQUANT require kernel_preference AUTO or CUTEDSL; TRITON is not supported"
+        )
+    raise_if_cutedsl_nvfp4_unavailable("NVFP4 V2 / V1_REQUANT")
+    return True
+
+
+def _require_cutedsl_backends(kernel_preference, num_experts: int) -> tuple[bool, bool]:
+    _require_cutedsl(kernel_preference)
+    from ._cutedsl_group_kernels_impl import MAX_GROUPS
+
+    if num_experts > MAX_GROUPS:
+        raise ValueError(
+            f"CuTeDSL supports at most {MAX_GROUPS} experts, got {num_experts}"
+        )
+    return True, True

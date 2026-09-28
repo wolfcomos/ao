@@ -4,14 +4,14 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Benchmark the grouped lazy columnwise weight requant amax across backends (triton, cutedsl).
+"""Benchmark the grouped lazy columnwise weight requant amax with CuTeDSL.
 
 One launch over the packed forward weight of the (E, M, N) stack -- the rowwise FP4
 codes and swizzled e4m3 block scales of ``bench_group_row_cast_quantize``'s op -- rebuilds
 W_qdq per expert and returns the per-expert amax of |W_qdq.bf16()|: the amax the
 V1_REQUANT backward's dgrad weight operand is requantized against. No sign vector.
 Reports device kernel time (see bench_utils.kernel_time_us) for each available backend
-on the DeepSeek-V3 shapes, with the cutedsl-vs-triton speedup.
+on the DeepSeek-V3 shapes.
 
     python -m benchmarks.prototype.nvfp4_training.bench_group_col_cast_requant_amax
 """
@@ -21,7 +21,6 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from tabulate import tabulate
-from torch.utils._triton import has_triton
 from tqdm import tqdm
 
 from benchmarks.prototype.nvfp4_training.bench_utils import kernel_time_us
@@ -35,7 +34,7 @@ from torchao.utils import is_sm_at_least_100
 
 device = torch.device("cuda")
 
-BACKENDS = ("triton", "cutedsl")
+BACKENDS = ("cutedsl",)
 
 # The target deployment is high expert parallelism, so the small-E shapes are the
 # representative ones; the ranking inverts at large E and misleads.
@@ -71,13 +70,7 @@ def make_runner(
     num_tensors: int,
 ) -> Optional[Callable[[], object]]:
     """No-arg callable running ``backend``'s grouped requant amax op, or None if unavailable."""
-    if backend == "triton":
-        if not has_triton():
-            return None
-        from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_triton import (
-            triton_group_col_cast_requant_amax as op,
-        )
-    elif backend == "cutedsl":
+    if backend == "cutedsl":
         if not cutedsl_nvfp4_kernels_available():
             return None
         from torchao.prototype.moe_training.nvfp4_training.group_col_cast_requantize_cutedsl import (
@@ -89,27 +82,26 @@ def make_runner(
     return lambda: op(row_fp4_w, row_sf_w, global_amax, num_tensors)
 
 
-def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
+def run_experiment(
+    config: ExperimentConfig, *, warmup: int = 15, iters: int = 50
+) -> Optional[ExperimentResult]:
+    if not cutedsl_nvfp4_kernels_available():
+        raise RuntimeError("NVFP4 V2 benchmarks require SM100+ and the CuTeDSL runtime")
     E, M, N = config.experts, config.m, config.n
     weights = torch.randn((E, M, N), dtype=torch.bfloat16, device=device)
     global_amax = weights.float().abs().amax(dim=(1, 2))
-    # The rowwise codes and scales are inputs, computed once outside the timed region;
-    # the two backends' row-cast ops are bitwise identical, so either feeds both amax ops.
-    if cutedsl_nvfp4_kernels_available():
-        from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
-            cutedsl_group_row_cast_quantize as cast_op,
-        )
-    else:
-        from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
-            triton_group_row_cast_quantize as cast_op,
-        )
+    # Prepare the packed forward weight outside the timed region.
+    from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
+        cutedsl_group_row_cast_quantize as cast_op,
+    )
+
     row_fp4_w, row_sf_w = cast_op(weights, global_amax, E)
 
     us: Dict[str, float] = {}
     for backend in BACKENDS:
         runner = make_runner(backend, row_fp4_w, row_sf_w, global_amax, E)
         if runner is not None:
-            us[backend] = kernel_time_us(runner)
+            us[backend] = kernel_time_us(runner, warmup=warmup, iters=iters)
     if not us:
         return None
 
@@ -128,16 +120,13 @@ def print_results(experiments: List[Experiment]) -> None:
         "M",
         "N",
         "cutedsl_us",
-        "triton_us",
-        "speedup",
         "cutedsl_gbps",
     ]
     rows = []
     for e in experiments:
         us = e.result.us
-        c, t = us.get("cutedsl"), us.get("triton")
-        speedup = f"{t / c:.2f}x" if (c and t) else "n/a"
-        ref = c or t
+        c = us["cutedsl"]
+        ref = c
         gbps = (e.result.moved_bytes / 1e9) / (ref / 1e6)
         rows.append(
             [
@@ -147,8 +136,6 @@ def print_results(experiments: List[Experiment]) -> None:
                 e.config.m,
                 e.config.n,
                 round(c, 3) if c else "n/a",
-                round(t, 3) if t else "n/a",
-                speedup,
                 round(gbps, 1),
             ]
         )

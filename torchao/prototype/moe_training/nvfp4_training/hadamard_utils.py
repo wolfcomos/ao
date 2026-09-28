@@ -237,44 +237,6 @@ if has_triton():
         return x_fp4x2
 
     @triton.jit
-    def convert_4xfp4_packed_to_8xfp32(bytes4):
-        """Inverse of ``convert_8xfp32_to_4xfp4_packed``.
-
-        One uint8 tile in; two fp32 tiles out (low-nibble columns, high-nibble
-        columns), interleaved back into the original column order. FP4 -> FP16 is a
-        widening conversion and therefore exact, so this round-trips the packer
-        bit-for-bit.
-        """
-        lo, hi = tl.inline_asm_elementwise(
-            asm="""
-            {
-            .reg .b8  b0, b1, b2, b3;
-            .reg .b32 p0, p1, p2, p3;
-            .reg .b16 l0, h0, l1, h1, l2, h2, l3, h3;
-            mov.b32 {b0, b1, b2, b3}, $8;          // 4 packed bytes -> 4 x b8
-            cvt.rn.f16x2.e2m1x2 p0, b0;            // byte -> 2 f16 (widening = exact)
-            cvt.rn.f16x2.e2m1x2 p1, b1;
-            cvt.rn.f16x2.e2m1x2 p2, b2;
-            cvt.rn.f16x2.e2m1x2 p3, b3;
-            mov.b32 {l0, h0}, p0;                  // split f16x2 -> lo/hi halves
-            mov.b32 {l1, h1}, p1;
-            mov.b32 {l2, h2}, p2;
-            mov.b32 {l3, h3}, p3;
-            cvt.f32.f16 $0, l0;   cvt.f32.f16 $4, h0;
-            cvt.f32.f16 $1, l1;   cvt.f32.f16 $5, h1;
-            cvt.f32.f16 $2, l2;   cvt.f32.f16 $6, h2;
-            cvt.f32.f16 $3, l3;   cvt.f32.f16 $7, h3;
-            }
-            """,
-            constraints="=r,=r,=r,=r,=r,=r,=r,=r,r",
-            args=[bytes4],
-            dtype=(tl.float32, tl.float32),
-            is_pure=True,
-            pack=4,
-        )
-        return tl.interleave(lo, hi)
-
-    @triton.jit
     def convert_8xfp32_to_4xfp4_packed_rs(x_pairs, rbits):
         """Convert 8 FP32 values to 4 packed FP4 bytes using stochastic rounding.
         Calls two cvt.rs instructions, each packing four FP32 values into one packed int8."""
@@ -381,117 +343,6 @@ if has_triton():
             safe_global_amax.shape, 1.0, safe_global_amax.dtype
         )  # div_rn needs a tensor numerator
         return global_encode_scale, tl.div_rn(one, global_encode_scale)
-
-    @triton.jit
-    def _nvfp4_dequantize(
-        qa_fp4, sfa, gds, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
-    ):
-        """Decode one packed NVFP4 tile back to FP32. The inverse of the encode half
-        of ``_nvfp4_quantize``.
-
-        Two steps, both of which the name has to carry: **unpack** the two FP4 codes
-        per byte into FP32 lanes, then **rescale** each 16-element vector by its FP8
-        block scale and the per-tensor global decode scale. It is not a rescale alone
-        -- the unpack is why the output has 2x the elements of the input.
-
-        Used to dequantize the quantize forward weight tile and in four or six 
-        quantization in forward.
-
-        Args:
-            qa_fp4: ``(BLOCK_M, BLOCK_N//2)`` packed uint8 FP4 codes.
-            sfa: ``(BLOCK_M, BLOCK_N//16)`` per-vector FP8 scale factors, already
-                un-swizzled (see ``_load_scales_swizzle``).
-            gds: per-tensor global *decode* scale from ``_nvfp4_global_scales``.
-
-        Returns ``(BLOCK_M, BLOCK_N//16, 16)`` FP32; reshape to ``(BLOCK_M, BLOCK_N)``
-        for a plain 2D view.
-
-        Used by:
-            ``_reconstruct_qdq_weight_tile`` below, its only caller -- which is to say
-            every lazy requantization kernel, and nothing else. The forward quantize
-            path never decodes.
-        """
-        qa_f32_unpacked = convert_4xfp4_packed_to_8xfp32(qa_fp4)
-        qa_f32_blocked = qa_f32_unpacked.reshape(BLOCK_M, BLOCK_N // 16, 16)
-        return qa_f32_blocked * sfa[:, :, None] * gds
-
-    @triton.jit
-    def _reconstruct_qdq_weight_tile(
-        qw_ptr,
-        sfw_ptr,
-        global_amax_ptr,
-        expert,
-        pid_m,
-        pid_n,
-        M,
-        N,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Reconstruct one ``W_qdq`` tile of expert ``expert`` on chip, in bf16.
-
-        Reads the rowwise operand §11.1 saved -- ``(E, M, N//2)`` packed codes plus
-        ``(E, M//128, N//64, 32, 16)`` swizzled scales -- and returns a
-        ``(BLOCK_M, BLOCK_N)`` bf16 tile, un-transposed and un-rotated.
-
-        Every lazy requantization path starts here: the cast one (§11.6/§11.7) then
-        transposes, the RHT one (§11.4/§11.5) transposes and rotates. It is one
-        function rather than one per file because the amax pass and the quantize pass
-        must reconstruct bit-identically -- if they drift, the amax stops bounding the
-        tensor being quantized and both gradients come out biased low. The two files
-        select between each other by recipe off the same saved weight, so that
-        invariant has to hold across them, not just within each.
-
-        The bf16 round-through here is required, not incidental: the reference takes
-        it, and dropping it makes the codes differ.
-
-        Used by:
-            ``_load_requant_weight_tile`` in ``group_col_cast_requantize_triton.py``,
-            feeding ``_group_col_cast_requant_amax_kernel`` (§11.6) and
-            ``_group_col_cast_requantize_kernel`` (§11.7).
-
-            ``_load_rht_requant_weight_tile`` in ``group_col_rht_requantize_triton.py``,
-            feeding ``_group_col_rht_requant_amax_kernel`` (§11.4) and
-            ``_group_col_rht_requantize_kernel`` (§11.5).
-
-            All four are lazy-requantization kernels: they rebuild the backward
-            operand from the rowwise weight §11.1 saved, rather than re-reading the
-            original BF16 weight. Any new kernel that decodes a saved forward weight
-            belongs on this helper too.
-        """
-        # Load packed fp4 codes
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        packed_inner = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
-        packed_offsets = offs_m[:, None] * (N // 2) + packed_inner[None, :]
-        qw_expert_ptr = qw_ptr + expert * M * (N // 2)
-        qw = tl.load(qw_expert_ptr + packed_offsets)
-
-        # Load swizzled scales
-        sfw_expert_stride = (M // 128) * (N // 64) * 32 * 16
-        sfw_expert_ptr = sfw_ptr + expert * sfw_expert_stride
-        sfw = _load_scales_swizzle(
-            sfw_expert_ptr,
-            pid_m,
-            pid_n,
-            M,
-            N,
-            BLOCK_M,
-            BLOCK_N,
-        )
-
-        # Load global amax precomputed in forward pass. Per expert -- a reduction
-        # across experts would decode every expert with expert 0's scale. This must be
-        # the exact scale the forward encoded with, which is why it goes through
-        # _nvfp4_global_scales rather than an open-coded divide.
-        FP8_E4M3_MAX: tl.constexpr = 448.0
-        amax_w = tl.load(global_amax_ptr + expert)
-        _, global_decode_scale = _nvfp4_global_scales(amax_w, FP8_E4M3_MAX)
-        dequant_w = _nvfp4_dequantize(qw, sfw, global_decode_scale, BLOCK_M, BLOCK_N)
-
-        # A NaN or inf global_amax must reconstruct to zero, not propagate.
-        valid_amax = (amax_w == amax_w) & (tl.abs(amax_w) != float("inf"))
-        dequant_w = tl.where(valid_amax, dequant_w, 0.0).to(tl.bfloat16)
-        return tl.reshape(dequant_w, [BLOCK_M, BLOCK_N])
 
     @triton.jit
     def _nvfp4_quantize(
@@ -623,54 +474,6 @@ if has_triton():
         tl.store(flat_ptrs, flat_val, mask=flat_msk)
 
     @triton.jit
-    def _load_scales_swizzle(
-        sf_ptr,
-        pid_outer,
-        pid_inner,
-        OUTER,
-        INNER,
-        BLOCK_OUTER: tl.constexpr,
-        BLOCK_INNER: tl.constexpr,
-    ):
-        """Load one swizzled scale tile and return its plain ``(outer, inner//16)`` view.
-
-        The read counterpart of ``_store_scales_swizzle``, needed by the
-        requantization kernels: they consume the swizzled E4M3 scales the forward
-        wrote and must undo the SWIZZLE_32_4_4 permutation on chip to reconstruct
-        ``W_qdq``.
-        """
-        BLOCK_OUTER_TILES: tl.constexpr = BLOCK_OUTER // 128
-        BLOCK_INNER_TILES: tl.constexpr = BLOCK_INNER // 64
-        FLAT_TILE: tl.constexpr = BLOCK_OUTER_TILES * BLOCK_INNER_TILES * TILE_ELEMS
-
-        INNER_TILES = tl.cdiv(INNER, 64)
-        OUTER_TILES = tl.cdiv(OUTER, 128)
-        rb_idx = pid_outer * BLOCK_OUTER_TILES + tl.arange(0, BLOCK_OUTER_TILES)
-        cb_idx = pid_inner * BLOCK_INNER_TILES + tl.arange(0, BLOCK_INNER_TILES)
-        elem_idx = tl.arange(0, TILE_ELEMS)
-        offsets = (
-            rb_idx[:, None, None].to(tl.int64) * INNER_TILES * TILE_ELEMS
-            + cb_idx[None, :, None] * TILE_ELEMS
-            + elem_idx[None, None, :]
-        )
-        mask = (
-            (rb_idx[:, None, None] < OUTER_TILES)
-            & (cb_idx[None, :, None] < INNER_TILES)
-            & (elem_idx[None, None, :] < TILE_ELEMS)
-        )
-        swizzled = tl.load(
-            sf_ptr + tl.reshape(offsets, (FLAT_TILE,)),
-            mask=tl.reshape(mask, (FLAT_TILE,)),
-            other=0.0,
-        )
-        swizzled = tl.reshape(
-            swizzled,
-            [BLOCK_OUTER_TILES, BLOCK_INNER_TILES, 32, 4, 4],
-        )
-        plain = tl.permute(swizzled, [0, 3, 2, 1, 4])
-        return tl.reshape(plain, [BLOCK_OUTER, BLOCK_INNER // 16])
-
-    @triton.jit
     def _store_grouped_scales_swizzle(
         scale_inv,
         sf_ptr,
@@ -725,9 +528,6 @@ else:
     def convert_8xfp32_to_4xfp4_packed(*args, **kwargs):
         raise RuntimeError("convert_8xfp32_to_4xfp4_packed requires Triton")
 
-    def convert_4xfp4_packed_to_8xfp32(*args, **kwargs):
-        raise RuntimeError("convert_4xfp4_packed_to_8xfp32 requires Triton")
-
     def convert_8xfp32_to_4xfp4_packed_rs(*args, **kwargs):
         raise RuntimeError("convert_8xfp32_to_4xfp4_packed_rs requires Triton")
 
@@ -737,12 +537,6 @@ else:
     def _nvfp4_global_scales(*args, **kwargs):
         raise RuntimeError("_nvfp4_global_scales requires Triton")
 
-    def _nvfp4_dequantize(*args, **kwargs):
-        raise RuntimeError("_nvfp4_dequantize requires Triton")
-
-    def _reconstruct_qdq_weight_tile(*args, **kwargs):
-        raise RuntimeError("_reconstruct_qdq_weight_tile requires Triton")
-
     def _nvfp4_quantize(*args, **kwargs):
         raise RuntimeError("_nvfp4_quantize requires Triton")
 
@@ -751,9 +545,6 @@ else:
 
     def _store_scales_swizzle(*args, **kwargs):
         raise RuntimeError("_store_scales_swizzle requires Triton")
-
-    def _load_scales_swizzle(*args, **kwargs):
-        raise RuntimeError("_load_scales_swizzle requires Triton")
 
     def _store_grouped_scales_swizzle(*args, **kwargs):
         raise RuntimeError("_store_grouped_scales_swizzle requires Triton")

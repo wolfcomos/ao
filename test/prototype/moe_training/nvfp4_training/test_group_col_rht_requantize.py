@@ -11,8 +11,7 @@ dgrad GEMM cancel: the ``dy`` operand carries ``R_n`` too. One ``dgrad_rht`` is 
 across every expert, which is the grouped-plus-RHT case the implementation must
 support.
 
-Both ops select their backend through the ``kernel`` parametrization (``_KERNELS``);
-the requantize tests take the same backend's amax, which is bitwise across backends.
+the requantize tests independently compute the PyTorch reference amax.
 """
 
 import pytest
@@ -27,36 +26,27 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 )
 
 from ._assertions import assert_codes_bitwise, assert_scales_bitwise
-from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
-from .nvfp4_reference import (
+from ._v2_marks import maybe_sm100, requires_cutedsl
+from ._v2_reference_ops import (
+    reference_col_rht_amax_op,
+    reference_col_rht_op,
+    reference_row_cast_op,
+    reference_weight_amax,
+)
+from .nvfp4_v2_reference import (
     reference_col_rht_requant_amax,
     reference_group_col_rht_requant_amax,
     reference_group_col_rht_requantize,
 )
 
-# Flip to True once both @triton.jit bodies in group_col_rht_requantize_triton.py land.
-_KERNEL_IMPLEMENTED = True
-_needs_kernel = kernel_gate(_KERNEL_IMPLEMENTED, "group_col_rht_requantize_triton.py")
+_needs_kernel = requires_cutedsl
 _skip_no_cutedsl = pytest.mark.skipif(
     not cutedsl_nvfp4_kernels_available(),
     reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
 )
 _KERNELS = [
-    pytest.param("triton", id="triton"),
     pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
 ]
-
-if TRITON_AVAILABLE:
-    from torchao.prototype.moe_training.nvfp4_training.group_col_rht_requantize_triton import (
-        triton_group_col_rht_requant_amax,
-        triton_group_col_rht_requantize,
-    )
-    from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
-        triton_group_row_cast_quantize,
-    )
-    from torchao.prototype.moe_training.nvfp4_training.group_weight_amax_triton import (
-        triton_group_weight_amax,
-    )
 
 
 def _signs(device="cuda", seed=0):
@@ -68,15 +58,15 @@ def _signs(device="cuda", seed=0):
 def _packed_weights(E, M, N, *, seed=0, scale=0.05):
     torch.manual_seed(seed)
     W = (torch.randn(E, M, N, device="cuda") * scale).bfloat16()
-    amax = triton_group_weight_amax(W, E)
-    codes, scales = triton_group_row_cast_quantize(W, amax, E)
+    amax = reference_weight_amax(W, E)
+    codes, scales = reference_row_cast_op(W, amax, E)
     return W, codes, scales, amax
 
 
 def _amax(kernel, codes, scales, amax, d, E):
     op = (
-        triton_group_col_rht_requant_amax
-        if kernel == "triton"
+        reference_col_rht_amax_op
+        if kernel == "reference"
         else cutedsl_group_col_rht_requant_amax
     )
     return op(codes, scales, amax, d, E)
@@ -84,8 +74,8 @@ def _amax(kernel, codes, scales, amax, d, E):
 
 def _requant(kernel, codes, scales, amax, amax_t, d, E):
     op = (
-        triton_group_col_rht_requantize
-        if kernel == "triton"
+        reference_col_rht_op
+        if kernel == "reference"
         else cutedsl_group_col_rht_requantize
     )
     return op(codes, scales, amax, amax_t, d, E)
@@ -154,7 +144,7 @@ def test_amax_is_computed_from_the_quantized_weight(kernel):
     once the rotation is involved, because ``W`` and ``W_qdq`` differ per element even
     though their maxima coincide (see the note in the unrotated twin's test file).
     """
-    from .nvfp4_reference import reference_dynamic_rht
+    from .nvfp4_v2_reference import reference_dynamic_rht
 
     W, codes, scales, amax = _packed_weights(1, 256, 512)
     d = _signs()
@@ -228,7 +218,7 @@ def test_decode_numerator_is_2688_not_1536(kernel):
     with the MS-EDEN numerator must disagree, so the test is sensitive to the mistake
     the design doc calls out as "backward off by roughly 40%".
     """
-    from .nvfp4_reference import EDEN_BLOCK_SCALE_MAX, reference_dequantize_rowwise
+    from .nvfp4_v2_reference import EDEN_BLOCK_SCALE_MAX, reference_dequantize_rowwise
 
     _, codes, scales, amax = _packed_weights(1, 256, 512)
     d = _signs()
@@ -282,7 +272,7 @@ def test_rejects_a_non_128_sign_vector(kernel, bad_len):
         _amax(kernel, codes, scales, amax, bad, E)
 
 
-# --- CuteDSL vs Triton, bitwise ---------------------------------------------
+# --- CuTeDSL vs PyTorch, bitwise ---------------------------------------------
 
 
 _BITWISE_CASES = [
@@ -300,14 +290,11 @@ _BITWISE_CASES = [
 @_skip_no_cutedsl
 @pytest.mark.parametrize("E,M,N", _BITWISE_CASES)
 @torch.no_grad()
-def test_cutedsl_amax_matches_triton(E, M, N):
-    """Bitwise by construction: both backends issue the same tcgen05 (128,128,16) bf16
-    UMMAs over K = 128 in the same order on the same product values (the sign vector
-    moves from ``R_n`` onto the dequantized operand, an exact flip), then round once to
-    bf16. A mismatch is a bug or a Triton lowering change, never tolerance."""
+def test_cutedsl_amax_matches_pytorch(E, M, N):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     _, codes, scales, amax = _packed_weights(E, M, N, seed=225)
     d = _signs(seed=0)
-    t_amax = _amax("triton", codes, scales, amax, d, E)
+    t_amax = _amax("reference", codes, scales, amax, d, E)
     c_amax = _amax("cutedsl", codes, scales, amax, d, E)
     assert torch.equal(c_amax, t_amax)
 
@@ -316,15 +303,14 @@ def test_cutedsl_amax_matches_triton(E, M, N):
 @_skip_no_cutedsl
 @pytest.mark.parametrize("E,M,N", _BITWISE_CASES)
 @torch.no_grad()
-def test_cutedsl_requantize_matches_triton(E, M, N):
-    """Same chain, then the RTNE 1x16 quantize instruction for instruction: codes and
-    scale bytes are bitwise, each backend fed by its own (bitwise) amax."""
+def test_cutedsl_requantize_matches_pytorch(E, M, N):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     _, codes, scales, amax = _packed_weights(E, M, N, seed=225)
     d = _signs(seed=0)
-    t_amax = _amax("triton", codes, scales, amax, d, E)
+    t_amax = _amax("reference", codes, scales, amax, d, E)
     c_amax = _amax("cutedsl", codes, scales, amax, d, E)
     assert torch.equal(c_amax, t_amax)
-    t_codes, t_scales = _requant("triton", codes, scales, amax, t_amax, d, E)
+    t_codes, t_scales = _requant("reference", codes, scales, amax, t_amax, d, E)
     c_codes, c_scales = _requant("cutedsl", codes, scales, amax, c_amax, d, E)
     assert_codes_bitwise(c_codes, t_codes, "codes")
     assert torch.equal(c_scales.view(torch.uint8), t_scales.view(torch.uint8))
@@ -333,22 +319,18 @@ def test_cutedsl_requantize_matches_triton(E, M, N):
 @_needs_kernel
 @_skip_no_cutedsl
 @torch.no_grad()
-def test_cutedsl_requantize_matches_triton_on_nan_scales():
-    """A NaN scale byte reconstructs its whole rowwise block to NaN, which the RHT-128
-    then spreads over whole columnwise blocks, so no block mixes a NaN with finite values
-    and the backends agree independently of the maxNum block amax the raw-row kernels
-    rely on. The requantization amax itself still propagates the NaN on both backends, so
-    the finite amax of the unpoisoned weight is supplied instead."""
+def test_cutedsl_requantize_matches_pytorch_on_nan_scales():
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     E, M, N = 2, 256, 512
     _, codes, scales, amax = _packed_weights(E, M, N, seed=225)
     d = _signs(seed=0)
-    amax_t = _amax("triton", codes, scales, amax, d, E)
+    amax_t = _amax("reference", codes, scales, amax, d, E)
     scale_bytes = scales.view(torch.uint8).view(E, -1)
     scale_bytes[0, [0, 5, 77, 1000]] = 0x7F
     scale_bytes[1, [3, 1234]] = 0xFF  # the negative-signed NaN
-    assert torch.isnan(_amax("triton", codes, scales, amax, d, E)).all()
+    assert torch.isnan(_amax("reference", codes, scales, amax, d, E)).all()
     assert torch.isnan(_amax("cutedsl", codes, scales, amax, d, E)).all()
-    t_codes, t_scales = _requant("triton", codes, scales, amax, amax_t, d, E)
+    t_codes, t_scales = _requant("reference", codes, scales, amax, amax_t, d, E)
     c_codes, c_scales = _requant("cutedsl", codes, scales, amax, amax_t, d, E)
     assert_codes_bitwise(c_codes, t_codes, "codes")
     assert torch.equal(c_scales.view(torch.uint8), t_scales.view(torch.uint8))
@@ -358,16 +340,16 @@ def test_cutedsl_requantize_matches_triton_on_nan_scales():
 @_skip_no_cutedsl
 @pytest.mark.parametrize("signs", ["random", "all-minus-one"])
 @torch.no_grad()
-def test_cutedsl_degenerate_experts_match_triton(signs):
+def test_cutedsl_degenerate_experts_match_pytorch(signs):
     """An all-zero expert and NaN / inf ``global_amax`` experts reconstruct to zero rows
-    in both backends; with every sign negative each zero product is ``-0`` and only an
-    accumulator that starts from ``+0``, as Triton's does, keeps the code nibble 0x0."""
+    in the target and reference; with every sign negative each zero product is ``-0`` and only an
+    accumulator that starts from ``+0``, as the matrix product does, keeps the code nibble 0x0."""
     E = 4
     torch.manual_seed(0)
     W = (torch.randn(E, 256, 512, device="cuda") * 0.05).bfloat16()
     W[3] = 0
-    amax = triton_group_weight_amax(W, E)
-    codes, scales = triton_group_row_cast_quantize(W, amax, E)
+    amax = reference_weight_amax(W, E)
+    codes, scales = reference_row_cast_op(W, amax, E)
     amax[1] = float("nan")
     amax[2] = float("inf")
     d = (
@@ -375,10 +357,10 @@ def test_cutedsl_degenerate_experts_match_triton(signs):
         if signs == "random"
         else -torch.ones(128, dtype=torch.int8, device="cuda")
     )
-    t_amax = _amax("triton", codes, scales, amax, d, E)
+    t_amax = _amax("reference", codes, scales, amax, d, E)
     c_amax = _amax("cutedsl", codes, scales, amax, d, E)
     assert torch.equal(c_amax, t_amax)
-    t_codes, t_scales = _requant("triton", codes, scales, amax, t_amax, d, E)
+    t_codes, t_scales = _requant("reference", codes, scales, amax, t_amax, d, E)
     c_codes, c_scales = _requant("cutedsl", codes, scales, amax, c_amax, d, E)
     assert_codes_bitwise(c_codes, t_codes, "codes")
     assert torch.equal(c_scales.view(torch.uint8), t_scales.view(torch.uint8))

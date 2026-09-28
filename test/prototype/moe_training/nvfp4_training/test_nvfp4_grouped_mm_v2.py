@@ -24,17 +24,13 @@ from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import NVFP4Reci
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 from torchao.quantization.utils import compute_error
 
-from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
+from ._v2_marks import CUTEDSL_AVAILABLE, maybe_sm100, requires_cutedsl
+from ._v2_test_utils import assert_ms_eden_modes
 
-_V1_REQUANT_KERNELS_IMPLEMENTED = True
-_V2_KERNELS_IMPLEMENTED = True
-_needs_v1_requant = kernel_gate(
-    _V1_REQUANT_KERNELS_IMPLEMENTED, "the §11.1/§11.6/§11.7 kernels"
-)
-_needs_v2 = kernel_gate(_V2_KERNELS_IMPLEMENTED, "the §11.1-§11.9 kernels")
+_needs_v1_requant = requires_cutedsl
+_needs_v2 = requires_cutedsl
 
-if TRITON_AVAILABLE:
-    from torchao.prototype.moe_training.nvfp4_training import nvfp4_grouped_mm
+if CUTEDSL_AVAILABLE:
     from torchao.prototype.moe_training.nvfp4_training import (
         nvfp4_grouped_mm_v2 as gmm_v2_mod,
     )
@@ -45,7 +41,6 @@ if TRITON_AVAILABLE:
 
 _KERNEL_PREFERENCES = [
     pytest.param(KernelPreference.AUTO, id="auto"),
-    pytest.param(KernelPreference.TRITON, id="triton"),
     pytest.param(
         KernelPreference.CUTEDSL,
         marks=pytest.mark.skipif(
@@ -56,7 +51,7 @@ _KERNEL_PREFERENCES = [
     ),
 ]
 
-# For tests that run BOTH backends in one body.
+# For tests that require the CuTeDSL runtime.
 _requires_cutedsl = pytest.mark.skipif(
     not cutedsl_nvfp4_kernels_available(), reason="requires the CuteDSL runtime"
 )
@@ -83,7 +78,6 @@ _KERNELS = {
         "group_row_rht_col_rht_quantize_ms_eden",
         "group_col_rht_requant_amax",
         "group_col_rht_requantize",
-        "group_weight_amax",
     },
     NVFP4Recipe.V1_REQUANT: {
         "group_rht_amax",
@@ -91,34 +85,21 @@ _KERNELS = {
         "group_row_cast_quantize",
         "group_col_cast_requant_amax",
         "group_col_cast_requantize",
-        "group_weight_amax",
     },
 }
 
 
 def _expected_ops(recipe, kernel_preference):
-    """The exact ``torchao::`` op set a recipe dispatches on the resolved backend.
-
-    The weight amax has no CuteDSL twin and is Triton on every path.
-    """
-    if kernel_preference is KernelPreference.AUTO:
-        kernel_preference = (
-            KernelPreference.CUTEDSL
-            if cutedsl_nvfp4_kernels_available()
-            else KernelPreference.TRITON
-        )
-    if kernel_preference is KernelPreference.TRITON:
-        return {"torchao::triton_" + k for k in _KERNELS[recipe]}
-    return {"torchao::triton_group_weight_amax"} | {
-        "torchao::cutedsl_" + k for k in _KERNELS[recipe] - {"group_weight_amax"}
-    }
+    return {"torchao::cutedsl_" + k for k in _KERNELS[recipe] - {"group_weight_amax"}}
 
 
 class _RecordOps(TorchDispatchMode):
     def __init__(self):
         self.names = set()
         self.kernels = set()
-        self.ms_eden_fast_path = None
+        self.quantize_fast_math = {}
+        self.ms_eden_inputs = None
+        self.ms_eden_outputs = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         name = func.name() if hasattr(func, "name") else str(func)
@@ -127,12 +108,29 @@ class _RecordOps(TorchDispatchMode):
             self.names.add(name)
             # torchao::<backend>_<kernel> -> <kernel>
             self.kernels.add(name.split("::")[1].split("_", 1)[1])
-            if name.endswith(_MS_EDEN_OP):
-                # The dispatcher drops a trailing argument left at its default.
-                bound = dict(zip((a.name for a in func._schema.arguments), args))
+            if name.endswith(
+                (
+                    "_group_rht_quantize_row_col",
+                    "_group_row_rht_col_rht_quantize_ms_eden",
+                )
+            ):
+                # Dispatcher schemas supply defaults when trailing args are omitted.
+                bound = {a.name: a.default_value for a in func._schema.arguments}
+                bound.update(zip((a.name for a in func._schema.arguments), args))
                 bound.update(kwargs or {})
-                self.ms_eden_fast_path = bound.get("fast_path", False)
-        return func(*args, **(kwargs or {}))
+                is_ms_eden = name.endswith("_group_row_rht_col_rht_quantize_ms_eden")
+                stage = "ms_eden" if is_ms_eden else "activation"
+                self.quantize_fast_math[stage] = bound["use_fast_math"]
+                if is_ms_eden:
+                    self.ms_eden_inputs = tuple(
+                        bound[a.name]
+                        for a in func._schema.arguments
+                        if a.name != "use_fast_math"
+                    )
+        result = func(*args, **(kwargs or {}))
+        if name.endswith("_group_row_rht_col_rht_quantize_ms_eden"):
+            self.ms_eden_outputs = result
+        return result
 
 
 def _signs(seed=0, n=128):
@@ -382,17 +380,17 @@ def test_single_expert_matches_three_dense_linears():
     [([128, 384, 256], False), ([64, 320, 128], True)],
     ids=["aligned", "padded"],
 )
-def test_v2_backends_are_bitwise_for_a_fixed_rng_state(sizes, pad, monkeypatch):
-    """A V2 grouped step on CuteDSL reproduces the Triton step bitwise once the
-    Philox state MS-EDEN receives is pinned. The padded parameter runs the real
-    ``pad_token_groups`` path on both backends."""
+def test_v2_auto_matches_explicit_cutedsl_for_a_fixed_rng_state(
+    sizes, pad, monkeypatch
+):
+    """AUTO and explicit CuTeDSL select the same V2 operators and RNG mapping."""
     fixed = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     # The grouped module binds _backward_rng_state at import, so it is pinned here.
     monkeypatch.setattr(gmm_v2_mod, "_backward_rng_state", lambda sr_seed: fixed)
     state = _state()
 
     results = []
-    for kernel_preference in (KernelPreference.TRITON, KernelPreference.CUTEDSL):
+    for kernel_preference in (KernelPreference.AUTO, KernelPreference.CUTEDSL):
         _, _, w2, _, offs = _moe_inputs(sizes, 512, 256)
         h = torch.randn(
             sum(sizes), 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
@@ -415,15 +413,14 @@ def test_v2_backends_are_bitwise_for_a_fixed_rng_state(sizes, pad, monkeypatch):
 
 @_needs_v2
 @_requires_cutedsl
-def test_v2_ms_eden_fast_path_moves_only_the_scale_bytes(monkeypatch):
-    """``ms_eden_fast_path`` reaches the CuteDSL MS-EDEN op as ``fast_path=True`` and
-    touches nothing else: the forward is the default path's bitwise, and the gradients
-    stay close to it because only the scale bytes move, each by at most one E4M3 step.
-    Leaving the knob out is the same call as passing ``False``."""
+def test_v2_use_fast_math_controls_activation_and_ms_eden(monkeypatch):
+    """One flag selects both stages; compare MS-EDEN modes with the same dy."""
     fixed = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     monkeypatch.setattr(gmm_v2_mod, "_backward_rng_state", lambda sr_seed: fixed)
     sizes = [128, 384, 256]
     state = _state()
+    torch.manual_seed(19)
+    dy = torch.randn(sum(sizes), 512, device="cuda", dtype=torch.bfloat16)
 
     def step(**kwargs):
         _, _, w2, _, offs = _moe_inputs(sizes, 512, 256)
@@ -441,30 +438,37 @@ def test_v2_ms_eden_fast_path_moves_only_the_scale_bytes(monkeypatch):
                 kernel_preference=KernelPreference.CUTEDSL,
                 **kwargs,
             )
-            out.float().square().mean().backward()
+            out.backward(dy)
         return recorder, out, h.grad, w2.grad
 
     default = step()
-    off = step(ms_eden_fast_path=False)
-    fast = step(ms_eden_fast_path=True)
-    assert default[0].ms_eden_fast_path is False and off[0].ms_eden_fast_path is False
-    assert fast[0].ms_eden_fast_path is True
-    for name, want, got in zip(("out", "h.grad", "w2.grad"), default[1:], off[1:]):
-        assert torch.equal(want, got), f"{name} differs between omitted and False"
-    assert torch.equal(default[1], fast[1]), "the fast path is a backward-only change"
-    for name, want, got in zip(("h.grad", "w2.grad"), default[2:], fast[2:]):
-        assert torch.isfinite(got).all(), f"{name} has non-finite values"
+    fast = step(use_fast_math=True)
+    exact = step(use_fast_math=False)
+    for result, expected in ((default, True), (fast, True), (exact, False)):
+        assert result[0].quantize_fast_math == {
+            "activation": expected,
+            "ms_eden": expected,
+        }
+        assert all(torch.isfinite(t).all() for t in result[1:])
+    for name, want, got in zip(("out", "h.grad", "w2.grad"), default[1:], fast[1:]):
+        assert torch.equal(want, got), f"{name} differs between omitted and True"
+    assert_ms_eden_modes(
+        exact[0].ms_eden_inputs,
+        exact[0].ms_eden_outputs,
+        fast[0].ms_eden_outputs,
+    )
+    # Activation quantization also changes, so dW is not a scale-only comparison.
+    for name, want, got in zip(("out", "h.grad", "w2.grad"), exact[1:], fast[1:]):
         assert compute_error(want.float(), got.float()) > 20.0, name
 
 
 @maybe_sm100
 @torch.no_grad()
-def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
-    """The fast path is a variant of the CuteDSL kernel, so a call whose MS-EDEN op
-    resolves to Triton refuses it before any kernel runs."""
+def test_v2_use_fast_math_refuses_triton():
+    """Explicit TRITON is rejected for V2, including the MS-EDEN fast path."""
     _, _, w2, _, offs = _moe_inputs([128, 128], 512, 256)
     h = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="requires the MS-EDEN op on CuteDSL"):
+    with pytest.raises(ValueError, match="AUTO or CUTEDSL"):
         nvfp4_v2_grouped_mm(
             h,
             w2.detach(),
@@ -473,21 +477,19 @@ def test_ms_eden_fast_path_refuses_a_triton_ms_eden():
             sr_seed=_seed(1),
             offs=offs,
             kernel_preference=KernelPreference.TRITON,
-            ms_eden_fast_path=True,
+            use_fast_math=True,
         )
 
 
 @_needs_v1_requant
 @_requires_cutedsl
 @torch.no_grad()
-def test_v1_requant_forward_is_bitwise_across_backends():
-    """The forward's three ops are bitwise twins. There is deliberately no
-    cross-backend ``_ffn`` check: FC1's backward is the stochastic-rounding cast of
-    ``dy``, the one site whose CuteDSL twin draws a different Philox stream."""
+def test_v1_requant_auto_matches_explicit_cutedsl():
+    """AUTO and explicit CuTeDSL agree on the lazy weight recipe forward."""
     sizes = [128, 384, 256]
     state = _state()
     outs = []
-    for kernel_preference in (KernelPreference.TRITON, KernelPreference.CUTEDSL):
+    for kernel_preference in (KernelPreference.AUTO, KernelPreference.CUTEDSL):
         x, w1, _, _, offs = _moe_inputs(sizes, 256, 512)
         outs.append(
             nvfp4_v1_requant_grouped_mm(
@@ -506,9 +508,7 @@ def test_v1_requant_forward_is_bitwise_across_backends():
 @pytest.mark.parametrize("kernel_preference", _KERNEL_PREFERENCES)
 @pytest.mark.parametrize("recipe", _RECIPES)
 def test_recipe_dispatches_only_the_resolved_backend(recipe, kernel_preference):
-    """Every quantize and amax op runs on the backend ``kernel_preference`` resolves
-    to, in forward and backward alike; the weight amax has no CuteDSL twin and stays
-    Triton."""
+    """Every quantization/RHT custom operator belongs to CuTeDSL; raw weight amax uses ATen."""
     sizes = [128, 128]
     x, w1, w2, _, offs = _moe_inputs(sizes, 256, 512)
     state = _state()
@@ -539,86 +539,6 @@ def test_recipe_dispatches_only_the_resolved_backend(recipe, kernel_preference):
 
 
 @maybe_sm100
-@pytest.mark.parametrize("recipe", _RECIPES)
-@torch.no_grad()
-def test_auto_falls_back_to_triton_without_cutedsl(recipe, monkeypatch):
-    """AUTO degrades to Triton where CuteDSL cannot run, matching an explicit TRITON
-    call bitwise (RTNE forward only)."""
-    x, w1, w2, _, offs = _moe_inputs([128, 128], 256, 512)
-    state = _state()
-    h = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
-
-    def run(kernel_preference):
-        if recipe is NVFP4Recipe.V2:
-            return nvfp4_v2_grouped_mm(
-                h,
-                w2,
-                wgrad_rht=state["fc2_wgrad"],
-                dgrad_rht=state["fc2_dgrad"],
-                sr_seed=state["fc2_seed"],
-                offs=offs,
-                kernel_preference=kernel_preference,
-            )
-        return nvfp4_v1_requant_grouped_mm(
-            x,
-            w1,
-            sign_vector=state["fc1_signs"],
-            sr_seed=state["fc1_seed"],
-            offs=offs,
-            kernel_preference=kernel_preference,
-        )
-
-    expected = run(KernelPreference.TRITON)
-    # The resolver is V1's, so the availability probe it reads lives in V1's module.
-    monkeypatch.setattr(
-        nvfp4_grouped_mm, "cutedsl_nvfp4_kernels_available", lambda: False
-    )
-    with _RecordOps() as recorder:
-        got = run(KernelPreference.AUTO)
-    assert recorder.names, "no torchao op was recorded; the probe is not working"
-    leaked = {n for n in recorder.names if n.startswith("torchao::cutedsl_")}
-    assert not leaked, f"AUTO reached CuteDSL without the runtime: {sorted(leaked)}"
-    assert torch.equal(got, expected)
-
-
-@maybe_sm100
-@pytest.mark.parametrize("recipe", _RECIPES)
-@torch.no_grad()
-def test_cutedsl_raises_without_the_runtime(recipe, monkeypatch):
-    monkeypatch.setattr(
-        nvfp4_grouped_mm, "cutedsl_nvfp4_kernels_available", lambda: False
-    )
-    x, w1, w2, _, offs = _moe_inputs([128, 128], 256, 512)
-    state = _state()
-    h = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
-
-    def run(kernel_preference):
-        if recipe is NVFP4Recipe.V2:
-            return nvfp4_v2_grouped_mm(
-                h,
-                w2,
-                wgrad_rht=state["fc2_wgrad"],
-                dgrad_rht=state["fc2_dgrad"],
-                sr_seed=state["fc2_seed"],
-                offs=offs,
-                kernel_preference=kernel_preference,
-            )
-        return nvfp4_v1_requant_grouped_mm(
-            x,
-            w1,
-            sign_vector=state["fc1_signs"],
-            sr_seed=state["fc1_seed"],
-            offs=offs,
-            kernel_preference=kernel_preference,
-        )
-
-    with pytest.raises(RuntimeError, match="CUTEDSL requires"):
-        run(KernelPreference.CUTEDSL)
-    with pytest.raises(ValueError, match="AUTO, TRITON, or CUTEDSL"):
-        run(KernelPreference.TORCH)
-
-
-@maybe_sm100
 @_requires_cutedsl
 @torch.no_grad()
 def test_cutedsl_rejects_more_than_64_experts():
@@ -635,54 +555,6 @@ def test_cutedsl_rejects_more_than_64_experts():
             offs=offs,
             kernel_preference=KernelPreference.CUTEDSL,
         )
-
-
-@_needs_v2
-@_requires_cutedsl
-@pytest.mark.parametrize("num_experts", [64, 65], ids=["at_cap", "past_cap"])
-def test_auto_splits_backends_around_the_64_expert_cap(num_experts, monkeypatch):
-    """At the cap AUTO runs every twin on CuteDSL; one expert past it the four
-    token-jagged ops fall back to Triton while the three weight ops stay on CuteDSL,
-    in forward and backward alike. Either way the step is bitwise to all-Triton:
-    every op on the AUTO path is a bitwise twin or Triton itself."""
-    fixed = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
-    monkeypatch.setattr(gmm_v2_mod, "_backward_rng_state", lambda sr_seed: fixed)
-    state = _state()
-
-    def step(kernel_preference):
-        x, w1, _, _, offs = _moe_inputs([128] * num_experts, 256, 256)
-        out = nvfp4_v2_grouped_mm(
-            x,
-            w1,
-            wgrad_rht=state["fc2_wgrad"],
-            dgrad_rht=state["fc2_dgrad"],
-            sr_seed=state["fc2_seed"],
-            offs=offs,
-            kernel_preference=kernel_preference,
-        )
-        out.float().square().mean().backward()
-        return out, x.grad, w1.grad
-
-    with _RecordOps() as recorder:
-        auto = step(KernelPreference.AUTO)
-    if num_experts <= 64:
-        expected = _expected_ops(NVFP4Recipe.V2, KernelPreference.CUTEDSL)
-    else:
-        expected = {
-            "torchao::triton_group_rht_amax",
-            "torchao::triton_group_rht_quantize_row_col",
-            "torchao::triton_group_row_rht_col_rht_amax",
-            "torchao::triton_group_row_rht_col_rht_quantize_ms_eden",
-            "torchao::triton_group_weight_amax",
-            "torchao::cutedsl_group_row_cast_quantize",
-            "torchao::cutedsl_group_col_rht_requant_amax",
-            "torchao::cutedsl_group_col_rht_requantize",
-        }
-    assert recorder.names == expected
-
-    triton = step(KernelPreference.TRITON)
-    for name, got, want in zip(("out", "x.grad", "w1.grad"), auto, triton):
-        assert torch.equal(got, want), f"{name} differs between AUTO and TRITON"
 
 
 # ---------------------------------------------------------------------------
@@ -753,3 +625,15 @@ def test_contraction_dimension_mismatch_is_caught():
         nvfp4_v1_requant_grouped_mm(
             x.detach(), bad, sign_vector=(1,) * 16, sr_seed=_seed(1), offs=offs
         )
+
+
+@pytest.mark.parametrize(
+    "preference", [KernelPreference.TRITON, KernelPreference.TORCH]
+)
+def test_lazy_recipes_reject_unsupported_backends(preference):
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
+        _require_cutedsl,
+    )
+
+    with pytest.raises(ValueError, match="AUTO or CUTEDSL"):
+        _require_cutedsl(preference)

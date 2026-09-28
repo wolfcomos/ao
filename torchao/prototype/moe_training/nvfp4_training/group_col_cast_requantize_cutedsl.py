@@ -6,14 +6,7 @@
 
 """CuteDSL grouped lazy columnwise NVFP4 weight requantization (SM100+).
 
-Drop-in backends for ``triton_group_col_cast_requant_amax`` (§11.6) and
-``triton_group_col_cast_requantize`` (§11.7): same signatures, same returns. Both kernels
-read the packed forward weight -- the rowwise codes and swizzled scales of
-``group_row_cast_quantize`` -- and never the BF16 weight, so the amax bounds the very
-``W_qdq`` the dgrad operand is requantized from (the invariant the Triton module
-docstring calls load-bearing); see ``_cutedsl_kernels_impl``.
-
-No sign vector: these apply no transform.
+See the public operator docstrings for tensor layouts and rounding contracts.
 """
 
 from typing import Tuple
@@ -38,12 +31,10 @@ def cutedsl_group_col_cast_requant_amax(
 ) -> torch.Tensor:
     """Per-expert amax of the dequantized forward weight, transposed (CuteDSL, SM100+).
 
-    Signature and returns match ``triton_group_col_cast_requant_amax``: ``(E,)`` float32
+    Returns ``(E,)`` float32
     ``out[g] = dequantize(row_fp4_w[g]).bf16().abs().amax()``, computed from the
-    *quantized* weight and bitwise the Triton op's for finite scale bytes (a NaN scale
-    byte, which §11.1 never emits, is NaN in both backends but with a different
-    payload). An expert whose ``global_amax`` is NaN or inf reconstructs to zero and
-    reports 0.0, as the Triton kernel does.
+    *quantized* weight. A NaN scale byte propagates to the expert amax. An expert whose ``global_amax`` is NaN or inf reconstructs to zero and
+    reports 0.0.
 
     Raises:
         NotImplementedError: pre-SM100 or a missing CuteDSL runtime.
@@ -78,11 +69,11 @@ def cutedsl_group_col_cast_requantize(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-expert columnwise NVFP4 requantization of the forward weight (CuteDSL, SM100+).
 
-    Signature and returns match ``triton_group_col_cast_requantize``: ``(E, N, M//2)``
+    Returns ``(E, N, M//2)``
     uint8 codes (rowwise ``W_qdq.T``) and ``(E, N//128, M//64, 32, 16)`` float8_e4m3fn
-    swizzled scales, bitwise the Triton op's. ``amax_w_qdq_t`` must come from §11.6. The
+    swizzled scales. ``amax_w_qdq_t`` must come from §11.6. The
     transpose is a plain SMEM gather, not an MMA against an identity, so the sign of an
-    exact zero survives as in Triton.
+    exact zero survives.
 
     Raises:
         NotImplementedError: pre-SM100 or a missing CuteDSL runtime.

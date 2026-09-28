@@ -11,8 +11,8 @@ axes are transformed with **independent** sign vectors. A crossed pair produces 
 error, only a wrong gradient, so the tests that separate the two vectors are the
 important ones here.
 
-Both ops select their backend through the ``kernel`` parametrization (``_KERNELS``);
-the MS-EDEN tests take the same backend's amax, which is bitwise across backends.
+The target is CuTeDSL. PyTorch computes the independent expected amax, packed
+codes and software-SR scale bytes; hardware-SR scales use property tests.
 """
 
 import math
@@ -31,37 +31,26 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 )
 
 from ._assertions import assert_codes_bitwise, assert_scales_adjacent
-from ._v2_marks import TRITON_AVAILABLE, kernel_gate, maybe_sm100
-from .nvfp4_reference import (
+from ._v2_marks import CUTEDSL_AVAILABLE, maybe_sm100, requires_cutedsl
+from ._v2_reference_ops import reference_dual_amax_op, reference_ms_eden_op
+from .nvfp4_v2_reference import (
     reference_group_row_rht_col_rht_amax,
     reference_row_rht_col_rht_amax,
 )
 
-_AMAX_IMPLEMENTED = True
-_MS_EDEN_IMPLEMENTED = True
-_needs_amax = kernel_gate(_AMAX_IMPLEMENTED, "group_row_rht_col_rht_amax_triton.py")
-_needs_ms_eden = kernel_gate(
-    _AMAX_IMPLEMENTED and _MS_EDEN_IMPLEMENTED,
-    "group_row_rht_col_rht_quantize_ms_eden_triton.py",
-)
+_needs_amax = requires_cutedsl
+_needs_ms_eden = requires_cutedsl
 _skip_no_cutedsl = pytest.mark.skipif(
     not cutedsl_nvfp4_kernels_available(),
     reason="requires SM100 (Blackwell) + CuteDSL runtime (cuda-python, nvidia-cutlass-dsl)",
 )
 _KERNELS = [
-    pytest.param("triton", id="triton"),
     pytest.param("cutedsl", marks=_skip_no_cutedsl, id="cutedsl"),
 ]
 
-if TRITON_AVAILABLE:
+if CUTEDSL_AVAILABLE:
     from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
         VARYING_FIRST_DIM,
-    )
-    from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_triton import (
-        triton_group_row_rht_col_rht_amax,
-    )
-    from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_triton import (
-        triton_group_row_rht_col_rht_quantize_ms_eden,
     )
 
 
@@ -84,8 +73,8 @@ def _packed(group_sizes, hidden, *, seed=0):
 
 def _amax(kernel, dy, d, w, offs, E):
     op = (
-        triton_group_row_rht_col_rht_amax
-        if kernel == "triton"
+        reference_dual_amax_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_amax
     )
     return op(dy, d, w, offs, E, dy.shape[0], dy.shape[1], VARYING_FIRST_DIM, offs[-1:])
@@ -93,8 +82,8 @@ def _amax(kernel, dy, d, w, offs, E):
 
 def _ms_eden(kernel, dy, ar, ac, d, w, offs, E, rng):
     op = (
-        triton_group_row_rht_col_rht_quantize_ms_eden
-        if kernel == "triton"
+        reference_ms_eden_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_quantize_ms_eden
     )
     return op(
@@ -110,12 +99,13 @@ def _ms_eden(kernel, dy, ar, ac, d, w, offs, E, rng):
         VARYING_FIRST_DIM,
         rng,
         offs[-1:],
+        **({"use_fast_math": False} if kernel != "reference" else {}),
     )
 
 
 def _ms_eden_fast(dy, ar, ac, d, w, offs, E, rng):
     """The CuteDSL op's ``FAST_PATH`` (hardware stochastic rounding, one Philox draw per
-    16 scales): a different random stream from the Triton op's, so never compared bitwise
+    16 scales): a different random stream from the software path's, so never compared bitwise
     to it -- only its codes are."""
     return cutedsl_group_row_rht_col_rht_quantize_ms_eden(
         dy,
@@ -130,7 +120,7 @@ def _ms_eden_fast(dy, ar, ac, d, w, offs, E, rng):
         VARYING_FIRST_DIM,
         rng,
         offs[-1:],
-        fast_path=True,
+        use_fast_math=True,
     )
 
 
@@ -273,8 +263,8 @@ def test_resampled_signs_change_the_output_without_retracing(kernel):
         return graph_module.forward
 
     op = (
-        triton_group_row_rht_col_rht_amax
-        if kernel == "triton"
+        reference_dual_amax_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_amax
     )
 
@@ -318,14 +308,12 @@ _BITWISE_CASES = [
 @_skip_no_cutedsl
 @pytest.mark.parametrize("group_sizes,hidden", _BITWISE_CASES)
 @torch.no_grad()
-def test_cutedsl_amax_matches_triton(group_sizes, hidden):
-    """Bitwise by construction: both backends issue the same tcgen05 (128,128,16) bf16
-    UMMAs over K = 128 in the same order on the same operand bytes, then round once to
-    bf16. A mismatch is a bug or a Triton lowering change, never tolerance."""
+def test_cutedsl_amax_matches_pytorch(group_sizes, hidden):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     dy, offs = _packed(group_sizes, hidden, seed=225)
     d, w = _signs(seed=0), _signs(seed=1)
     E = len(group_sizes)
-    t_row, t_col = _amax("triton", dy, d, w, offs, E)
+    t_row, t_col = _amax("reference", dy, d, w, offs, E)
     c_row, c_col = _amax("cutedsl", dy, d, w, offs, E)
     assert torch.equal(c_row, t_row) and torch.equal(c_col, t_col)
 
@@ -339,8 +327,8 @@ def test_amax_excludes_rows_past_logical_packed_length(kernel):
     capacity[:256] = dy
     d, w = _signs(seed=0), _signs(seed=1)
     op = (
-        triton_group_row_rht_col_rht_amax
-        if kernel == "triton"
+        reference_dual_amax_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_amax
     )
     got = op(capacity, d, w, offs, 2, 512, 512, VARYING_FIRST_DIM, offs[-1:])
@@ -428,7 +416,7 @@ def test_ms_eden_is_unbiased(kernel):
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         reference_dequantize_rowwise,
         reference_dynamic_rht,
@@ -483,7 +471,7 @@ def test_codes_are_rtne_from_the_pre_correction_scale(kernel):
     every other test in this file. It also pins the whole deterministic chain at once:
     RHT-128, the 256 ceiling, the block amax, the TE scale chain, RTNE and the packing.
     """
-    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+    from .nvfp4_v2_reference import reference_dynamic_rht, reference_ms_eden
 
     M, N = 256, 512
     dy, offs = _packed([M], N, seed=2)
@@ -564,7 +552,7 @@ def test_multi_group_matches_the_reference(kernel, group_sizes):
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         from_blocked_grouped,
         reference_group_row_rht_col_rht_quantize_ms_eden,
     )
@@ -601,20 +589,15 @@ def test_multi_group_matches_the_reference(kernel, group_sizes):
 @_skip_no_cutedsl
 @pytest.mark.parametrize("group_sizes,hidden", _BITWISE_CASES)
 @torch.no_grad()
-def test_cutedsl_ms_eden_matches_triton(group_sizes, hidden):
-    """Codes are bitwise by construction (same UMMAs, one bf16 rounding, RTNE); the scale
-    bytes are the same Philox word at the same counter through the same fp32 chain, so
-    they are bitwise too. A mismatch is a bug or a Triton lowering change, never
-    tolerance. The second rng_state has a negative seed (both key words 0xFFFFFFFx), an
-    offset whose high word must be ignored, a max seed and an offset with the top bit of
-    its low word set."""
+def test_cutedsl_ms_eden_matches_pytorch(group_sizes, hidden):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     dy, offs = _packed(group_sizes, hidden, seed=225)
     d, w = _signs(seed=0), _signs(seed=1)
     E = len(group_sizes)
     ar, ac = _amax("cutedsl", dy, d, w, offs, E)
     for words in ([1, 2, 3, 4], [-7, 2**32 + 5, 2**63 - 1, 2**31]):
         rng = torch.tensor(words, dtype=torch.int64, device="cuda")
-        t = _ms_eden("triton", dy, ar, ac, d, w, offs, E, rng)
+        t = _ms_eden("reference", dy, ar, ac, d, w, offs, E, rng)
         c = _ms_eden("cutedsl", dy, ar, ac, d, w, offs, E, rng)
         for got, ref, label in zip(
             c, t, ("row codes", "row scales", "col codes", "col scales")
@@ -626,11 +609,8 @@ def test_cutedsl_ms_eden_matches_triton(group_sizes, hidden):
 @_skip_no_cutedsl
 @pytest.mark.parametrize("group_sizes,hidden", _BITWISE_CASES)
 @torch.no_grad()
-def test_cutedsl_ms_eden_matches_triton_on_nan_blocks(group_sizes, hidden):
-    """The RHT-128 on both axes spreads a NaN in ``dy`` over whole 1x16 blocks, so no
-    block mixes a NaN with finite values and the backends agree independently of the
-    maxNum block amax the raw-row kernels rely on. The amaxes are taken over the NaN-free
-    tensor, since the NaN-propagating group amax would hide the block."""
+def test_cutedsl_ms_eden_matches_pytorch_on_nan_blocks(group_sizes, hidden):
+    """Check CuTeDSL output bytes against the independent PyTorch reference."""
     dy, offs = _packed(group_sizes, hidden, seed=225)
     dy[0, 0] = float("nan")
     dy[1, hidden - 1] = float("nan")
@@ -639,7 +619,7 @@ def test_cutedsl_ms_eden_matches_triton_on_nan_blocks(group_sizes, hidden):
     E = len(group_sizes)
     ar, ac = _amax("cutedsl", torch.nan_to_num(dy, 0.0, 0.0, 0.0), d, w, offs, E)
     rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
-    t = _ms_eden("triton", dy, ar, ac, d, w, offs, E, rng)
+    t = _ms_eden("reference", dy, ar, ac, d, w, offs, E, rng)
     c = _ms_eden("cutedsl", dy, ar, ac, d, w, offs, E, rng)
     for got, ref, label in zip(
         c, t, ("row codes", "row scales", "col codes", "col scales")
@@ -687,7 +667,7 @@ def test_fast_path_scales_are_neighbours_of_the_default_path(group_sizes):
     held to the same one-step band as in ``test_multi_group_matches_the_reference``."""
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         from_blocked_grouped,
         reference_group_row_rht_col_rht_quantize_ms_eden,
     )
@@ -741,7 +721,7 @@ def test_fast_path_rounds_up_with_the_fractional_position():
     """
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import reference_dynamic_rht, reference_ms_eden
+    from .nvfp4_v2_reference import reference_dynamic_rht, reference_ms_eden
 
     M = N = 4096
     dy, offs = _packed([M], N, seed=7)
@@ -826,7 +806,7 @@ def test_fast_path_is_unbiased():
     the bound)."""
     from torchao.prototype.mx_formats.utils import from_blocked
 
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         reference_dequantize_rowwise,
         reference_dynamic_rht,
@@ -914,7 +894,7 @@ def test_ms_eden_keeps_rn_error_and_sr_unbiasedness(kernel):
     half of itself and would put MS-EDEN above SR). The table and the reference line
     under it are what ``pytest -s`` prints.
     """
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         FP4_E2M1_MAX,
         decode_fp4_codes,
@@ -1062,7 +1042,7 @@ def test_fast_path_sqnr_matches_the_default_path(group_sizes, hidden):
     from torchao.prototype.mx_formats.utils import from_blocked
 
     from ._assertions import assert_zero_quantized
-    from .nvfp4_reference import (
+    from .nvfp4_v2_reference import (
         EDEN_BLOCK_SCALE_MAX,
         from_blocked_grouped,
         reference_dequantize_rowwise,
@@ -1175,12 +1155,12 @@ def test_fast_path_each_rng_slice_drives_exactly_one_output():
 @torch.no_grad()
 def test_ms_eden_excludes_rows_past_logical_packed_length(kernel):
     """Capacity rows beyond offsets[-1] are never read; the tails are left as allocated in
-    both backends. Codes and rowwise scales do not depend on the capacity, so their valid
+    the target and reference. Codes and rowwise scales do not depend on the capacity, so their valid
     prefixes equal the full-extent call's. The columnwise stochastic draw is counted over
-    the capacity (Triton's ``INNER = M``), so the full-extent call is a different draw and
+    the capacity (the full allocated inner dimension), so the full-extent call is a different draw and
     its scales are compared between two capacity buffers that differ only past
     ``offsets[-1]``: equal valid prefixes show the valid outputs do not depend on the
-    tail's contents. The CuteDSL capacity draw is also compared with Triton's."""
+    tail's contents. The CuTeDSL capacity draw is compared with the PyTorch Philox reference."""
     dy, offs = _packed([128, 128], 512)
     capacity = torch.full((512, 512), float("inf"), device="cuda", dtype=torch.bfloat16)
     capacity[:256] = dy
@@ -1190,8 +1170,8 @@ def test_ms_eden_excludes_rows_past_logical_packed_length(kernel):
     ar, ac = _amax(kernel, dy, d, w, offs, 2)
     rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     op = (
-        triton_group_row_rht_col_rht_quantize_ms_eden
-        if kernel == "triton"
+        reference_ms_eden_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_quantize_ms_eden
     )
     got = op(
@@ -1221,15 +1201,15 @@ def test_ms_eden_excludes_rows_past_logical_packed_length(kernel):
     assert torch.equal(got[3].flatten()[:valid], other[3].flatten()[:valid])
     # The columnwise draw is counted over the capacity (Triton's INNER = M), so the
     # capacity call's valid col scales are a different draw from the full-extent call's
-    # -- both backends.
+    # -- the target and reference.
     assert not torch.equal(got[3].flatten()[:valid], full[3].flatten())
     if kernel == "cutedsl":
         # The only spare-capacity case: the CuteDSL columnwise draw must be pitched by
-        # the capacity like Triton's, not by offsets[-1].
-        tri = triton_group_row_rht_col_rht_quantize_ms_eden(
+        # the allocated capacity, not by offsets[-1].
+        reference_out = reference_ms_eden_op(
             capacity, ar, ac, d, w, offs, 2, 512, 512, VARYING_FIRST_DIM, rng, offs[-1:]
         )
-        assert torch.equal(got[3].flatten()[:valid], tri[3].flatten()[:valid])
+        assert torch.equal(got[3].flatten()[:valid], reference_out[3].flatten()[:valid])
 
 
 @maybe_sm100
@@ -1255,13 +1235,13 @@ def test_register_fake_shapes_and_return_order(kernel):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     op = (
-        triton_group_row_rht_col_rht_amax
-        if kernel == "triton"
+        reference_dual_amax_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_amax
     )
     ms_eden_op = (
-        triton_group_row_rht_col_rht_quantize_ms_eden
-        if kernel == "triton"
+        reference_ms_eden_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_quantize_ms_eden
     )
     M, N, E = 512, 256, 2
@@ -1311,9 +1291,85 @@ def test_ms_eden_always_requires_an_rng_state(kernel):
     sv = torch.ones(128, dtype=torch.int8, device="cuda")
     amax = torch.ones(E, dtype=torch.float32, device="cuda")
     op = (
-        triton_group_row_rht_col_rht_quantize_ms_eden
-        if kernel == "triton"
+        reference_ms_eden_op
+        if kernel == "reference"
         else cutedsl_group_row_rht_col_rht_quantize_ms_eden
     )
     with pytest.raises(TypeError, match="rng_state must be a torch.Tensor"):
         op(dy, amax, amax, sv, sv, offs, E, M, N, VARYING_FIRST_DIM, None, offs[-1:])
+
+
+@pytest.mark.parametrize(
+    "use_fast_math", [None, True, False], ids=["default", "fast", "exact"]
+)
+def test_ms_eden_fake_accepts_unified_fast_math(use_fast_math):
+    """Both variants and the raw-op default expose the same compile-time contract."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from torchao.prototype.moe_training.nvfp4_training.group_hadamard_utils import (
+        VARYING_FIRST_DIM,
+    )
+
+    kwargs = {} if use_fast_math is None else {"use_fast_math": use_fast_math}
+    M, N, E = 512, 256, 2
+    with FakeTensorMode():
+        dy = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        signs = torch.empty(128, dtype=torch.int8, device="cuda")
+        offs = torch.empty(E, dtype=torch.int32, device="cuda")
+        amax = torch.empty(E, dtype=torch.float32, device="cuda")
+        rng = torch.empty(4, dtype=torch.int64, device="cuda")
+        outputs = cutedsl_group_row_rht_col_rht_quantize_ms_eden(
+            dy,
+            amax,
+            amax,
+            signs,
+            signs,
+            offs,
+            E,
+            M,
+            N,
+            VARYING_FIRST_DIM,
+            rng,
+            **kwargs,
+        )
+    assert [(tuple(t.shape), t.dtype) for t in outputs] == [
+        ((M, N // 2), torch.uint8),
+        ((M, N // 16), torch.float8_e4m3fn),
+        ((N, M // 2), torch.uint8),
+        ((N, M // 16), torch.float8_e4m3fn),
+    ]
+
+
+@requires_cutedsl
+@torch.no_grad()
+def test_ms_eden_raw_default_matches_software_reference():
+    """The raw op keeps its software-SR default; recipe APIs default to fast math."""
+    from ._assertions import assert_scales_bitwise
+
+    dy, offs = _packed([128, 256], 256, seed=225)
+    d, w = _signs(seed=0), _signs(seed=1)
+    ar, ac = _amax("cutedsl", dy, d, w, offs, 2)
+    rng = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    args = (
+        dy,
+        ar,
+        ac,
+        d,
+        w,
+        offs,
+        2,
+        dy.shape[0],
+        dy.shape[1],
+        VARYING_FIRST_DIM,
+        rng,
+        offs[-1:],
+    )
+    default = cutedsl_group_row_rht_col_rht_quantize_ms_eden(*args)
+    software = cutedsl_group_row_rht_col_rht_quantize_ms_eden(
+        *args, use_fast_math=False
+    )
+    reference = reference_ms_eden_op(*args)
+    for i, label in enumerate(("row codes", "row scales", "col codes", "col scales")):
+        check = assert_scales_bitwise if i % 2 else assert_codes_bitwise
+        check(default[i], software[i], f"default vs explicit software {label}")
+        check(default[i], reference[i], f"default vs PyTorch {label}")

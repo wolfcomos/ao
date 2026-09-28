@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Benchmark the dense-expert grouped NVFP4 rowwise (1x16) weight quantize across backends.
+"""Benchmark the dense-expert grouped NVFP4 rowwise (1x16) weight quantize with CuTeDSL.
 
 One launch over the whole (E, M, N) stack produces two outputs per expert: rowwise FP4
 codes + swizzled e4m3 block scales for the forward GEMM. RTNE, no RHT, and no columnwise
@@ -18,7 +18,6 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from tabulate import tabulate
-from torch.utils._triton import has_triton
 from tqdm import tqdm
 
 from benchmarks.prototype.nvfp4_training.bench_utils import kernel_time_us
@@ -32,7 +31,7 @@ from torchao.utils import is_sm_at_least_100
 
 device = torch.device("cuda")
 
-BACKENDS = ("triton", "cutedsl")
+BACKENDS = ("cutedsl",)
 
 # The target deployment is high expert parallelism, so the small-E shapes are the
 # representative ones; the ranking inverts at large E and misleads.
@@ -67,13 +66,7 @@ def make_runner(
     num_tensors: int,
 ) -> Optional[Callable[[], object]]:
     """No-arg callable running ``backend``'s grouped rowwise quantize, or None if unavailable."""
-    if backend == "triton":
-        if not has_triton():
-            return None
-        from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_triton import (
-            triton_group_row_cast_quantize as op,
-        )
-    elif backend == "cutedsl":
+    if backend == "cutedsl":
         if not cutedsl_nvfp4_kernels_available():
             return None
         from torchao.prototype.moe_training.nvfp4_training.group_row_cast_quantize_cutedsl import (
@@ -85,7 +78,11 @@ def make_runner(
     return lambda: op(weights, global_amax, num_tensors)
 
 
-def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
+def run_experiment(
+    config: ExperimentConfig, *, warmup: int = 15, iters: int = 50
+) -> Optional[ExperimentResult]:
+    if not cutedsl_nvfp4_kernels_available():
+        raise RuntimeError("NVFP4 V2 benchmarks require SM100+ and the CuTeDSL runtime")
     E, M, N = config.experts, config.m, config.n
     weights = torch.randn((E, M, N), dtype=torch.bfloat16, device=device)
     global_amax = weights.float().abs().amax(dim=(1, 2))
@@ -94,7 +91,7 @@ def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
     for backend in BACKENDS:
         runner = make_runner(backend, weights, global_amax, E)
         if runner is not None:
-            us[backend] = kernel_time_us(runner)
+            us[backend] = kernel_time_us(runner, warmup=warmup, iters=iters)
     if not us:
         return None
 
@@ -112,16 +109,13 @@ def print_results(experiments: List[Experiment]) -> None:
         "M",
         "N",
         "cutedsl_us",
-        "triton_us",
-        "speedup",
         "cutedsl_gbps",
     ]
     rows = []
     for e in experiments:
         us = e.result.us
-        c, t = us.get("cutedsl"), us.get("triton")
-        speedup = f"{t / c:.2f}x" if (c and t) else "n/a"
-        ref = c or t
+        c = us["cutedsl"]
+        ref = c
         gbps = (e.result.moved_bytes / 1e9) / (ref / 1e6)
         rows.append(
             [
@@ -131,8 +125,6 @@ def print_results(experiments: List[Experiment]) -> None:
                 e.config.m,
                 e.config.n,
                 round(c, 3) if c else "n/a",
-                round(t, 3) if t else "n/a",
-                speedup,
                 round(gbps, 1),
             ]
         )

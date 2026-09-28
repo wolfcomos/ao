@@ -116,7 +116,9 @@ class NVFP4TrainingConfig(AOBaseConfig):
                 resampling buys.
 
             V1_REQUANT and V2 are single-GPU only for now: ``process_group`` raises.
-        kernel_preference: Backend for quantization kernels.
+        kernel_preference: Backend for quantization kernels. V2 and V1_REQUANT
+            require AUTO or CUTEDSL and the CuTeDSL runtime; their raw weight
+            amax uses PyTorch. The following backend choices apply to V1.
             AUTO: CuteDSL where its runtime allows, Triton otherwise. Both backends
                 accept the same shapes, on the tensor-parallel path as on the single-GPU
                 one, so the choice is availability alone and there is nothing for AUTO
@@ -141,11 +143,10 @@ class NVFP4TrainingConfig(AOBaseConfig):
             grouped paths alike** -- both draw through ``philox4_all``. SR runs in the
             backward pass, so the same seed on a node without the CuteDSL runtime
             yields different gradients -- statistically equivalent, not bitwise equal.
-            That applies to V1 and V1_REQUANT, which round ``dy`` stochastically through
-            the RHT quantize; V2's MS-EDEN draws the same stream on both backends, so a
-            fixed RNG state gives bitwise-equal V2 gradients on either.
-            Pin kernel_preference explicitly for runs that must reproduce bitwise
-            across machines.
+            V1 and V1_REQUANT round ``dy`` stochastically through the RHT quantize.
+            V2 uses CuTeDSL only, and its MS-EDEN scale RNG mapping depends on
+            ``use_fast_math``. Pin both settings for runs that must reproduce
+            bitwise across machines.
         process_group: Optional ProcessGroup for tensor-parallel TP.
             When set, forward dispatches to the NVFP4 tensor-parallel path on the
             backend kernel_preference resolves to, exactly as the single-GPU path does.
@@ -158,13 +159,21 @@ class NVFP4TrainingConfig(AOBaseConfig):
             consistency should broadcast a single vector before calling
             quantize_() and pass it here.  The TP path always enforces
             consistency via _replicate_rht_sign_vector regardless of this field.
-        use_fast_math: Match TransformerEngine under ``NVTE_USE_FAST_MATH=1``: the RHT
+        use_fast_math: Enable fast arithmetic for activation quantization: the RHT
             quantize consumes the FP32 accumulator directly and takes an approximate
-            reciprocal. On by default; both backends implement it and remain bitwise
-            identical to TE and to each other. Set False to recover the exact-math
-            arithmetic.  Default: True.
+            reciprocal, matching TransformerEngine under ``NVTE_USE_FAST_MATH=1``.
+            For V2, this also enables optimized MS-EDEN correction and hardware
+            stochastic rounding of corrected E4M3 gradient scales. False uses exact
+            activation arithmetic and software MS-EDEN scale rounding. For fixed
+            gradient inputs, MS-EDEN FP4 codes are unchanged, but the scale RNG
+            mapping differs between modes,
+            so V2 gradients need not agree bitwise. Default: True.
 
-    Both defaults moved together, and both change what this config computes:
+    V2's default now enables hardware MS-EDEN scale rounding together with activation
+    fast math. Previously, activation fast math was enabled while MS-EDEN used
+    software scale rounding. V1 and V1_REQUANT retain their existing behavior.
+
+    For V1, both defaults moved together and change what this config computes:
     ``kernel_preference`` was TRITON and is now AUTO, and ``use_fast_math`` is new and
     defaults on (fast-vs-exact measures 30-32 dB SQNR on the columnwise quantize output
     -- above NVFP4's own ~20 dB quantization noise, but not identical; end to end at the

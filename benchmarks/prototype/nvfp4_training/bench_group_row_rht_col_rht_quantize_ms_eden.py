@@ -4,20 +4,19 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Benchmark the grouped rowwise-RHT + columnwise-RHT MS-EDEN quantize kernel across backends (triton, cutedsl).
+"""Benchmark the grouped rowwise-RHT + columnwise-RHT MS-EDEN quantize kernel with CuTeDSL.
 
 One launch over the packed gradient dy = (E * tokens, dim) bf16 quantizes per group
 dy_g @ R_n (rowwise, dgrad signs) and dy_g^T @ R_m (columnwise, wgrad signs) with
 independent 128-point randomized Hadamard transforms on both axes -- RTNE FP4 codes and
 corrected, stochastically rounded E4M3 block scales against the group amaxes of
 ``bench_group_row_rht_col_rht_amax``'s op -- the V2 backward MS-EDEN operands. Reports
-device kernel time (see bench_utils.kernel_time_us) for each available backend on the
-DeepSeek-V3 shapes, with the cutedsl-vs-triton speedup. ``--fast-path`` times the CuteDSL
+device kernel time (see bench_utils.kernel_time_us) on the DeepSeek-V3 shapes. ``--use-fast-math`` times the CuteDSL
 op's ``FAST_PATH`` (hardware stochastic rounding, one Philox draw per 16 scales; a different
-random stream from the Triton op's) in the cutedsl column instead of the default, bitwise path.
+random stream from the default software path).
 
     python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quantize_ms_eden
-    python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quantize_ms_eden --fast-path
+    python -m benchmarks.prototype.nvfp4_training.bench_group_row_rht_col_rht_quantize_ms_eden --use-fast-math
 """
 
 import argparse
@@ -26,7 +25,6 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from tabulate import tabulate
-from torch.utils._triton import has_triton
 from tqdm import tqdm
 
 from benchmarks.prototype.nvfp4_training.bench_utils import (
@@ -43,7 +41,7 @@ from torchao.utils import is_sm_at_least_100
 
 device = torch.device("cuda")
 
-BACKENDS = ("triton", "cutedsl")
+BACKENDS = ("cutedsl",)
 
 # The target deployment is high expert parallelism, so the small-E shapes are the
 # representative ones; the ranking inverts at large E and misleads.
@@ -57,7 +55,7 @@ class ExperimentConfig:
     dim: int
     model: str = ""
     projection: str = ""
-    fast_path: bool = False
+    use_fast_math: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,26 +87,20 @@ def make_runner(
     num_tensors: int,
     rng_state: torch.Tensor,
     logical_packed_length: torch.Tensor,
-    fast_path: bool = False,
+    use_fast_math: bool = False,
 ) -> Optional[Callable[[], object]]:
     """No-arg callable running ``backend``'s grouped MS-EDEN quantize op, or None if unavailable.
-    ``fast_path`` reaches the cutedsl op only (the Triton op has no such variant)."""
+    ``use_fast_math`` selects hardware stochastic rounding of corrected scales."""
     psl, hidden = dy.shape
     kwargs = {}
-    if backend == "triton":
-        if not has_triton():
-            return None
-        from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_triton import (
-            triton_group_row_rht_col_rht_quantize_ms_eden as op,
-        )
-    elif backend == "cutedsl":
+    if backend == "cutedsl":
         if not cutedsl_nvfp4_kernels_available():
             return None
         from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_quantize_ms_eden_cutedsl import (
             cutedsl_group_row_rht_col_rht_quantize_ms_eden as op,
         )
 
-        kwargs = {"fast_path": fast_path}
+        kwargs = {"use_fast_math": use_fast_math}
     else:
         raise ValueError(f"unknown backend {backend}")
 
@@ -129,23 +121,22 @@ def make_runner(
     )
 
 
-def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
+def run_experiment(
+    config: ExperimentConfig, *, warmup: int = 15, iters: int = 50
+) -> Optional[ExperimentResult]:
+    if not cutedsl_nvfp4_kernels_available():
+        raise RuntimeError("NVFP4 V2 benchmarks require SM100+ and the CuTeDSL runtime")
     E, tokens, dim = config.experts, config.tokens, config.dim
     dy = torch.randn((E * tokens, dim), dtype=torch.bfloat16, device=device)
     dgrad_rht, wgrad_rht = _signs(seed=0), _signs(seed=1)
     offsets = torch.arange(1, E + 1, dtype=torch.int32, device=device) * tokens
     logical_packed_length = offsets[-1:]
     rng_state = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device)
-    # The group amaxes are inputs, computed once outside the timed region; the two
-    # backends' amax ops are bitwise identical, so either feeds both quantize ops.
-    if cutedsl_nvfp4_kernels_available():
-        from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_cutedsl import (
-            cutedsl_group_row_rht_col_rht_amax as amax_op,
-        )
-    else:
-        from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_triton import (
-            triton_group_row_rht_col_rht_amax as amax_op,
-        )
+    # Compute group amaxes once outside the timed quantization region.
+    from torchao.prototype.moe_training.nvfp4_training.group_row_rht_col_rht_amax_cutedsl import (
+        cutedsl_group_row_rht_col_rht_amax as amax_op,
+    )
+
     amax_rht_dy, amax_rht_dy_t = amax_op(
         dy,
         dgrad_rht,
@@ -171,10 +162,10 @@ def run_experiment(config: ExperimentConfig) -> Optional[ExperimentResult]:
             E,
             rng_state,
             logical_packed_length,
-            config.fast_path,
+            config.use_fast_math,
         )
         if runner is not None:
-            us[backend] = kernel_time_us(runner)
+            us[backend] = kernel_time_us(runner, warmup=warmup, iters=iters)
     if not us:
         return None
     # bf16 in; FP4 codes and E4M3 scales out on both axes, 3.125 bytes per element.
@@ -190,16 +181,13 @@ def print_results(experiments: List[Experiment]) -> None:
         "tokens",
         "dim",
         "cutedsl_us",
-        "triton_us",
-        "speedup",
         "cutedsl_gbps",
     ]
     rows = []
     for e in experiments:
         us = e.result.us
-        c, t = us.get("cutedsl"), us.get("triton")
-        speedup = f"{t / c:.2f}x" if (c and t) else "n/a"
-        ref = c or t
+        c = us["cutedsl"]
+        ref = c
         gbps = (e.result.moved_bytes / 1e9) / (ref / 1e6)
         rows.append(
             [
@@ -209,8 +197,6 @@ def print_results(experiments: List[Experiment]) -> None:
                 e.config.tokens,
                 e.config.dim,
                 round(c, 3) if c else "n/a",
-                round(t, 3) if t else "n/a",
-                speedup,
                 round(gbps, 1),
             ]
         )
@@ -223,7 +209,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--fast-path",
+        "--use-fast-math",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Time the CuteDSL op's FAST_PATH (hardware stochastic rounding, one Philox "
@@ -239,7 +225,7 @@ def main() -> None:
             shape.dim,
             model=shape.model,
             projection=shape.projection,
-            fast_path=args.fast_path,
+            use_fast_math=args.use_fast_math,
         )
         for shape in get_deepseek_v3_activation_shapes(
             "dy", factorized_experts=LOCAL_EXPERTS
@@ -250,8 +236,10 @@ def main() -> None:
         result = run_experiment(config)
         if result is not None:
             experiments.append(Experiment(config=config, result=result))
-    if args.fast_path:
-        print("cutedsl column: fast_path=True (hardware SR; not bitwise with triton)")
+    if args.use_fast_math:
+        print(
+            "cutedsl column: use_fast_math=True (hardware SR; different scale RNG from the default path)"
+        )
     print_results(experiments)
 
 

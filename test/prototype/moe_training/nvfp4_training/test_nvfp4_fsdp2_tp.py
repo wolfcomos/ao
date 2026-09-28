@@ -44,10 +44,6 @@ from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import
 from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import (
     prepare_for_cuda_graph,
 )
-from torchao.prototype.moe_training.nvfp4_training.nvfp4_tensor_parallel import (
-    NVFP4ColwiseParallel,
-    NVFP4RowwiseParallel,
-)
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
     NVFP4Recipe,
     recipe_uses_dynamic_signs,
@@ -55,6 +51,10 @@ from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import (
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_rht_cadence import (
     iter_dynamic_sign_buffers,
     resample_nvfp4_rht_signs,
+)
+from torchao.prototype.moe_training.nvfp4_training.nvfp4_tensor_parallel import (
+    NVFP4ColwiseParallel,
+    NVFP4RowwiseParallel,
 )
 from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import NVFP4Linear
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
@@ -319,7 +319,7 @@ def _test_nvfp4_mlp_fsdp2_smoke(
     distributed_env: DeviceMesh,
     *,
     recipe: NVFP4Recipe,
-    kernel_preference: KernelPreference = KernelPreference.TRITON,
+    kernel_preference: KernelPreference = KernelPreference.CUTEDSL,
 ) -> None:
     """FSDP2 without TP, driving the resample cadence the way a trainer must.
 
@@ -386,12 +386,10 @@ def _test_nvfp4_mlp_fsdp2_smoke(
         torch.cuda.synchronize()
 
 
-@pytest.mark.skipif(not has_triton(), reason="unsupported without triton")
 @pytest.mark.skipif(not is_sm_at_least_100(), reason="Requires SM100+")
 @pytest.mark.parametrize(
     "kernel_preference",
     [
-        pytest.param(KernelPreference.TRITON, id="triton"),
         pytest.param(
             KernelPreference.CUTEDSL,
             marks=pytest.mark.skipif(
